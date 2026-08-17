@@ -1,0 +1,50 @@
+{
+  "id": "orca-isolated-review",
+  "max_concurrency": 2,
+  "max_tokens": 2400,
+  "require_reality_anchor": true,
+  "nodes": [
+    {
+      "id": "codex-draft",
+      "kind": "agent",
+      "writes": ["draft"],
+      "estimated_tokens": 900,
+      "max_tokens": 1400,
+      "reality_anchor": true,
+      "retry": {"max_attempts": 2},
+      "agent": {
+        "executor": "codex",
+        "task_type": "coding",
+        "model_family": "general-purpose",
+        "prompt": "Inspect the repository and prepare a factual implementation draft.",
+        "required_capabilities": ["structured_output", "token_usage"],
+        "tools": ["read", "write"],
+        "workspace": {
+          "mode": "isolated",
+          "lineage": "child",
+          "retain": "on_failure"
+        }
+      }
+    },
+    {
+      "id": "claude-review",
+      "kind": "agent",
+      "deps": ["codex-draft"],
+      "reads": ["draft"],
+      "writes": ["reviewed_report"],
+      "estimated_tokens": 500,
+      "max_tokens": 1000,
+      "gate": "approve-review",
+      "verifier_for": "codex-draft",
+      "agent": {
+        "executor": "claude-code",
+        "task_type": "review",
+        "model_family": "general-purpose",
+        "prompt": "Independently review the draft and return a corrected report.",
+        "required_capabilities": ["structured_output", "token_usage"],
+        "tools": ["read"],
+        "workspace": {"mode": "shared"}
+      }
+    }
+  ]
+}

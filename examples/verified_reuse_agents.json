@@ -1,0 +1,49 @@
+{
+  "id": "verified-reuse-agents",
+  "max_concurrency": 1,
+  "max_tokens": 1200,
+  "require_reality_anchor": true,
+  "nodes": [
+    {
+      "id": "answer",
+      "kind": "agent",
+      "writes": ["answer"],
+      "estimated_tokens": 700,
+      "max_tokens": 800,
+      "agent": {
+        "executor": "codex",
+        "prompt": "Inspect the workspace and return a factual answer.",
+        "required_capabilities": ["structured_output"],
+        "tools": ["read"],
+        "task_type": "research",
+        "model_family": "general-purpose",
+        "reuse_scope": "local"
+      }
+    },
+    {
+      "id": "verify",
+      "kind": "agent",
+      "deps": ["answer"],
+      "reads": ["answer"],
+      "writes": ["verification"],
+      "estimated_tokens": 300,
+      "max_tokens": 400,
+      "verifier_for": "answer",
+      "reality_anchor": true,
+      "verified_reuse": {
+        "decision_artifact": "verification",
+        "passed_path": ["passed"],
+        "quality_path": ["quality_score"],
+        "minimum_quality_score": 0.9
+      },
+      "agent": {
+        "executor": "claude-code",
+        "prompt": "Independently verify the answer. Return verification as an object with boolean passed and quality_score from 0 to 1.",
+        "required_capabilities": ["structured_output"],
+        "tools": ["read"],
+        "task_type": "verification",
+        "model_family": "general-purpose"
+      }
+    }
+  ]
+}

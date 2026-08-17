@@ -1,0 +1,37 @@
+{
+  "id": "grounded-report",
+  "max_concurrency": 2,
+  "max_tokens": 100,
+  "require_reality_anchor": true,
+  "nodes": [
+    {
+      "id": "collect",
+      "kind": "collect",
+      "writes": ["facts"],
+      "estimated_tokens": 10,
+      "max_tokens": 20,
+      "reality_anchor": true
+    },
+    {
+      "id": "draft",
+      "kind": "draft",
+      "deps": ["collect"],
+      "reads": ["facts"],
+      "writes": ["draft"],
+      "estimated_tokens": 20,
+      "max_tokens": 30
+    },
+    {
+      "id": "verify",
+      "kind": "verify",
+      "deps": ["draft"],
+      "reads": ["draft"],
+      "writes": ["verified_report"],
+      "estimated_tokens": 5,
+      "max_tokens": 10,
+      "gate": "release",
+      "verifier_for": "draft",
+      "reality_anchor": true
+    }
+  ]
+}

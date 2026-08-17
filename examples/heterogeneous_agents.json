@@ -1,0 +1,45 @@
+{
+  "id": "heterogeneous-review",
+  "max_concurrency": 2,
+  "max_tokens": 2000,
+  "require_reality_anchor": true,
+  "nodes": [
+    {
+      "id": "research",
+      "kind": "agent",
+      "writes": ["draft"],
+      "estimated_tokens": 800,
+      "max_tokens": 1200,
+      "reality_anchor": true,
+      "agent": {
+        "executor": "claude-code",
+        "task_type": "drafting",
+        "model_family": "general-purpose",
+        "prompt": "Inspect the workspace and produce a concise factual draft.",
+        "required_capabilities": ["structured_output", "token_usage"],
+        "tools": ["read"],
+        "timeout_seconds": 300,
+        "max_cost_usd": 1.0
+      }
+    },
+    {
+      "id": "review",
+      "kind": "agent",
+      "deps": ["research"],
+      "reads": ["draft"],
+      "writes": ["reviewed_report"],
+      "estimated_tokens": 400,
+      "max_tokens": 800,
+      "verifier_for": "research",
+      "agent": {
+        "executor": "pi-agent",
+        "task_type": "review",
+        "model_family": "general-purpose",
+        "prompt": "Independently review the draft and return a corrected report.",
+        "required_capabilities": ["structured_output", "token_usage"],
+        "tools": ["read"],
+        "timeout_seconds": 300
+      }
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+[
+  {
+    "case_id": "coding-basic",
+    "quality_score": 0.92,
+    "cost_usd": 0.18,
+    "latency_seconds": 1.8,
+    "reality_anchor_passed": true
+  }
+]

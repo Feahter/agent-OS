@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "graph-engineering-agent-os"
+version = "0.0.1"
+description = "A local-first graph engineering runtime for orchestrating heterogeneous coding agents."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [{ name = "Feahter" }]
+keywords = ["agents", "orchestration", "graph", "codex", "claude-code", "pi-agent", "rsi"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Feahter/agent-os"
+Repository = "https://github.com/Feahter/agent-os"
+Issues = "https://github.com/Feahter/agent-os/issues"
+
+[project.scripts]
+agent-os = "grapheng.cli:main"
+
+[tool.setuptools]
+packages = ["grapheng"]

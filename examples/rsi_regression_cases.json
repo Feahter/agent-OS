@@ -1,0 +1,10 @@
+[
+  {
+    "case_id": "coding-basic",
+    "fixture_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "task_type": "coding",
+    "baseline_quality": 0.9,
+    "baseline_cost_usd": 0.2,
+    "baseline_latency_seconds": 2.0
+  }
+]
