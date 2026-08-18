@@ -164,6 +164,13 @@ class UserTaskModuleTests(unittest.TestCase):
             "[project]\nname = 'sample'\n", encoding="utf-8"
         )
         (self.workspace / "tests").mkdir()
+        (self.workspace / "tests" / "test_smoke.py").write_text(
+            "import unittest\n\n\n"
+            "class SmokeTest(unittest.TestCase):\n"
+            "    def test_workspace(self):\n"
+            "        self.assertTrue(True)\n",
+            encoding="utf-8",
+        )
         subprocess.run(("git", "init", "-q"), cwd=self.workspace, check=True)
         subprocess.run(("git", "add", "."), cwd=self.workspace, check=True)
         subprocess.run(
