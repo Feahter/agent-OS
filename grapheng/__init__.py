@@ -145,7 +145,11 @@ from .routing import (
     route_context_key,
 )
 from .reuse import ReuseStore, VerifiedArtifactCache, VerifiedReuseRecord
-from .resident import RESIDENT_QUEUE_SCHEMA_VERSION, ResidentCoordinator
+from .resident import (
+    RESIDENT_QUEUE_SCHEMA_VERSION,
+    ResidentCoordinator,
+    ResidentJobHandler,
+)
 from .singleflight import (
     FlightDelivery,
     RemoteFlightError,
@@ -260,6 +264,7 @@ __all__ = [
     "RELEASE_SCHEMA_VERSION",
     "RESIDENT_QUEUE_SCHEMA_VERSION",
     "ResidentCoordinator",
+    "ResidentJobHandler",
     "RemoteFlightError",
     "RetrySpec",
     "RetryableNodeError",

@@ -55,6 +55,9 @@
 - 活动或损坏 single-flight 状态阻止导入；publication receipt、lease、凭据和未验证结果仍不可迁移。
 - 持久迁移审计记录源/目标版本、转换器和变更路径，但不保存源机器绝对路径。
 - `OrcaCoordinator` 已形成独立持久状态机；GE 独占依赖调度、并发、token、retry、gate 和发布决策，Orca 独占 Run/Task/Dispatch/worker 生命周期。
+- 工程任务、高级 Graph 和 Orca 已收束到同一个本地常驻优先级队列；队列只保存状态定位符和调度控制，不复制三个执行模块的事实状态。
+- 高级 Graph 可先由 `LocalControlPlane.prepare` 持久化，再由常驻进程启动；阻塞 gate 仍唯一读取 `ApprovalInbox`，allow 后自动恢复且 checkpoint 节点不重复。
+- Orca 常驻恢复继续经过原 `OrcaCoordinator` 与 Effect Journal；队列落盘前崩溃时只对账终态，不重复 materialize、dispatch、cleanup 或 ack。
 - 独立就绪节点按并发上限成波启动，依赖节点只在上游 Artifact 成功提交后启动；临时 token 预留不足会等待下一波，真实用量越界则失败关闭。
 - `question / escalation / worker_done` 进入同一 Delivery 循环；问题必须使用真实消息 ID 回复，升级支持 continue/retry/fail，重试显式携带 `retry_of`。
 - Delivery 必须整批完成并执行 worker release/retain 后才 ack；消息 ID 碰撞、Delivery 内容漂移、未知或陈旧 Dispatch 均被保守处理。
@@ -174,9 +177,9 @@ Adapter 与 Orca 集成测试使用本地假 CLI，覆盖真实参数调用和�
 
 ## 当前限制
 
-- `agent-run` 与 `engineer` CLI 仍是同步入口；异步生命周期目前通过 `LocalControlPlane` Python API 使用。
+- `agent-run` 与 `engineer` CLI 仍是同步入口；高级 Graph 与 Orca 的常驻提交目前通过 Python API 使用。
 - 数据权限是声明式策略，不负责创建或轮换供应商凭据。
-- Orca Coordinator 当前以 Python API 运行，尚未提供长期驻留 daemon 或 CLI 操作入口；本轮也未对真实 Orca 状态做端到端写入验收。
+- Orca Coordinator 已接入共享常驻进程，不需要单独 daemon，但尚无专用 CLI；本轮未对真实 Orca 状态做端到端写入验收。
 - 当前候选生成只覆盖四类可解释失败；不会自由生成节点或删除依赖、gate、Reality Anchor。
 - 实时操作台是单机 loopback 前台进程，不是远程多用户管理面。
 - 受控合并已具备临时仓库端到端验证，尚未在真实用户项目与真实 Orca worker 上执行验收。

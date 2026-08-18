@@ -240,6 +240,12 @@ class LocalControlPlane:
         registry: NodeRegistry,
         gate_policy: Optional[GatePolicy] = None,
     ) -> str:
+        run_id = self.prepare(graph)
+        self.start(run_id, registry, gate_policy)
+        return run_id
+
+    def prepare(self, graph: GraphSpec) -> str:
+        """Persist a validated run without tying it to the caller process."""
         validate_graph(graph)
         run_id = str(uuid.uuid4())
         run_dir = self._run_dir(run_id)
@@ -262,10 +268,27 @@ class LocalControlPlane:
                 "result": None,
             },
         )
+        return run_id
+
+    def start(
+        self,
+        run_id: str,
+        registry: NodeRegistry,
+        gate_policy: Optional[GatePolicy] = None,
+    ) -> RunSnapshot:
+        graph = self._read_graph(run_id)
+
+        def claim(state: Dict[str, Any]) -> None:
+            if state["phase"] != "queued" or state.get("owner_id") is not None:
+                raise ContractViolation(
+                    f"run {run_id} cannot start from phase {state['phase']}"
+                )
+
+        self._mutate_state(run_id, claim)
         self._registries[run_id] = registry
         self._policies[run_id] = gate_policy
         self._launch(run_id, graph, registry, gate_policy, resume=False)
-        return run_id
+        return self.inspect(run_id)
 
     def inspect(self, run_id: str) -> RunSnapshot:
         state = self._read_state(run_id)

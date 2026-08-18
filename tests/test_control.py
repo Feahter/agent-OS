@@ -24,6 +24,25 @@ def graph(nodes):
 
 
 class ControlPlaneTests(unittest.TestCase):
+    def test_prepared_run_can_be_started_by_a_new_control_plane(self):
+        spec = graph([{"id": "work", "kind": "work", "writes": ["answer"]}])
+        registry = NodeRegistry()
+        registry.register("work", lambda context: {"answer": 42})
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            creator = LocalControlPlane(root, owner_id="creator")
+            run_id = creator.prepare(spec)
+            creator.close()
+            prepared = LocalControlPlane(root, owner_id="resident")
+            self.assertEqual("queued", prepared.inspect(run_id).phase)
+            prepared.start(run_id, registry)
+            snapshot = prepared.wait(run_id, timeout=2)
+            prepared.close()
+
+        self.assertEqual("succeeded", snapshot.phase)
+        self.assertEqual(42, snapshot.result["artifacts"]["answer"])
+
     def test_submit_wait_inspect_and_cursor_events(self):
         spec = graph([{"id": "work", "kind": "work", "writes": ["answer"]}])
         registry = NodeRegistry()

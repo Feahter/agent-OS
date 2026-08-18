@@ -3,7 +3,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from grapheng import ContractViolation, ResidentCoordinator
+from grapheng import (
+    ContractViolation,
+    GraphSpec,
+    NodeRegistry,
+    OrcaCoordinator,
+    OrcaMaterializedRun,
+    ResidentCoordinator,
+)
+from grapheng.resident_jobs import ResidentJobCatalog
 
 
 class FakeTasks:
@@ -29,6 +37,87 @@ class FakeTasks:
 
     def record_queue_failure(self, task_id, failure):
         self.failures.append((task_id, failure))
+
+
+class FakeJob:
+    def __init__(self):
+        self.phases = {}
+        self.executed = []
+
+    def inspect(self, reference):
+        return self.phases.get(reference, "queued")
+
+    def execute(self, reference, control_probe):
+        self.executed.append(reference)
+        self.phases[reference] = "succeeded"
+        return {"phase": "succeeded"}
+
+    def record_failure(self, reference, failure):
+        self.phases[reference] = "failed"
+
+
+class FakeOrcaBackend:
+    def __init__(self):
+        self.materialize_calls = 0
+        self.starts = []
+        self.acks = []
+        self.finishes = []
+        self.stops = []
+        self.deliveries = []
+
+    def materialize(self, plan):
+        self.materialize_calls += 1
+        return OrcaMaterializedRun(
+            "run-orca",
+            {task.node_id: f"task-{task.node_id}" for task in plan.tasks},
+            {},
+        )
+
+    def start_worker(self, plan, materialized, node_id, attempt=1, retry_of=None):
+        dispatch_id = f"dispatch-{node_id}-{attempt}"
+        self.starts.append(dispatch_id)
+        return {"dispatch": {"id": dispatch_id}}
+
+    def wait_delivery(self, timeout_ms=900000):
+        if not self.deliveries:
+            return {"count": 0}
+        return self.deliveries.pop(0)
+
+    def acknowledge_delivery(self, delivery_id):
+        self.acks.append(delivery_id)
+        return {"deliveryId": delivery_id, "acknowledged": True}
+
+    def finish_worker(self, dispatch_id, retain, succeeded):
+        self.finishes.append((dispatch_id, retain, succeeded))
+        return {"dispatchId": dispatch_id, "action": "released"}
+
+    def stop_worker(self, dispatch_id):
+        self.stops.append(dispatch_id)
+        return {"dispatchId": dispatch_id, "stopped": True}
+
+    def enqueue_done(self, node_id):
+        self.deliveries.append(
+            {
+                "count": 1,
+                "delivery": {
+                    "deliveryId": "delivery-1",
+                    "messages": [
+                        {
+                            "id": "done-1",
+                            "type": "worker_done",
+                            "taskId": f"task-{node_id}",
+                            "dispatchId": f"dispatch-{node_id}-1",
+                            "outcome": "succeeded",
+                            "payload": {
+                                "outputs": {"answer": 42},
+                                "text": "complete",
+                                "tokens_used": 1,
+                            },
+                        }
+                    ],
+                },
+            }
+        )
 
 
 class ResidentCoordinatorTests(unittest.TestCase):
@@ -86,7 +175,7 @@ class ResidentCoordinatorTests(unittest.TestCase):
     def test_interrupted_running_item_is_recovered_without_losing_priority(self):
         task_id = "task-0000000000000003"
         self.coordinator.submit(task_id, priority=7)
-        self.assertEqual(task_id, self.coordinator._claim_next())
+        self.assertEqual(task_id, self.coordinator._claim_next()["reference"])
 
         restored = ResidentCoordinator(
             self.root,
@@ -108,7 +197,7 @@ class ResidentCoordinatorTests(unittest.TestCase):
     def test_recovery_reconciles_completed_task_before_reexecution(self):
         task_id = "task-0000000000000005"
         self.coordinator.submit(task_id)
-        self.assertEqual(task_id, self.coordinator._claim_next())
+        self.assertEqual(task_id, self.coordinator._claim_next()["reference"])
         self.tasks.phases[task_id] = "succeeded"
 
         restored = ResidentCoordinator(
@@ -126,11 +215,224 @@ class ResidentCoordinatorTests(unittest.TestCase):
         task_id = "task-0000000000000006"
         self.coordinator.submit(task_id)
         value = json.loads(self.coordinator.queue_path.read_text(encoding="utf-8"))
-        value["items"][task_id]["priority"] = 1000
+        value["items"][f"engineering:{task_id}"]["priority"] = 1000
         self.coordinator.queue_path.write_text(json.dumps(value), encoding="utf-8")
 
         with self.assertRaisesRegex(ContractViolation, "fields are invalid"):
             self.coordinator.inspect(task_id)
+
+    def test_heterogeneous_jobs_share_priority_and_waiting_lifecycle(self):
+        graph_job = FakeJob()
+        orca_job = FakeJob()
+        graph_job.phases["run-1"] = "waiting"
+        coordinator = ResidentCoordinator(
+            self.root,
+            task_module_factory=lambda: self.tasks,
+            job_handlers={"graph": graph_job, "orca": orca_job},
+            clock=lambda: 104.0,
+        )
+        coordinator.schedule("graph", "run-1", priority=20)
+        coordinator.schedule("orca", "orca-1", priority=10)
+
+        self.assertTrue(coordinator.serve_once())
+        self.assertEqual("waiting", coordinator.inspect_job("graph", "run-1")["state"])
+        self.assertTrue(coordinator.serve_once())
+        self.assertEqual(["orca-1"], orca_job.executed)
+
+        graph_job.phases["run-1"] = "queued"
+        self.assertTrue(coordinator.serve_once())
+        self.assertEqual(["run-1"], graph_job.executed)
+
+    def test_v1_task_queue_migrates_without_losing_control_state(self):
+        task_id = "task-0000000000000007"
+        self.coordinator.submit(task_id, priority=7)
+        value = json.loads(self.coordinator.queue_path.read_text(encoding="utf-8"))
+        item = value["items"].pop(f"engineering:{task_id}")
+        item.pop("job_id")
+        item.pop("kind")
+        item.pop("reference")
+        item["task_id"] = task_id
+        value["schema_version"] = 1
+        value["items"][task_id] = item
+        self.coordinator.queue_path.write_text(json.dumps(value), encoding="utf-8")
+
+        restored = ResidentCoordinator(
+            self.root,
+            task_module_factory=lambda: self.tasks,
+            clock=lambda: 105.0,
+        )
+
+        migrated = restored.inspect(task_id)
+        self.assertEqual("engineering:task-0000000000000007", migrated["job_id"])
+        self.assertEqual(7, migrated["priority"])
+
+    def test_graph_approval_resume_does_not_repeat_completed_node(self):
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        calls = []
+        graph = GraphSpec.from_dict(
+            {
+                "id": "resident-graph",
+                "require_reality_anchor": False,
+                "nodes": [
+                    {
+                        "id": "prepare",
+                        "kind": "agent",
+                        "writes": ["draft"],
+                        "agent": {"prompt": "prepare"},
+                    },
+                    {
+                        "id": "release",
+                        "kind": "agent",
+                        "deps": ["prepare"],
+                        "reads": ["draft"],
+                        "writes": ["released"],
+                        "gate": "ship",
+                        "agent": {"prompt": "release"},
+                    },
+                ],
+            }
+        )
+
+        def registry_factory(value, root):
+            registry = NodeRegistry()
+
+            def execute(context):
+                calls.append(context.node_id)
+                if context.node_id == "prepare":
+                    return {"draft": "ready"}
+                return {"released": context.read("draft")}
+
+            registry.register("agent", execute)
+            return registry
+
+        catalog = ResidentJobCatalog(
+            self.root, graph_registry_factory=registry_factory
+        )
+        run_id = catalog.graph.prepare(graph, workspace)
+        coordinator = ResidentCoordinator(
+            self.root,
+            task_module_factory=lambda: self.tasks,
+            job_handlers={"graph": catalog.graph},
+            clock=lambda: 106.0,
+        )
+        coordinator.schedule("graph", run_id)
+
+        self.assertTrue(coordinator.serve_once())
+        self.assertEqual("waiting", coordinator.inspect_job("graph", run_id)["state"])
+        catalog.graph.inbox.decide(run_id, "ship", "allow", "operator")
+        self.assertTrue(coordinator.serve_once())
+
+        self.assertEqual("succeeded", coordinator.inspect_job("graph", run_id)["state"])
+        self.assertEqual(["prepare", "release"], calls)
+
+    def test_orca_completion_is_reconciled_after_queue_settlement_crash(self):
+        workspace = self.root / "orca-workspace"
+        workspace.mkdir()
+        graph = GraphSpec.from_dict(
+            {
+                "id": "resident-orca",
+                "require_reality_anchor": False,
+                "nodes": [
+                    {
+                        "id": "work",
+                        "kind": "agent",
+                        "writes": ["answer"],
+                        "agent": {"executor": "codex", "prompt": "work"},
+                    }
+                ],
+            }
+        )
+        backend = FakeOrcaBackend()
+        backend.enqueue_done("work")
+
+        def coordinator_factory(value, job_root, root):
+            return OrcaCoordinator(value, backend, job_root, root)
+
+        catalog = ResidentJobCatalog(
+            self.root, orca_coordinator_factory=coordinator_factory
+        )
+        reference = catalog.orca.prepare(graph, workspace)
+        first = ResidentCoordinator(
+            self.root,
+            task_module_factory=lambda: self.tasks,
+            job_handlers={"orca": catalog.orca},
+            clock=lambda: 107.0,
+        )
+        first.schedule("orca", reference)
+        claimed = first._claim_next()
+        catalog.orca.execute(reference, lambda: None)
+
+        restored = ResidentCoordinator(
+            self.root,
+            task_module_factory=lambda: self.tasks,
+            job_handlers={"orca": catalog.orca},
+            clock=lambda: 108.0,
+        )
+        restored._recover_interrupted()
+        self.assertTrue(restored.serve_once())
+
+        self.assertEqual(reference, claimed["reference"])
+        self.assertEqual("succeeded", restored.inspect_job("orca", reference)["state"])
+        self.assertEqual(1, backend.materialize_calls)
+        self.assertEqual(["dispatch-work-1"], backend.starts)
+        self.assertEqual(["delivery-1"], backend.acks)
+        self.assertEqual([("dispatch-work-1", "on_failure", True)], backend.finishes)
+
+    def test_orca_cancel_from_recovered_pause_stops_dispatch(self):
+        workspace = self.root / "orca-cancel-workspace"
+        workspace.mkdir()
+        graph = GraphSpec.from_dict(
+            {
+                "id": "resident-orca-cancel",
+                "require_reality_anchor": False,
+                "nodes": [
+                    {
+                        "id": "work",
+                        "kind": "agent",
+                        "writes": ["answer"],
+                        "agent": {"executor": "codex", "prompt": "work"},
+                    }
+                ],
+            }
+        )
+        backend = FakeOrcaBackend()
+
+        def coordinator_factory(value, job_root, root):
+            return OrcaCoordinator(value, backend, job_root, root)
+
+        catalog = ResidentJobCatalog(
+            self.root, orca_coordinator_factory=coordinator_factory
+        )
+        reference = catalog.orca.prepare(graph, workspace)
+        first = ResidentCoordinator(
+            self.root,
+            task_module_factory=lambda: self.tasks,
+            job_handlers={"orca": catalog.orca},
+            clock=lambda: 109.0,
+        )
+        first.schedule("orca", reference)
+        first._claim_next()
+        value, job_root, root = catalog.orca._definition(reference)
+        coordinator_factory(value, job_root, root).start()
+        first.request_job("orca", reference, "pause")
+
+        restored = ResidentCoordinator(
+            self.root,
+            task_module_factory=lambda: self.tasks,
+            job_handlers={"orca": catalog.orca},
+            clock=lambda: 110.0,
+        )
+        restored._recover_interrupted()
+        self.assertEqual("paused", restored.inspect_job("orca", reference)["state"])
+        requested = restored.request_job("orca", reference, "cancel")
+        self.assertEqual("cancel_requested", requested["state"])
+        self.assertTrue(restored.serve_once())
+        self.assertFalse(restored.serve_once())
+
+        self.assertEqual("cancelled", restored.inspect_job("orca", reference)["state"])
+        self.assertEqual(["dispatch-work-1"], backend.stops)
+        self.assertEqual([("dispatch-work-1", "on_failure", False)], backend.finishes)
 
 
 if __name__ == "__main__":

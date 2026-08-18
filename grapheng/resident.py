@@ -1,8 +1,10 @@
-"""Persistent local scheduling for approved user tasks.
+"""Persistent local scheduling for Agent OS jobs.
 
-The resident coordinator owns only scheduling metadata. Engineering task truth
-continues to live in each task's plan/status/report files.
+The resident coordinator owns only scheduling metadata. Each job handler keeps
+its own execution state and remains responsible for safe recovery.
 """
+
+from __future__ import annotations
 
 import fcntl
 import json
@@ -15,21 +17,38 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping, Optional
+from typing import Any, Callable, Dict, Mapping, Optional, Protocol, Union
 
 from .errors import ContractViolation
+from .model import GraphSpec
 
 
-RESIDENT_QUEUE_SCHEMA_VERSION = 1
+RESIDENT_QUEUE_SCHEMA_VERSION = 2
 _ACTIVE_STATES = {
     "queued",
     "running",
+    "waiting",
     "paused",
     "pause_requested",
     "cancel_requested",
 }
 _TERMINAL_STATES = {"succeeded", "failed", "cancelled"}
 _TASK_ID = re.compile(r"^task-[0-9a-f]{16}$")
+_REFERENCE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_JOB_KINDS = {"engineering", "graph", "orca"}
+
+
+class ResidentJobHandler(Protocol):
+    def inspect(self, reference: str) -> str:
+        ...
+
+    def execute(
+        self, reference: str, control_probe: Callable[[], Optional[str]]
+    ) -> Union[str, Mapping[str, Any]]:
+        ...
+
+    def record_failure(self, reference: str, failure: str) -> None:
+        ...
 
 
 def _atomic_json_write(path: Path, value: Mapping[str, Any]) -> None:
@@ -71,12 +90,13 @@ def _file_lock(path: Path, blocking: bool = True):
 
 
 class ResidentCoordinator:
-    """Runs approved tasks from one durable, priority-ordered local queue."""
+    """Runs heterogeneous jobs from one durable, priority-ordered local queue."""
 
     def __init__(
         self,
         home: Path,
         task_module_factory: Optional[Callable[[], Any]] = None,
+        job_handlers: Optional[Mapping[str, ResidentJobHandler]] = None,
         clock: Callable[[], float] = time.time,
         poll_seconds: float = 0.2,
         heartbeat_seconds: float = 1.0,
@@ -103,6 +123,15 @@ class ResidentCoordinator:
 
             task_module_factory = lambda: UserTaskModule(self.home)
         self._task_module_factory = task_module_factory
+        from .resident_jobs import ResidentJobCatalog
+
+        self._job_catalog = ResidentJobCatalog(self.home)
+        self._job_handlers = dict(job_handlers or {})
+        for kind, handler in self._job_catalog.handlers().items():
+            self._job_handlers.setdefault(kind, handler)
+        self._job_handlers.setdefault(
+            "engineering", _EngineeringJobHandler(self._task_module_factory)
+        )
         self._stop = threading.Event()
         if not self.queue_path.exists():
             with _file_lock(self.queue_lock_path):
@@ -111,18 +140,29 @@ class ResidentCoordinator:
 
     def submit(self, task_id: str, priority: int = 0) -> Mapping[str, Any]:
         self._validate_task_id(task_id)
+        return self.schedule("engineering", task_id, priority)
+
+    def schedule(
+        self, kind: str, reference: str, priority: int = 0
+    ) -> Mapping[str, Any]:
+        self._validate_job(kind, reference)
+        if kind not in self._job_handlers:
+            raise ContractViolation(f"resident job kind {kind} has no handler")
         priority = self._priority(priority)
         now = self._clock()
+        job_id = self._job_id(kind, reference)
         with _file_lock(self.queue_lock_path):
             queue = self._read_queue()
             items = queue["items"]
-            existing = items.get(task_id)
+            existing = items.get(job_id)
             if isinstance(existing, dict) and existing.get("state") in _ACTIVE_STATES:
-                raise ContractViolation(f"task {task_id} is already scheduled")
+                raise ContractViolation(f"resident job {job_id} is already scheduled")
             sequence = queue["next_sequence"]
             queue["next_sequence"] = sequence + 1
-            items[task_id] = {
-                "task_id": task_id,
+            items[job_id] = {
+                "job_id": job_id,
+                "kind": kind,
+                "reference": reference,
                 "priority": priority,
                 "sequence": sequence,
                 "state": "queued",
@@ -134,12 +174,29 @@ class ResidentCoordinator:
             }
             queue["updated_at"] = now
             self._write_queue(queue)
-            return dict(items[task_id])
+            return dict(items[job_id])
+
+    def schedule_graph(
+        self, graph: GraphSpec, workspace: Path, priority: int = 0
+    ) -> Mapping[str, Any]:
+        reference = self._job_catalog.graph.prepare(graph, workspace)
+        return self.schedule("graph", reference, priority)
+
+    def schedule_orca(
+        self, graph: GraphSpec, workspace: Path, priority: int = 0
+    ) -> Mapping[str, Any]:
+        reference = self._job_catalog.orca.prepare(graph, workspace)
+        return self.schedule("orca", reference, priority)
 
     def inspect(self, task_id: str) -> Optional[Mapping[str, Any]]:
         self._validate_task_id(task_id)
+        return self.inspect_job("engineering", task_id)
+
+    def inspect_job(self, kind: str, reference: str) -> Optional[Mapping[str, Any]]:
+        self._validate_job(kind, reference)
+        job_id = self._job_id(kind, reference)
         with _file_lock(self.queue_lock_path):
-            item = self._read_queue()["items"].get(task_id)
+            item = self._read_queue()["items"].get(job_id)
             return dict(item) if isinstance(item, dict) else None
 
     def request(
@@ -148,38 +205,53 @@ class ResidentCoordinator:
         action: str,
         priority: Optional[int] = None,
     ) -> Mapping[str, Any]:
-        if action not in ("pause", "resume", "cancel", "reprioritize"):
-            raise ContractViolation("unsupported resident task control action")
         self._validate_task_id(task_id)
+        return self.request_job("engineering", task_id, action, priority)
+
+    def request_job(
+        self,
+        kind: str,
+        reference: str,
+        action: str,
+        priority: Optional[int] = None,
+    ) -> Mapping[str, Any]:
+        if action not in ("pause", "resume", "cancel", "reprioritize"):
+            raise ContractViolation("unsupported resident job control action")
+        self._validate_job(kind, reference)
+        job_id = self._job_id(kind, reference)
         now = self._clock()
         with _file_lock(self.queue_lock_path):
             queue = self._read_queue()
-            item = queue["items"].get(task_id)
+            item = queue["items"].get(job_id)
             if not isinstance(item, dict):
-                raise ContractViolation(f"task {task_id} is not scheduled")
+                raise ContractViolation(f"resident job {job_id} is not scheduled")
             state = item["state"]
             if state in _TERMINAL_STATES:
-                raise ContractViolation(f"task {task_id} is already {state}")
+                raise ContractViolation(f"resident job {job_id} is already {state}")
             if action == "pause":
-                if state == "queued":
+                if state in ("queued", "waiting"):
                     item["state"] = "paused"
                 elif state == "running":
                     item["state"] = "pause_requested"
                 else:
-                    raise ContractViolation(f"task {task_id} cannot pause from {state}")
+                    raise ContractViolation(f"resident job {job_id} cannot pause from {state}")
                 item["requested_action"] = "pause"
             elif action == "resume":
                 if state not in ("queued", "paused", "pause_requested"):
-                    raise ContractViolation(f"task {task_id} cannot resume from {state}")
+                    raise ContractViolation(f"resident job {job_id} cannot resume from {state}")
                 item["state"] = "queued"
                 item["requested_action"] = None
             elif action == "cancel":
-                if state in ("queued", "paused"):
+                if state == "queued":
+                    item["state"] = "cancelled"
+                elif state in ("waiting", "paused") and kind == "orca":
+                    item["state"] = "cancel_requested"
+                elif state in ("waiting", "paused"):
                     item["state"] = "cancelled"
                 elif state in ("running", "pause_requested"):
                     item["state"] = "cancel_requested"
                 else:
-                    raise ContractViolation(f"task {task_id} cannot cancel from {state}")
+                    raise ContractViolation(f"resident job {job_id} cannot cancel from {state}")
                 item["requested_action"] = "cancel"
             else:
                 item["priority"] = self._priority(priority)
@@ -189,7 +261,11 @@ class ResidentCoordinator:
             return dict(item)
 
     def control_probe(self, task_id: str) -> Optional[str]:
-        item = self.inspect(task_id)
+        self._validate_task_id(task_id)
+        return self.job_control_probe("engineering", task_id)
+
+    def job_control_probe(self, kind: str, reference: str) -> Optional[str]:
+        item = self.inspect_job(kind, reference)
         if item is None:
             return None
         if item["state"] in ("cancel_requested", "cancelled") or item.get(
@@ -201,28 +277,51 @@ class ResidentCoordinator:
         return None
 
     def serve_once(self) -> bool:
-        task_id = self._claim_next()
-        if task_id is None:
+        self._refresh_waiting()
+        item = self._claim_next()
+        if item is None:
             return False
-        tasks = self._task_module_factory()
+        job_id = str(item["job_id"])
+        kind = str(item["kind"])
+        reference = str(item["reference"])
+        handler = self._job_handlers[kind]
         try:
-            phase = tasks.execution_phase(task_id)
-            if phase in _TERMINAL_STATES:
-                self._settle(task_id, phase, None)
+            cancel = getattr(handler, "cancel", None)
+            if item.get("requested_action") == "cancel" and callable(cancel):
+                result = cancel(reference)
+                phase = (
+                    str(result.get("phase", "failed"))
+                    if isinstance(result, Mapping)
+                    else str(result)
+                )
+                if phase not in _TERMINAL_STATES:
+                    phase = "failed"
+                self._settle(job_id, phase, None)
                 return True
-            result = tasks.execute_queued(
-                task_id, lambda: self.control_probe(task_id)
+            phase = str(handler.inspect(reference))
+            if phase in _TERMINAL_STATES:
+                self._settle(job_id, phase, None)
+                return True
+            if phase == "waiting":
+                self._settle(job_id, "waiting", None)
+                return True
+            result = handler.execute(
+                reference, lambda: self.job_control_probe(kind, reference)
             )
-            phase = str(result.get("phase", "failed"))
-            if phase not in _TERMINAL_STATES | {"paused"}:
+            phase = (
+                str(result.get("phase", "failed"))
+                if isinstance(result, Mapping)
+                else str(result)
+            )
+            if phase not in _TERMINAL_STATES | {"paused", "waiting"}:
                 phase = "failed"
-            self._settle(task_id, phase, None)
+            self._settle(job_id, phase, None)
         except Exception as error:
             failure = f"{type(error).__name__}: {error}"
             try:
-                tasks.record_queue_failure(task_id, failure)
+                handler.record_failure(reference, failure)
             finally:
-                self._settle(task_id, "failed", failure)
+                self._settle(job_id, "failed", failure)
         return True
 
     def serve_forever(self) -> None:
@@ -287,13 +386,14 @@ class ResidentCoordinator:
             return False
         return True
 
-    def _claim_next(self) -> Optional[str]:
+    def _claim_next(self) -> Optional[Mapping[str, Any]]:
         with _file_lock(self.queue_lock_path):
             queue = self._read_queue()
             candidates = [
                 item
                 for item in queue["items"].values()
-                if isinstance(item, dict) and item.get("state") == "queued"
+                if isinstance(item, dict)
+                and item.get("state") in ("queued", "cancel_requested")
             ]
             if not candidates:
                 return None
@@ -307,12 +407,12 @@ class ResidentCoordinator:
             item["attempts"] = int(item["attempts"]) + 1
             queue["updated_at"] = now
             self._write_queue(queue)
-            return str(item["task_id"])
+            return dict(item)
 
-    def _settle(self, task_id: str, phase: str, error: Optional[str]) -> None:
+    def _settle(self, job_id: str, phase: str, error: Optional[str]) -> None:
         with _file_lock(self.queue_lock_path):
             queue = self._read_queue()
-            item = queue["items"].get(task_id)
+            item = queue["items"].get(job_id)
             if not isinstance(item, dict):
                 return
             if phase == "paused":
@@ -347,6 +447,31 @@ class ResidentCoordinator:
                 queue["updated_at"] = now
                 self._write_queue(queue)
 
+    def _refresh_waiting(self) -> None:
+        with _file_lock(self.queue_lock_path):
+            waiting = [
+                (str(item["job_id"]), str(item["kind"]), str(item["reference"]))
+                for item in self._read_queue()["items"].values()
+                if isinstance(item, dict) and item.get("state") == "waiting"
+            ]
+        for job_id, kind, reference in waiting:
+            phase = str(self._job_handlers[kind].inspect(reference))
+            if phase in _TERMINAL_STATES:
+                self._settle(job_id, phase, None)
+            elif phase != "waiting":
+                self._requeue_waiting(job_id)
+
+    def _requeue_waiting(self, job_id: str) -> None:
+        with _file_lock(self.queue_lock_path):
+            queue = self._read_queue()
+            item = queue["items"].get(job_id)
+            if not isinstance(item, dict) or item.get("state") != "waiting":
+                return
+            item["state"] = "queued"
+            item["updated_at"] = self._clock()
+            queue["updated_at"] = item["updated_at"]
+            self._write_queue(queue)
+
     def _heartbeat_loop(self) -> None:
         while not self._stop.is_set():
             _atomic_json_write(
@@ -364,6 +489,9 @@ class ResidentCoordinator:
             value = json.loads(self.queue_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
             raise ContractViolation(f"cannot read resident queue: {error}") from error
+        migrated_from_v1 = isinstance(value, dict) and value.get("schema_version") == 1
+        if migrated_from_v1:
+            value = self._migrate_v1_queue(value)
         if (
             not isinstance(value, dict)
             or value.get("schema_version") != RESIDENT_QUEUE_SCHEMA_VERSION
@@ -373,11 +501,11 @@ class ResidentCoordinator:
             or not isinstance(value.get("items"), dict)
         ):
             raise ContractViolation("resident queue has an invalid contract")
-        for task_id, item in value["items"].items():
-            if not isinstance(task_id, str) or _TASK_ID.fullmatch(task_id) is None:
-                raise ContractViolation("resident queue contains an invalid task id")
+        for job_id, item in value["items"].items():
             if not isinstance(item, dict) or set(item) != {
-                "task_id",
+                "job_id",
+                "kind",
+                "reference",
                 "priority",
                 "sequence",
                 "state",
@@ -389,7 +517,11 @@ class ResidentCoordinator:
             }:
                 raise ContractViolation("resident queue item has an invalid contract")
             if (
-                item["task_id"] != task_id
+                item["job_id"] != job_id
+                or item["kind"] not in _JOB_KINDS
+                or not isinstance(item["reference"], str)
+                or _REFERENCE.fullmatch(item["reference"]) is None
+                or job_id != self._job_id(item["kind"], item["reference"])
                 or isinstance(item["priority"], bool)
                 or not isinstance(item["priority"], int)
                 or not -100 <= item["priority"] <= 100
@@ -409,7 +541,32 @@ class ResidentCoordinator:
                     item[field], (int, float)
                 ):
                     raise ContractViolation("resident queue item timestamps are invalid")
+        if migrated_from_v1:
+            self._write_queue(value)
         return value
+
+    def _migrate_v1_queue(self, value: Mapping[str, Any]) -> Dict[str, Any]:
+        items = value.get("items")
+        if not isinstance(items, dict):
+            raise ContractViolation("resident queue has an invalid v1 contract")
+        migrated = dict(value)
+        migrated["schema_version"] = RESIDENT_QUEUE_SCHEMA_VERSION
+        migrated["items"] = {}
+        for task_id, item in items.items():
+            if (
+                not isinstance(task_id, str)
+                or _TASK_ID.fullmatch(task_id) is None
+                or not isinstance(item, dict)
+            ):
+                raise ContractViolation("resident queue has an invalid v1 task")
+            job_id = self._job_id("engineering", task_id)
+            converted = dict(item)
+            converted.pop("task_id", None)
+            converted.update(
+                {"job_id": job_id, "kind": "engineering", "reference": task_id}
+            )
+            migrated["items"][job_id] = converted
+        return migrated
 
     def _write_queue(self, value: Mapping[str, Any]) -> None:
         _atomic_json_write(self.queue_path, value)
@@ -432,3 +589,31 @@ class ResidentCoordinator:
     def _validate_task_id(task_id: str) -> None:
         if not isinstance(task_id, str) or _TASK_ID.fullmatch(task_id) is None:
             raise ContractViolation("invalid resident task id")
+
+    @staticmethod
+    def _job_id(kind: str, reference: str) -> str:
+        return f"{kind}:{reference}"
+
+    @staticmethod
+    def _validate_job(kind: str, reference: str) -> None:
+        if kind not in _JOB_KINDS:
+            raise ContractViolation("unsupported resident job kind")
+        if not isinstance(reference, str) or _REFERENCE.fullmatch(reference) is None:
+            raise ContractViolation("invalid resident job reference")
+
+
+class _EngineeringJobHandler:
+    def __init__(self, factory: Callable[[], Any]):
+        self._factory = factory
+
+    def inspect(self, task_id: str) -> str:
+        phase = str(self._factory().execution_phase(task_id))
+        return "queued" if phase in ("running", "paused") else phase
+
+    def execute(
+        self, task_id: str, control_probe: Callable[[], Optional[str]]
+    ) -> Mapping[str, Any]:
+        return self._factory().execute_queued(task_id, control_probe)
+
+    def record_failure(self, task_id: str, failure: str) -> None:
+        self._factory().record_queue_failure(task_id, failure)

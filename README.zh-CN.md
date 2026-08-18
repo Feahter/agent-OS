@@ -173,6 +173,19 @@ agent-os agent-run examples/heterogeneous_agents.json \
 
 这条命令会调用真实模型并可能产生费用。没有依赖关系的 Agent 不能共享可写工作区；隔离工作区必须交给 Orca 后端执行。
 
+高级集成可以把 Graph 或 Orca 作业提交给同一个 `ResidentCoordinator`，退出调用进程后仍由统一优先级队列恢复。常驻层只保存作业类型、状态定位符、顺序和控制意图；Graph 状态仍属于 `LocalControlPlane`，gate 决策仍唯一写入 `ApprovalInbox`，Orca 的 Run/Task/Dispatch 和 Effect Receipt 仍属于 `OrcaCoordinator`：
+
+```python
+from pathlib import Path
+from grapheng import GraphSpec, ResidentCoordinator
+
+resident = ResidentCoordinator(Path.home() / ".agent-os")
+graph = GraphSpec.from_json(Path("graph.json"))
+resident.schedule_graph(graph, Path("/path/to/project"), priority=10)
+# 或：resident.schedule_orca(graph, Path("/path/to/project"), priority=10)
+resident.start_background()
+```
+
 ## GraphSpec 契约
 
 ```json
@@ -256,8 +269,8 @@ tests/        契约、恢复和跨进程集成测试
 
 ## 当前限制
 
-- `agent-run` 和 `engineer` 目前是同步 CLI。
-- Orca Coordinator 已提供 Python API，还没有长期驻留 daemon。
+- `agent-run` 和 `engineer` 仍是同步 CLI；高级 Graph/Orca 后台提交目前通过 Python 接口使用。
+- Orca 已复用 Agent OS 常驻生命周期，不再需要独立 daemon；问题与升级处理仍通过 Coordinator Python 接口完成。
 - 数据分级是策略约束，各工具仍需自行管理凭据生命周期。
 - 真实项目和真实 Orca 接入需要先做小流量、可观察的灰度。
 - 跨主机状态、多租户隔离和带信任根的发行签名尚未实现。

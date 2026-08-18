@@ -202,6 +202,29 @@ class OrcaCoordinator:
         with self._locked():
             return self._snapshot(self._read_state())
 
+    def cancel(self) -> OrcaCoordinatorSnapshot:
+        with self._locked():
+            state = self._read_state()
+            if state["phase"] in _TERMINAL_PHASES:
+                return self._snapshot(state)
+            for node_id, dispatch_id in tuple(state["active_dispatches"].items()):
+                self._effect(
+                    "stop",
+                    dispatch_id,
+                    {"dispatch_id": dispatch_id, "action": "cancel"},
+                    lambda dispatch_id=dispatch_id: self.backend.stop_worker(dispatch_id),
+                )
+                node = self.graph.node_map()[node_id]
+                self._finish_dispatch(state, node, dispatch_id, False)
+                self._deactivate_dispatch(state, node_id, dispatch_id)
+            for node_id, status in tuple(state["statuses"].items()):
+                if status not in _TERMINAL_NODE_STATES:
+                    state["statuses"][node_id] = "cancelled"
+            state["phase"] = "cancelled"
+            self._emit(state, "run_cancelled", payload={"backend": "orca"})
+            self._save(state)
+            return self._snapshot(state)
+
     def events(self, after: int = 0) -> EventPage:
         if isinstance(after, bool) or not isinstance(after, int) or after < 0:
             raise ContractViolation("event cursor must be a non-negative integer")

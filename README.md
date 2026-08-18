@@ -173,6 +173,19 @@ agent-os agent-run examples/heterogeneous_agents.json \
 
 This command can call real models and incur cost. Shared writable workspaces are rejected for unordered agents; isolated workspaces must use the Orca backend.
 
+Advanced integrations can submit Graph or Orca work to the same `ResidentCoordinator`, so the shared priority queue restores it after the caller exits. The resident stores only the job kind, state locator, ordering and control intent. Graph truth stays in `LocalControlPlane`, gate decisions still have one writer in `ApprovalInbox`, and Orca Run/Task/Dispatch state plus Effect Receipts stay in `OrcaCoordinator`:
+
+```python
+from pathlib import Path
+from grapheng import GraphSpec, ResidentCoordinator
+
+resident = ResidentCoordinator(Path.home() / ".agent-os")
+graph = GraphSpec.from_json(Path("graph.json"))
+resident.schedule_graph(graph, Path("/path/to/project"), priority=10)
+# Or: resident.schedule_orca(graph, Path("/path/to/project"), priority=10)
+resident.start_background()
+```
+
 ## Graph contract
 
 ```json
@@ -256,8 +269,8 @@ tests/        contract, recovery and cross-process integration tests
 
 ## Current limits
 
-- `agent-run` and `engineer` are synchronous CLI entry points.
-- The Orca coordinator is available as a Python API, not a resident daemon.
+- `agent-run` and `engineer` remain synchronous CLI entry points; advanced Graph/Orca background submission currently uses the Python interface.
+- Orca now shares the Agent OS resident lifecycle instead of requiring a separate daemon; question and escalation handling still uses the coordinator Python interface.
 - Data classification is enforced as policy metadata; credential lifecycle remains the responsibility of each tool.
 - Real-project and real-Orca rollout still needs a small, monitored pilot.
 - Cross-host state, multi-tenant isolation and signed releases are not implemented yet.

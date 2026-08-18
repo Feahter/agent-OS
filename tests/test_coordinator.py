@@ -220,6 +220,22 @@ class OrcaCoordinatorTests(unittest.TestCase):
         self.assertEqual(["left", "right"], [item["node_id"] for item in backend.starts])
         self.assertEqual(snapshot.active_dispatches, resumed.active_dispatches)
 
+    def test_cancel_stops_active_dispatches_once_and_is_restart_safe(self):
+        value = graph([node("work")])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = FakeBackend()
+            coordinator = self.coordinator(root, value, backend)
+            started = coordinator.start()
+            cancelled = coordinator.cancel()
+            resumed = self.coordinator(root, value, backend).cancel()
+
+        self.assertEqual("running", started.phase)
+        self.assertEqual("cancelled", cancelled.phase)
+        self.assertEqual("cancelled", resumed.phase)
+        self.assertEqual(["dispatch-work-1"], backend.stops)
+        self.assertEqual([("dispatch-work-1", "on_failure", False)], backend.finishes)
+
     def test_v1_state_migrates_fingerprint_and_merge_fields_without_replaying(self):
         value = graph([node("work")])
         with tempfile.TemporaryDirectory() as directory:
