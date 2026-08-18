@@ -72,6 +72,27 @@ agent-os validate examples/minimal_graph.json
 agent-os demo examples/minimal_graph.json --work-dir /tmp/agent-os-demo
 ```
 
+### Daily task interface
+
+Initialize a project's safety and verification policy once, then use the same five actions regardless of which local agent is selected:
+
+```bash
+agent-os engineer init --workspace /path/to/project
+
+agent-os do "Fix the login timeout and add a regression test" \
+  --workspace /path/to/project
+
+agent-os status task-0123456789abcdef
+agent-os approve task-0123456789abcdef --actor operator
+agent-os result task-0123456789abcdef
+```
+
+`do` performs read-only exploration and planning, returns a stable task ID, and stops at a digest-bound approval. `approve` executes the exact approved plan and returns only after bounded checks and an independent review. Use `control TASK_ID cancel --actor NAME` to cancel a task before approval. Add `--json` to any of the five actions for machine-readable output.
+
+The default home is `~/.agent-os`; override it with `AGENT_OS_HOME` or `--home`. Operational task state stays under `tasks/` and remains the single source for status and results. Portable, prompt-free learning and policy state stays under `state/`; raw objectives, project paths and runtime evidence are deliberately excluded from state exports.
+
+These commands can call real local agents and incur model cost. GraphSpec and the existing lower-level commands remain available as advanced interfaces.
+
 Run the test suite:
 
 ```bash

@@ -4,6 +4,9 @@
 
 ## Unreleased
 
+- 增加统一的 `do / status / approve / control / result` 用户任务入口。
+- 增加稳定 task ID、面向人的摘要、机器 JSON，以及产物、验证、费用和人工介入结果视图。
+- 将任务运行态与可迁移 RSI 状态分区，避免原始目标和项目路径进入状态导出包。
 - 增加隐私最小化的用户结果评测、工程报告导入和不可覆盖的基线快照。
 - 增加 `evaluate record-engineering / baseline / status` 命令。
 

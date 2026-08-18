@@ -205,6 +205,7 @@ class EngineeringTests(unittest.TestCase):
         self.assertTrue(report["success"])
         self.assertEqual("succeeded", report["phase"])
         self.assertTrue(report["reality_anchor"]["passed"])
+        self.assertEqual("implemented", report["implementation"]["summary"])
         self.assertEqual(4, report["agent_calls"])
         self.assertEqual(20, report["tokens_used"])
         self.assertTrue(report["cost_complete"])

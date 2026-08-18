@@ -544,6 +544,7 @@ class EngineeringWorkflow:
             "cost_usd": preparation_usage["cost_usd"],
             "cost_complete": preparation_usage["cost_complete"],
             "preparation_usage": preparation_usage,
+            "implementation": None,
             "checks": [],
             "reviews": [],
             "repairs": [],
@@ -571,6 +572,10 @@ class EngineeringWorkflow:
                 effect_index=0,
             )
             last_mutating_task = result["task_id"]
+            state["implementation"] = {
+                "task_id": result["task_id"],
+                "summary": result["outputs"]["implementation_summary"],
+            }
             self._assert_protected_unchanged(protected)
 
             while True:

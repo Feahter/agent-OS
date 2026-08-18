@@ -25,6 +25,7 @@ from .orca import OrcaGraphCompiler
 from .policy import AllowListGatePolicy
 from .publication import VerifiedResultPublisher
 from .runtime import GraphRuntime, NodeOutcome, NodeRegistry
+from .tasks import UserTaskModule
 from .validation import validate_graph
 
 
@@ -250,9 +251,86 @@ def _run_evaluation_command(args, parser) -> int:
     return 0
 
 
+def _print_user_task(value, json_output: bool) -> None:
+    if json_output:
+        print(json.dumps(value, ensure_ascii=False, sort_keys=True))
+        return
+    task_id = value["task_id"]
+    phase = value["phase"]
+    summary = value.get("summary") or {
+        "succeeded": "Verified result is ready",
+        "failed": "Task stopped without a verified result",
+        "cancelled": "Task was cancelled before execution",
+    }.get(phase, f"Task is {phase}")
+    print(f"Task {task_id}: {summary}")
+    verification = value.get("verification")
+    if isinstance(verification, dict) and phase in ("succeeded", "failed"):
+        print(f"Verification: {'passed' if verification.get('passed') else 'not passed'}")
+    usage = value.get("usage")
+    if isinstance(usage, dict):
+        print(
+            "Usage: "
+            f"{usage.get('tokens_used', 0)} tokens, "
+            f"${float(usage.get('cost_usd', 0.0)):.4f}"
+        )
+    outcome = value.get("outcome")
+    if isinstance(outcome, dict) and outcome.get("summary"):
+        print(f"Outcome: {outcome['summary']}")
+    artifacts = value.get("artifacts")
+    if isinstance(artifacts, list):
+        for artifact in artifacts:
+            if isinstance(artifact, dict) and artifact.get("path"):
+                print(f"Artifact: {artifact.get('name', 'result')} -> {artifact['path']}")
+    next_action = value.get("next_action")
+    if next_action:
+        suffix = " --actor YOUR_NAME" if next_action == "approve" else ""
+        print(f"Next: agent-os {next_action} {task_id}{suffix}")
+
+
+def _run_user_task_command(args) -> int:
+    tasks = UserTaskModule(args.home)
+    if args.command == "do":
+        value = tasks.do(args.objective, args.workspace, args.policy)
+    elif args.command == "status":
+        value = tasks.status(args.task_id)
+    elif args.command == "approve":
+        value = tasks.approve(args.task_id, args.actor)
+    elif args.command == "control":
+        value = tasks.control(args.task_id, args.action, args.actor)
+    else:
+        value = tasks.result(args.task_id)
+    _print_user_task(value, args.json_output)
+    return 1 if value.get("phase") == "failed" else 0
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(prog="grapheng")
+    parser = argparse.ArgumentParser(prog="agent-os")
     subparsers = parser.add_subparsers(dest="command", required=True)
+    do_parser = subparsers.add_parser("do")
+    do_parser.add_argument("objective")
+    do_parser.add_argument("--workspace", type=Path, required=True)
+    do_parser.add_argument("--policy", type=Path)
+    do_parser.add_argument("--home", type=Path)
+    do_parser.add_argument("--json", action="store_true", dest="json_output")
+    status_parser = subparsers.add_parser("status")
+    status_parser.add_argument("task_id")
+    status_parser.add_argument("--home", type=Path)
+    status_parser.add_argument("--json", action="store_true", dest="json_output")
+    approve_parser = subparsers.add_parser("approve")
+    approve_parser.add_argument("task_id")
+    approve_parser.add_argument("--actor", required=True)
+    approve_parser.add_argument("--home", type=Path)
+    approve_parser.add_argument("--json", action="store_true", dest="json_output")
+    control_parser = subparsers.add_parser("control")
+    control_parser.add_argument("task_id")
+    control_parser.add_argument("action", choices=("cancel",))
+    control_parser.add_argument("--actor", required=True)
+    control_parser.add_argument("--home", type=Path)
+    control_parser.add_argument("--json", action="store_true", dest="json_output")
+    result_parser = subparsers.add_parser("result")
+    result_parser.add_argument("task_id")
+    result_parser.add_argument("--home", type=Path)
+    result_parser.add_argument("--json", action="store_true", dest="json_output")
     validate_parser = subparsers.add_parser("validate")
     validate_parser.add_argument("spec", type=Path)
     demo_parser = subparsers.add_parser("demo")
@@ -406,6 +484,9 @@ def main() -> int:
     evaluation_parser.add_argument("--recovery-attempted", action="store_true")
     evaluation_parser.add_argument("--recovery-succeeded", action="store_true")
     args = parser.parse_args()
+
+    if args.command in ("do", "status", "approve", "control", "result"):
+        return _run_user_task_command(args)
 
     if args.command == "engineer":
         if args.action != "status" and args.workspace is None:

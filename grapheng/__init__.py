@@ -143,6 +143,7 @@ from .singleflight import (
     SingleFlightCoordinator,
     SingleFlightTimeoutError,
 )
+from .tasks import USER_TASK_SCHEMA_VERSION, UserTaskModule, default_agent_os_home
 from .validation import validate_graph
 
 __version__ = "0.0.1"
@@ -257,6 +258,8 @@ __all__ = [
     "MigrationStep",
     "SingleFlightCoordinator",
     "SingleFlightTimeoutError",
+    "USER_TASK_SCHEMA_VERSION",
+    "UserTaskModule",
     "RouteDecision",
     "RouteObservation",
     "ReuseStore",
@@ -265,6 +268,7 @@ __all__ = [
     "VerifiedReuseRecord",
     "VerifiedReuseSpec",
     "route_context_key",
+    "default_agent_os_home",
     "WorkspaceSpec",
     "CheckResult",
     "assess_change_set",

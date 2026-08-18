@@ -72,6 +72,27 @@ agent-os validate examples/minimal_graph.json
 agent-os demo examples/minimal_graph.json --work-dir /tmp/agent-os-demo
 ```
 
+### 日常任务入口
+
+每个项目只需初始化一次安全与验证策略。之后无论底层选择哪个本地 Agent，都使用同样五个动作：
+
+```bash
+agent-os engineer init --workspace /path/to/project
+
+agent-os do "修复登录超时并补回归测试" \
+  --workspace /path/to/project
+
+agent-os status task-0123456789abcdef
+agent-os approve task-0123456789abcdef --actor operator
+agent-os result task-0123456789abcdef
+```
+
+`do` 只进行只读探索和计划，返回稳定 task ID，然后停在绑定计划摘要的审批点。`approve` 只执行这份已批准计划，完成有限检查和独立审查后才返回。批准前可用 `control TASK_ID cancel --actor NAME` 取消任务。五个动作都可加 `--json` 获得机器可读输出。
+
+默认主目录是 `~/.agent-os`，可用 `AGENT_OS_HOME` 或 `--home` 覆盖。`tasks/` 保存运行态，也是状态和结果的唯一事实来源；`state/` 只保存可迁移、无 prompt 的学习与策略状态。原始目标、项目路径和运行证据不会进入状态导出包。
+
+这些命令可能调用真实本地 Agent 并产生模型费用。GraphSpec 和现有底层命令继续作为高级接口保留。
+
 运行全部测试：
 
 ```bash
