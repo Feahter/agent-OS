@@ -218,14 +218,16 @@ A node can read only declared artifacts and must produce exactly its declared ou
 
 ## Supported tools
 
-| Tool | Role | Integration |
-| --- | --- | --- |
-| Codex | Coding and review agent | Local CLI adapter |
-| Claude Code | Coding and review agent | Local CLI adapter |
-| Pi | Lightweight coding and review agent | Local CLI adapter |
-| Orca | Isolated worker lifecycle and delivery | Graph compiler, backend and coordinator |
+| Tool | Verified version | Protocol | Integration |
+| --- | --- | --- | --- |
+| Codex | `0.148.0-alpha.9` | `exec-jsonl-v1` | Local CLI adapter |
+| Claude Code | `2.1.234` | `json-envelope-v1` | Local CLI adapter |
+| Pi | `0.84.1` | `message-end-jsonl-v1` | Local CLI adapter |
+| Orca | `1.4.180` | `orca-json-command-v1` | Graph compiler, backend and coordinator |
 
-Adapters translate the common `read / shell / edit / write` tool contract into each product's protocol. Executor discovery runs only protocol checks such as `--help` and `--version`; it does not call a model.
+Adapters translate the common `read / shell / edit / write` tool contract into each product's protocol. The versions above were verified on Darwin arm64 on 2026-08-18. Evidence is version-controlled and travels with release bundles. Discovery runs only protocol checks such as `--help` and `--version`; it does not call a model, and Orca's version is read from its application bundle. An exact evidence match is verified, a protocol-compatible unknown version is warned but not certified as ready, and missing protocol features fail closed.
+
+The offline fault baseline covers rate limits, timeouts, process crashes, damaged output and protocol drift. Rate limits and timeouts are classified as retryable while remaining governed by graph retry, budget and provider policies. A crashed process or unknown protocol can never be reported as a successful result.
 
 ## Governed RSI
 
@@ -258,6 +260,7 @@ The stable Agent OS root contains learning, optimization, reuse, approvals and r
 
 ```bash
 agent-os agent-os status --root /path/to/agent-os-state
+agent-os agent-os compatibility
 agent-os agent-os export --root /path/to/agent-os-state --bundle /tmp/agent-os.bundle
 agent-os agent-os import --root /path/to/restored-state --bundle /tmp/agent-os.bundle
 agent-os agent-os doctor --root /path/to/agent-os-state
@@ -277,6 +280,7 @@ tests/        contract, recovery and cross-process integration tests
 - `agent-run` and `engineer` remain synchronous CLI entry points; advanced Graph/Orca background submission currently uses the Python interface.
 - Orca now shares the Agent OS resident lifecycle instead of requiring a separate daemon; question and escalation handling still uses the coordinator Python interface.
 - Data classification is enforced as policy metadata; credential lifecycle remains the responsibility of each tool.
+- Compatibility certification is currently exact-versioned to the table above; run `doctor` and add protocol evidence after upgrading a tool.
 - Real-project and real-Orca rollout still needs a small, monitored pilot.
 - Cross-host state, multi-tenant isolation and signed releases are not implemented yet.
 

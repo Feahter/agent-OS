@@ -1,8 +1,22 @@
 import json
 import sys
+import time
 
 
 mode = sys.argv[1]
+fault = sys.argv[2] if len(sys.argv) > 2 else None
+
+if fault == "timeout":
+    time.sleep(2)
+elif fault == "crash":
+    print("simulated process crash", file=sys.stderr)
+    raise SystemExit(23)
+elif fault == "rate-limit":
+    print("429 too many requests: rate limit exceeded", file=sys.stderr)
+    raise SystemExit(29)
+elif fault == "corrupt":
+    print("{not-json")
+    raise SystemExit(0)
 
 if mode == "claude":
     print(

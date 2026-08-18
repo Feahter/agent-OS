@@ -28,6 +28,10 @@ class AgentProtocolError(ContractViolation):
     pass
 
 
+class AgentRateLimitError(RetryableNodeError):
+    pass
+
+
 class AgentTimeoutError(RetryableNodeError):
     pass
 

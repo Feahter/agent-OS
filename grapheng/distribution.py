@@ -2,6 +2,8 @@ import fcntl
 import hashlib
 import json
 import os
+import plistlib
+import re
 import shutil
 import subprocess
 import sys
@@ -21,14 +23,15 @@ from .os import AGENT_OS_SCHEMA_VERSION, AgentOS
 
 
 RELEASE_SCHEMA_VERSION = 1
-DIAGNOSTIC_SCHEMA_VERSION = 1
-COMPATIBILITY_MATRIX_VERSION = 1
+DIAGNOSTIC_SCHEMA_VERSION = 2
+COMPATIBILITY_MATRIX_VERSION = 2
 _RELEASE_KIND = "grapheng-agent-os-release"
 _MINIMUM_PYTHON = (3, 9)
 _SOURCE_FILES = (
     Path("README.md"),
     Path(".workflow/agent-os/plan.md"),
     Path(".workflow/agent-os/results.md"),
+    Path("grapheng/compatibility-evidence.json"),
 )
 _SOURCE_GLOBS = (
     (Path("grapheng"), "*.py"),
@@ -44,6 +47,11 @@ _REQUIRED_RELEASE_PATHS = (
     PurePosixPath("grapheng/cli.py"),
     PurePosixPath("grapheng/distribution.py"),
     PurePosixPath("state.bundle/manifest.json"),
+)
+_COMPATIBILITY_EVIDENCE_PATH = Path("grapheng/compatibility-evidence.json")
+_COMPATIBILITY_EVIDENCE_SCHEMA_VERSION = 1
+_VERSION_PATTERN = re.compile(
+    r"(?<![0-9])([0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?)"
 )
 
 
@@ -156,6 +164,7 @@ class AgentOSDistribution:
 
     def compatibility_matrix(self) -> Mapping[str, Any]:
         migrations = default_bundle_migrations()
+        evidence = self._compatibility_evidence()
         return {
             "matrix_schema_version": COMPATIBILITY_MATRIX_VERSION,
             "runtime": {
@@ -187,9 +196,22 @@ class AgentOSDistribution:
                     "help_arguments": list(probe.help_arguments),
                     "required_help_flags": list(probe.required_help_flags),
                     "diagnostic_side_effect": "help/version only; no model or Orca object creation",
+                    "support": {
+                        "policy": "exact version with matching protocol evidence",
+                        "verified_versions": evidence["adapters"][probe.probe_id],
+                        "last_verified_at": max(
+                            item["validated_at"]
+                            for item in evidence["adapters"][probe.probe_id]
+                        ),
+                    },
                 }
                 for probe in _COMMAND_PROBES
             ],
+            "evidence": {
+                "schema_version": evidence["schema_version"],
+                "verification_scope": evidence["verification_scope"],
+                "platform": evidence["platform"],
+            },
             "portability": {
                 "included": [
                     "runtime source",
@@ -219,14 +241,18 @@ class AgentOSDistribution:
         checks.append(self._state_check(agent_os_root))
         checks.extend(self._command_check(probe) for probe in _COMMAND_PROBES)
         statuses = {item.check_id: item.status for item in checks}
+        ready_executors = [
+            probe.probe_id
+            for probe in _COMMAND_PROBES
+            if probe.role == "agent"
+            and statuses.get(f"adapter:{probe.probe_id}") == "pass"
+        ]
         return {
             "diagnostic_schema_version": DIAGNOSTIC_SCHEMA_VERSION,
+            "observed_at": self._clock(),
             "healthy": all(item.status != "fail" for item in checks),
-            "ready_for_agent_execution": any(
-                statuses.get(f"adapter:{probe.probe_id}") == "pass"
-                for probe in _COMMAND_PROBES
-                if probe.role == "agent"
-            ),
+            "ready_for_agent_execution": bool(ready_executors),
+            "ready_executors": ready_executors,
             "ready_for_orca": statuses.get("orchestration:orca") == "pass",
             "checks": [item.to_dict() for item in checks],
             "compatibility": self.compatibility_matrix(),
@@ -510,8 +536,10 @@ class AgentOSDistribution:
         missing = [
             flag for flag in probe.required_help_flags if flag not in help_text
         ]
-        version = (version_result.stdout or version_result.stderr or "").strip()
-        version = version.splitlines()[0][:200] if version else None
+        version = self._installed_version(probe, path, version_result)
+        verified = self._compatibility_evidence()["adapters"][probe.probe_id]
+        verified_versions = [item["version"] for item in verified]
+        last_verified_at = max(item["validated_at"] for item in verified)
         if help_result.returncode != 0 or missing:
             return DiagnosticCheck(
                 f"{prefix}:{probe.probe_id}",
@@ -524,20 +552,113 @@ class AgentOSDistribution:
                     "help_exit_code": help_result.returncode,
                     "missing_help_flags": missing,
                     "version": version,
+                    "support_status": "protocol_mismatch",
+                    "verified_versions": verified_versions,
+                    "last_verified_at": last_verified_at,
                 },
             )
-        version_status = "pass" if version_result.returncode == 0 else "warn"
+        support_status = (
+            "verified" if version in verified_versions else "unverified_version"
+        )
+        version_status = (
+            "pass"
+            if version_result.returncode == 0 and support_status == "verified"
+            else "warn"
+        )
+        if version_status == "pass":
+            summary = f"Command {probe.command} satisfies the verified Adapter protocol"
+        elif support_status == "verified":
+            summary = f"Command {probe.command} matches a verified version but its version probe failed"
+        else:
+            summary = f"Command {probe.command} matches the protocol but its version is not verified"
         return DiagnosticCheck(
             f"{prefix}:{probe.probe_id}",
             version_status,
-            f"Command {probe.command} satisfies the declared protocol",
+            summary,
             {
                 "command": probe.command,
                 "path": path,
                 "protocol": probe.protocol,
                 "version": version,
+                "support_status": support_status,
+                "verified_versions": verified_versions,
+                "last_verified_at": last_verified_at,
             },
         )
+
+    def _compatibility_evidence(self) -> Mapping[str, Any]:
+        path = self.source_root / _COMPATIBILITY_EVIDENCE_PATH
+        evidence = self._read_json(path)
+        adapters = evidence.get("adapters")
+        if (
+            evidence.get("schema_version")
+            != _COMPATIBILITY_EVIDENCE_SCHEMA_VERSION
+            or not isinstance(evidence.get("verification_scope"), str)
+            or not isinstance(evidence.get("platform"), dict)
+            or not isinstance(adapters, dict)
+        ):
+            raise ContractViolation("invalid compatibility evidence envelope")
+        expected_ids = {probe.probe_id for probe in _COMMAND_PROBES}
+        if set(adapters) != expected_ids:
+            raise ContractViolation("compatibility evidence Adapter set is incomplete")
+        for probe in _COMMAND_PROBES:
+            records = adapters[probe.probe_id]
+            if not isinstance(records, list) or not records:
+                raise ContractViolation(
+                    f"compatibility evidence is missing versions for {probe.probe_id}"
+                )
+            versions = set()
+            for record in records:
+                if (
+                    not isinstance(record, dict)
+                    or record.get("protocol") != probe.protocol
+                    or not isinstance(record.get("version"), str)
+                    or not record["version"].strip()
+                    or not isinstance(record.get("validated_at"), str)
+                    or not record["validated_at"].strip()
+                    or not isinstance(record.get("version_source"), str)
+                    or not record["version_source"].strip()
+                    or record["version"] in versions
+                ):
+                    raise ContractViolation(
+                        f"invalid compatibility evidence for {probe.probe_id}"
+                    )
+                versions.add(record["version"])
+        return evidence
+
+    @classmethod
+    def _installed_version(
+        cls,
+        probe: _CommandProbe,
+        path: str,
+        result: subprocess.CompletedProcess,
+    ) -> Optional[str]:
+        text = f"{result.stdout or ''}\n{result.stderr or ''}"
+        match = _VERSION_PATTERN.search(text)
+        if match is not None:
+            return match.group(1)
+        if probe.probe_id != "orca":
+            return None
+        return cls._macos_bundle_version(Path(path))
+
+    @staticmethod
+    def _macos_bundle_version(command: Path) -> Optional[str]:
+        try:
+            resolved = command.resolve(strict=True)
+        except OSError:
+            return None
+        app = next(
+            (parent for parent in resolved.parents if parent.suffix == ".app"),
+            None,
+        )
+        if app is None:
+            return None
+        try:
+            with (app / "Contents" / "Info.plist").open("rb") as handle:
+                value = plistlib.load(handle).get("CFBundleShortVersionString")
+        except (OSError, plistlib.InvalidFileException):
+            return None
+        return value if isinstance(value, str) and value.strip() else None
 
     def _copy_runtime(self, destination: Path) -> None:
         for source in self._runtime_sources():

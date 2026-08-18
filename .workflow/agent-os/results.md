@@ -80,6 +80,8 @@
 - Coordinator schema 升至 v2，候选自带 checksum，v1 非合并状态可安全迁移；候选、receipt 与清理状态进入运行态快照但不进入迁移包。
 - `AgentOSDistribution` 已收束 Python/源码布局/文件系统/状态检查、兼容矩阵、迁移演练、恢复验证和发行生成。
 - Claude Code、Codex、Pi 与 Orca 的协议诊断只调用 `--help / --version`，不触发模型、真实 Run、Task 或 Dispatch。
+- 兼容矩阵现已携带精确认证版本、协议、平台和最近验证时间；未知版本不认证 ready，协议缺项失败关闭，证据文件随发行包迁移。
+- 离线 fake CLI 覆盖限流、超时、进程崩溃和损坏输出；限流与超时进入可重试类型，但不绕过预算、供应商治理或 Graph 重试上限。
 - 当前 v2 bundle 和旧 v1 bundle 均经过 staging 转换与两次 round-trip 稳定性验证，演练期间源状态保持不变。
 - 自包含发行目录包含运行源码、测试、fake protocol fixture、示例、干净 `state.bundle`、`COMPATIBILITY.json`、`RESTORE.md` 与发行清单。
 - 发行清单逐文件绑定 SHA-256、大小和 release identity；目标已存在、身份被改写或任意内容被篡改都会失败关闭。

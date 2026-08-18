@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "verification_scope": "help/version protocol inspection only; no model calls or Orca object creation",
+  "platform": {
+    "architecture": "arm64",
+    "operating_system": "Darwin"
+  },
+  "adapters": {
+    "claude-code": [
+      {
+        "protocol": "json-envelope-v1",
+        "validated_at": "2026-08-18T08:58:53Z",
+        "version": "2.1.234",
+        "version_source": "claude --version"
+      }
+    ],
+    "codex": [
+      {
+        "protocol": "exec-jsonl-v1",
+        "validated_at": "2026-08-18T08:58:53Z",
+        "version": "0.148.0-alpha.9",
+        "version_source": "codex --version"
+      }
+    ],
+    "orca": [
+      {
+        "protocol": "orca-json-command-v1",
+        "validated_at": "2026-08-18T08:58:53Z",
+        "version": "1.4.180",
+        "version_source": "macOS application bundle"
+      }
+    ],
+    "pi-agent": [
+      {
+        "protocol": "message-end-jsonl-v1",
+        "validated_at": "2026-08-18T08:58:53Z",
+        "version": "0.84.1",
+        "version_source": "pi --version"
+      }
+    ]
+  }
+}

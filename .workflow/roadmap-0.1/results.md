@@ -88,3 +88,33 @@ P1.4 需要选择三个外部项目并调用真实 Agent，可能产生模型费
 - `PYTHONPYCACHEPREFIX=/tmp/agent-os-pycache python3 -m compileall -q grapheng tests`：通过。
 - `uv build --offline`：sdist 和 wheel 构建成功，包含异构常驻作业适配器。
 - 故障测试额外覆盖：Orca 从崩溃恢复后的暂停态收到取消请求，只停止并清理活动 dispatch 一次。
+
+## P5.1–P5.2：真实兼容证据与离线故障基线
+
+### 已完成
+
+- `AgentOSDistribution` 继续作为兼容性唯一事实模块；没有为诊断、发行或 RSI 新建平行状态。
+- 版本库保存 Codex `0.148.0-alpha.9`、Claude Code `2.1.234`、Pi `0.84.1`、Orca `1.4.180` 的协议、平台和最近验证时间，证据随自包含发行包迁移。
+- `doctor` 同时投影安装版本、认证版本、支持状态和最近验证时间；精确证据命中为 pass，协议匹配但版本未认证为 warn 且不进入 ready，协议漂移为 fail。
+- Orca CLI 没有独立版本输出时，从其 macOS 应用包读取版本；其他平台无法确认版本时保守保持未认证状态。
+- fake CLI 故障注入覆盖超时、限流、进程崩溃和损坏输出；命令探测额外覆盖超时、崩溃和协议漂移，所有路径都不调用模型。
+- 限流与超时进入可重试错误类型，仍由既有 Graph retry、预算、供应商限流和熔断共同约束；普通进程失败和协议损坏失败关闭。
+- 既有工程工作区指纹、受控合并漂移、checkpoint、single-flight、Effect receipt 和常驻对账测试继续覆盖工作区漂移与崩溃恢复。
+
+### 真实协议证据
+
+- 2026-08-18 在 Darwin arm64 上运行本地 `doctor`：四个工具均命中认证版本，Agent 执行与 Orca 就绪状态均为 true。
+- 探测范围仅为帮助、版本和本地应用包元数据；未发送 prompt，未创建 Orca Run/Task/Dispatch，token 与模型费用均为 0。
+
+### 验证
+
+- `PYTHONPYCACHEPREFIX=/tmp/agent-os-p5-pycache python3 -m unittest tests.test_distribution tests.test_adapters -v`：13 项通过。
+- `PYTHONPYCACHEPREFIX=/tmp/agent-os-p5-pycache python3 -m unittest discover -s tests -v`：210 项通过。
+- `PYTHONPYCACHEPREFIX=/tmp/agent-os-p5-pycache python3 -m compileall -q grapheng tests`：通过。
+- `uv build --offline`：sdist 和 wheel 构建成功，兼容证据进入两种发行物。
+- 在全新临时虚拟环境安装 wheel 后调用兼容矩阵：schema v2、四个 Adapter 及认证版本均可读取。
+- 真实本机只读 `doctor`：运行时、状态、Codex、Claude Code、Pi、Orca 共 8 项检查通过。
+
+### 待授权
+
+- P5.3 与 P1.4 合并执行低风险真实项目灰度，验证真实模型输出和 Orca 生命周期，并记录 token、费用、耗时与人工介入。

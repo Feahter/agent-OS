@@ -50,3 +50,6 @@ agent-os = "grapheng.cli:main"
 
 [tool.setuptools]
 packages = ["grapheng"]
+
+[tool.setuptools.package-data]
+grapheng = ["compatibility-evidence.json"]

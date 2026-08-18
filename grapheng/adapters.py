@@ -12,7 +12,13 @@ from .agents import (
     ExecutorRegistry,
     validate_agent_outputs,
 )
-from .errors import AgentExecutionError, AgentProtocolError, AgentTimeoutError, ContractViolation
+from .errors import (
+    AgentExecutionError,
+    AgentProtocolError,
+    AgentRateLimitError,
+    AgentTimeoutError,
+    ContractViolation,
+)
 from .routing import PolicyRouter
 from .reuse import VerifiedArtifactCache
 
@@ -96,6 +102,14 @@ class _CliExecutor:
             detail = (completed.stderr or completed.stdout).strip()
             if len(detail) > 1000:
                 detail = detail[-1000:]
+            normalized = detail.lower()
+            if any(
+                marker in normalized
+                for marker in ("rate limit", "rate_limit", "too many requests", "429")
+            ):
+                raise AgentRateLimitError(
+                    f"agent {executor_id} was rate limited: {detail}"
+                )
             raise AgentExecutionError(
                 f"agent {executor_id} exited with {completed.returncode}: {detail}"
             )

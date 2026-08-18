@@ -218,14 +218,16 @@ resident.start_background()
 
 ## 支持的工具
 
-| 工具 | 用途 | 接入方式 |
-| --- | --- | --- |
-| Codex | 编码与审查 | 本地 CLI Adapter |
-| Claude Code | 编码与审查 | 本地 CLI Adapter |
-| Pi | 轻量编码与审查 | 本地 CLI Adapter |
-| Orca | 隔离 worker 生命周期与结果交付 | 图编译器、后端与协调器 |
+| 工具 | 已验证版本 | 协议 | 接入方式 |
+| --- | --- | --- | --- |
+| Codex | `0.148.0-alpha.9` | `exec-jsonl-v1` | 本地 CLI Adapter |
+| Claude Code | `2.1.234` | `json-envelope-v1` | 本地 CLI Adapter |
+| Pi | `0.84.1` | `message-end-jsonl-v1` | 本地 CLI Adapter |
+| Orca | `1.4.180` | `orca-json-command-v1` | 图编译器、后端与协调器 |
 
-Adapter 会把统一的 `read / shell / edit / write` 工具契约翻译成各产品协议。执行器发现只运行 `--help`、`--version` 等协议检查，不会调用模型。
+Adapter 会把统一的 `read / shell / edit / write` 工具契约翻译成各产品协议。上述版本于 2026-08-18 在 Darwin arm64 上完成只读协议验收，证据保存在版本库并随发行包迁移。执行器发现只运行 `--help`、`--version` 等协议检查，不会调用模型；Orca 版本从应用包读取。版本与证据完全匹配时标记为已验证，协议匹配但版本未知时只警告且不认证为可执行，协议缺项则失败关闭。
+
+离线故障基线覆盖限流、超时、进程崩溃、损坏输出和协议漂移。限流与超时被归类为可重试故障，但仍受图重试、预算和供应商治理约束；进程崩溃和未知协议不会被伪装成成功结果。
 
 ## 受治理的 RSI
 
@@ -258,6 +260,7 @@ Adapter 会把统一的 `read / shell / edit / write` 工具契约翻译成各�
 
 ```bash
 agent-os agent-os status --root /path/to/agent-os-state
+agent-os agent-os compatibility
 agent-os agent-os export --root /path/to/agent-os-state --bundle /tmp/agent-os.bundle
 agent-os agent-os import --root /path/to/restored-state --bundle /tmp/agent-os.bundle
 agent-os agent-os doctor --root /path/to/agent-os-state
@@ -277,6 +280,7 @@ tests/        契约、恢复和跨进程集成测试
 - `agent-run` 和 `engineer` 仍是同步 CLI；高级 Graph/Orca 后台提交目前通过 Python 接口使用。
 - Orca 已复用 Agent OS 常驻生命周期，不再需要独立 daemon；问题与升级处理仍通过 Coordinator Python 接口完成。
 - 数据分级是策略约束，各工具仍需自行管理凭据生命周期。
+- 当前兼容认证精确绑定上表版本；升级工具后应先运行 `doctor` 并补充新的协议证据。
 - 真实项目和真实 Orca 接入需要先做小流量、可观察的灰度。
 - 跨主机状态、多租户隔离和带信任根的发行签名尚未实现。
 

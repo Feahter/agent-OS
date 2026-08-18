@@ -33,6 +33,7 @@ from .coordinator import (
 from .errors import (
     AgentExecutionError,
     AgentProtocolError,
+    AgentRateLimitError,
     AgentTimeoutError,
     ContractViolation,
     EffectIndeterminateError,
@@ -177,6 +178,7 @@ __all__ = [
     "AgentExecutor",
     "AgentNodeHandler",
     "AgentProtocolError",
+    "AgentRateLimitError",
     "AgentRequest",
     "AgentResult",
     "AgentSpec",
