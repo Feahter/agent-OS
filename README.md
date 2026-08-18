@@ -88,6 +88,23 @@ agent-os result task-0123456789abcdef
 
 `do` compiles the goal into a reviewable intent, performs read-only exploration and planning, returns a stable task ID, and stops at a digest-bound approval. The approval binds the goal, constraints, template, verification commands, project rules and proposed steps; any change invalidates it. `approve` executes only that plan and returns after bounded checks and an independent review. Use `control TASK_ID cancel --actor NAME` to cancel before approval. Add `--json` to any action for machine-readable output.
 
+For work that should survive the terminal, approve it for background execution. The local resident starts automatically, keeps a durable priority queue, and uses the same task status and reports as foreground execution:
+
+```bash
+agent-os approve task-0123456789abcdef \
+  --actor operator \
+  --background \
+  --priority 10
+
+agent-os status task-0123456789abcdef
+agent-os control task-0123456789abcdef pause --actor operator
+agent-os control task-0123456789abcdef resume --actor operator
+agent-os control task-0123456789abcdef reprioritize --priority 20 --actor operator
+agent-os control task-0123456789abcdef cancel --actor operator
+```
+
+Pause and cancellation take effect at the next safe checkpoint between Agent calls or verification steps. An in-flight Agent process is allowed to reach that checkpoint; Agent OS does not claim arbitrary mid-call suspension. After restart or resume, completed mutating calls are recovered from Effect Receipts instead of being replayed.
+
 The first templates are `fix`, `test`, `refactor`, `research` and `release`. Selection is automatic, or can be overridden with `--template`. Research tasks are enforced as read-only. If the goal is too vague or no trusted verification command can be found, `do` stops before calling an agent and tells you what context is missing. For custom checks and budgets, run `agent-os engineer init --workspace /path/to/project` once and edit `.agent-os/engineering.json`.
 
 The default home is `~/.agent-os`; override it with `AGENT_OS_HOME` or `--home`. Operational task state stays under `tasks/` and remains the single source for status and results. Portable, prompt-free learning and policy state stays under `state/`; raw objectives, project paths and runtime evidence are deliberately excluded from state exports.

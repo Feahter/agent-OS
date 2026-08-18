@@ -290,6 +290,14 @@ def _print_user_task(value, json_output: bool) -> None:
             f"{usage.get('tokens_used', 0)} tokens, "
             f"${float(usage.get('cost_usd', 0.0)):.4f}"
         )
+    scheduling = value.get("scheduling")
+    if isinstance(scheduling, dict):
+        print(
+            "Queue: "
+            f"{scheduling.get('state', 'unknown')} · "
+            f"priority {scheduling.get('priority', 0)} · "
+            f"attempt {scheduling.get('attempts', 0)}"
+        )
     outcome = value.get("outcome")
     if isinstance(outcome, dict) and outcome.get("summary"):
         print(f"Outcome: {outcome['summary']}")
@@ -300,8 +308,12 @@ def _print_user_task(value, json_output: bool) -> None:
                 print(f"Artifact: {artifact.get('name', 'result')} -> {artifact['path']}")
     next_action = value.get("next_action")
     if next_action:
-        suffix = " --actor YOUR_NAME" if next_action == "approve" else ""
-        print(f"Next: agent-os {next_action} {task_id}{suffix}")
+        if next_action == "approve":
+            print(f"Next: agent-os approve {task_id} --actor YOUR_NAME")
+        elif next_action == "control":
+            print(f"Next: agent-os control {task_id} resume --actor YOUR_NAME")
+        else:
+            print(f"Next: agent-os {next_action} {task_id}")
 
 
 def _run_user_task_command(args) -> int:
@@ -317,9 +329,14 @@ def _run_user_task_command(args) -> int:
     elif args.command == "status":
         value = tasks.status(args.task_id)
     elif args.command == "approve":
-        value = tasks.approve(args.task_id, args.actor)
+        value = tasks.approve(
+            args.task_id,
+            args.actor,
+            background=args.background,
+            priority=args.priority,
+        )
     elif args.command == "control":
-        value = tasks.control(args.task_id, args.action, args.actor)
+        value = tasks.control(args.task_id, args.action, args.actor, args.priority)
     else:
         value = tasks.result(args.task_id)
     _print_user_task(value, args.json_output)
@@ -346,12 +363,17 @@ def main() -> int:
     approve_parser = subparsers.add_parser("approve")
     approve_parser.add_argument("task_id")
     approve_parser.add_argument("--actor", required=True)
+    approve_parser.add_argument("--background", action="store_true")
+    approve_parser.add_argument("--priority", type=int, default=0)
     approve_parser.add_argument("--home", type=Path)
     approve_parser.add_argument("--json", action="store_true", dest="json_output")
     control_parser = subparsers.add_parser("control")
     control_parser.add_argument("task_id")
-    control_parser.add_argument("action", choices=("cancel",))
+    control_parser.add_argument(
+        "action", choices=("pause", "resume", "cancel", "reprioritize")
+    )
     control_parser.add_argument("--actor", required=True)
+    control_parser.add_argument("--priority", type=int)
     control_parser.add_argument("--home", type=Path)
     control_parser.add_argument("--json", action="store_true", dest="json_output")
     result_parser = subparsers.add_parser("result")

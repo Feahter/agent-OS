@@ -15,12 +15,17 @@ from grapheng import (
     ExecutorCapabilities,
     ExecutorRegistry,
     ProjectPolicy,
+    ResidentCoordinator,
     UserTaskModule,
 )
 from grapheng.cli import main
 
 
 class TaskExecutor:
+    def __init__(self, hook=None):
+        self.hook = hook
+        self.calls = []
+
     @property
     def capabilities(self):
         return ExecutorCapabilities(
@@ -31,6 +36,9 @@ class TaskExecutor:
 
     def execute(self, request):
         role = request.task_type.split(".")[-1]
+        self.calls.append(role)
+        if role == "implement" and self.hook is not None:
+            self.hook()
         outputs = {
             "explore": {"exploration": {"files": ["app.py"]}},
             "plan": {"plan": {"steps": ["change", "verify"]}},
@@ -252,6 +260,87 @@ class UserTaskModuleTests(unittest.TestCase):
 
         self.assertIn("Plan ready and waiting for approval", human.getvalue())
         self.assertEqual(value, json.loads(machine.getvalue()))
+
+    def test_cli_background_approval_forwards_priority(self):
+        task_id = "task-0123456789abcdef"
+        tasks = Mock()
+        tasks.approve.return_value = {
+            "task_id": task_id,
+            "phase": "queued",
+            "summary": "Approved task is queued for background execution",
+            "next_action": "status",
+            "usage": {"tokens_used": 10, "cost_usd": 0.02},
+            "scheduling": {"state": "queued", "priority": 12, "attempts": 0},
+        }
+        output = io.StringIO()
+        argv = [
+            "agent-os",
+            "approve",
+            task_id,
+            "--actor",
+            "operator",
+            "--background",
+            "--priority",
+            "12",
+        ]
+        with patch(
+            "grapheng.cli.UserTaskModule", return_value=tasks
+        ), patch.object(sys, "argv", argv), contextlib.redirect_stdout(output):
+            self.assertEqual(0, main())
+
+        tasks.approve.assert_called_once_with(
+            task_id, "operator", background=True, priority=12
+        )
+        self.assertIn("priority 12", output.getvalue())
+
+    def test_background_task_pauses_and_resumes_without_repeating_mutation(self):
+        task_id = "task-fedcba9876543210"
+        executor = TaskExecutor()
+        holder = {}
+        home = self.root / "background-home"
+
+        def workflow_factory(workspace, task_dir, policy, agent_os):
+            registry = ExecutorRegistry()
+            registry.register(executor)
+            return EngineeringWorkflow(
+                workspace,
+                task_dir,
+                registry,
+                policy,
+                agent_os_root=agent_os.root,
+            )
+
+        resident = ResidentCoordinator(
+            home,
+            task_module_factory=lambda: holder["tasks"],
+        )
+        resident.start_background = Mock()
+        tasks = UserTaskModule(
+            home,
+            workflow_factory=workflow_factory,
+            resident_factory=lambda: resident,
+            id_factory=lambda: task_id,
+        )
+        holder["tasks"] = tasks
+        submitted = tasks.do("Change the value safely", self.workspace)
+        executor.hook = lambda: resident.request(task_id, "pause")
+
+        queued = tasks.approve(
+            submitted["task_id"], "operator", background=True, priority=5
+        )
+        self.assertEqual("queued", queued["phase"])
+        self.assertEqual(5, queued["scheduling"]["priority"])
+        self.assertTrue(resident.serve_once())
+        self.assertEqual("paused", tasks.status(task_id)["phase"])
+
+        executor.hook = None
+        resumed = tasks.control(task_id, "resume", "operator")
+        self.assertEqual("queued", resumed["phase"])
+        self.assertTrue(resident.serve_once())
+
+        self.assertEqual("succeeded", tasks.status(task_id)["phase"])
+        self.assertEqual(1, executor.calls.count("implement"))
+        self.assertTrue(tasks.result(task_id)["verification"]["passed"])
 
 
 if __name__ == "__main__":

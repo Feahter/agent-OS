@@ -385,6 +385,14 @@ class CheckResult:
         return {**asdict(self), "command": list(self.command), "passed": self.passed}
 
 
+class _EngineeringPaused(Exception):
+    pass
+
+
+class _EngineeringCancelled(Exception):
+    pass
+
+
 class EngineeringWorkflow:
     """Coordinates a finite engineering loop without changing GraphSpec semantics."""
 
@@ -552,7 +560,12 @@ class EngineeringWorkflow:
         )
         return plan
 
-    def execute(self, approved_by: str, plan_digest: Optional[str] = None) -> Mapping[str, Any]:
+    def execute(
+        self,
+        approved_by: str,
+        plan_digest: Optional[str] = None,
+        control_probe: Optional[Callable[[], Optional[str]]] = None,
+    ) -> Mapping[str, Any]:
         if not isinstance(approved_by, str) or not approved_by.strip():
             raise ContractViolation("engineering execution requires approved_by")
         if not isinstance(plan_digest, str) or not plan_digest.strip():
@@ -610,6 +623,7 @@ class EngineeringWorkflow:
         last_execution_task = ""
         self._write_running_state(state)
         try:
+            self._control_checkpoint(control_probe)
             result = self._bounded_agent_call(
                 state,
                 started,
@@ -646,6 +660,7 @@ class EngineeringWorkflow:
                 and execution_workspace_digest != self._workspace_fingerprint()
             ):
                 raise ContractViolation("read-only research changed the workspace")
+            self._control_checkpoint(control_probe)
 
             while True:
                 self._require_time(started)
@@ -658,6 +673,7 @@ class EngineeringWorkflow:
                     }
                 )
                 self._write_running_state(state)
+                self._control_checkpoint(control_probe)
                 if not all(item.passed for item in checks):
                     if not mutation_allowed:
                         state["phase"] = "failed"
@@ -721,6 +737,7 @@ class EngineeringWorkflow:
                                 "engineering-independent-review",
                             )
                         break
+                    self._control_checkpoint(control_probe)
                     if not mutation_allowed:
                         state["phase"] = "failed"
                         state["failure"] = "read_only_review_rejected"
@@ -764,6 +781,19 @@ class EngineeringWorkflow:
                 )
                 self._assert_protected_unchanged(protected)
                 self._write_running_state(state)
+                self._control_checkpoint(control_probe)
+        except _EngineeringPaused:
+            state["phase"] = "paused"
+            state["updated_at"] = self._clock()
+            self._write_running_state(state)
+            return state
+        except _EngineeringCancelled:
+            state["phase"] = "cancelled"
+            state["finished_at"] = self._clock()
+            state["failure"] = None
+            _atomic_json_write(self.report_path, state)
+            self._write_running_state(state)
+            return state
         except Exception as error:
             state["phase"] = "failed"
             state["failure"] = f"{type(error).__name__}: {error}"
@@ -776,6 +806,20 @@ class EngineeringWorkflow:
         _atomic_json_write(self.report_path, state)
         self._write_running_state(state)
         return state
+
+    @staticmethod
+    def _control_checkpoint(
+        control_probe: Optional[Callable[[], Optional[str]]]
+    ) -> None:
+        if control_probe is None:
+            return
+        action = control_probe()
+        if action == "pause":
+            raise _EngineeringPaused()
+        if action == "cancel":
+            raise _EngineeringCancelled()
+        if action is not None:
+            raise ContractViolation("engineering control probe returned an invalid action")
 
     def status(self) -> Mapping[str, Any]:
         for path in (self.report_path, self.task_dir / "status.json"):

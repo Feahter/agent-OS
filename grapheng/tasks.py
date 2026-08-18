@@ -71,6 +71,7 @@ class UserTaskModule:
             Callable[[Path, Path, ProjectPolicy, AgentOS], EngineeringWorkflow]
         ] = None,
         intent_compiler: Optional[IntentCompiler] = None,
+        resident_factory: Optional[Callable[[], Any]] = None,
         clock: Callable[[], float] = time.time,
         id_factory: Optional[Callable[[], str]] = None,
     ):
@@ -90,6 +91,7 @@ class UserTaskModule:
         self.agent_os = AgentOS(self.state_root)
         self._workflow_factory = workflow_factory
         self._intent_compiler = intent_compiler or IntentCompiler()
+        self._resident_factory = resident_factory
         self._clock = clock
         self._id_factory = id_factory or (
             lambda: f"task-{uuid.uuid4().hex[:16]}"
@@ -194,9 +196,52 @@ class UserTaskModule:
                 "assumptions": list(intent.assumptions),
             }
             value["proposed_plan"] = engineering_plan.plan
+        resident = self._resident_if_initialized()
+        scheduling = resident.inspect(task_id) if resident is not None else None
+        if scheduling is not None:
+            value["scheduling"] = {
+                key: scheduling.get(key)
+                for key in (
+                    "state",
+                    "priority",
+                    "sequence",
+                    "attempts",
+                    "requested_action",
+                    "error",
+                )
+            }
+            schedule_state = scheduling.get("state")
+            if schedule_state == "queued":
+                value.update(
+                    {
+                        "phase": "queued",
+                        "summary": self._phase_summary("queued"),
+                        "next_action": "status",
+                        "approval_required": False,
+                    }
+                )
+            elif schedule_state == "paused":
+                value.update(
+                    {
+                        "phase": "paused",
+                        "summary": self._phase_summary("paused"),
+                        "next_action": "control",
+                        "approval_required": False,
+                    }
+                )
+            elif schedule_state == "pause_requested":
+                value["summary"] = "Pause requested; waiting for the next safe checkpoint"
+            elif schedule_state == "cancel_requested":
+                value["summary"] = "Cancellation requested; waiting for the next safe checkpoint"
         return value
 
-    def approve(self, task_id: str, actor: str) -> Mapping[str, Any]:
+    def approve(
+        self,
+        task_id: str,
+        actor: str,
+        background: bool = False,
+        priority: int = 0,
+    ) -> Mapping[str, Any]:
         if not isinstance(actor, str) or not actor.strip():
             raise ContractViolation("task approval actor cannot be empty")
         task_dir, _ = self._task(task_id)
@@ -209,33 +254,159 @@ class UserTaskModule:
         digest = plan.get("digest")
         if not isinstance(digest, str) or not digest:
             raise ContractViolation("task plan has no approval digest")
+        if background:
+            approved_at = self._clock()
+            approval_path = task_dir / "approval.json"
+            approval = {
+                "schema_version": USER_TASK_SCHEMA_VERSION,
+                "task_id": task_id,
+                "actor": actor.strip(),
+                "plan_digest": digest,
+                "approved_at": approved_at,
+            }
+            queued_state = dict(state)
+            queued_state.update(
+                {
+                    "phase": "queued",
+                    "approved_by": actor.strip(),
+                    "approved_at": approved_at,
+                    "updated_at": approved_at,
+                }
+            )
+            _atomic_json_write(approval_path, approval)
+            _atomic_json_write(task_dir / "status.json", queued_state)
+            resident = self._resident()
+            try:
+                resident.submit(task_id, priority)
+            except Exception:
+                _atomic_json_write(task_dir / "status.json", state)
+                approval_path.unlink(missing_ok=True)
+                raise
+            resident.start_background()
+            return self.status(task_id)
         self._workflow(task_dir).execute(actor.strip(), digest)
         return self.status(task_id)
 
     def control(
-        self, task_id: str, action: str, actor: str
+        self,
+        task_id: str,
+        action: str,
+        actor: str,
+        priority: Optional[int] = None,
     ) -> Mapping[str, Any]:
-        if action != "cancel":
-            raise ContractViolation("task control currently supports only cancel")
+        if action not in ("pause", "resume", "cancel", "reprioritize"):
+            raise ContractViolation("unsupported task control action")
         if not isinstance(actor, str) or not actor.strip():
             raise ContractViolation("task control actor cannot be empty")
         task_dir, _ = self._task(task_id)
         state = dict(self._state(task_dir))
-        if state.get("phase") != "awaiting_approval":
-            raise ContractViolation(
-                f"task {task_id} cannot be cancelled from phase {state.get('phase', 'preparing')}"
+        phase = state.get("phase")
+        if phase == "awaiting_approval" and action == "cancel":
+            cancelled_at = self._clock()
+            state.update(
+                {
+                    "phase": "cancelled",
+                    "cancelled_by": actor.strip(),
+                    "cancelled_at": cancelled_at,
+                    "updated_at": cancelled_at,
+                }
             )
-        cancelled_at = self._clock()
+            _atomic_json_write(task_dir / "status.json", state)
+            return self.status(task_id)
+        resident = self._resident_if_initialized()
+        scheduling = resident.inspect(task_id) if resident is not None else None
+        if scheduling is None:
+            raise ContractViolation(
+                f"task {task_id} cannot be controlled from phase {phase or 'preparing'}"
+            )
+        updated = resident.request(task_id, action, priority)
+        changed_at = self._clock()
+        if updated["state"] == "cancelled":
+            state.update(
+                {
+                    "phase": "cancelled",
+                    "cancelled_by": actor.strip(),
+                    "cancelled_at": changed_at,
+                    "updated_at": changed_at,
+                }
+            )
+            _atomic_json_write(task_dir / "status.json", state)
+        elif updated["state"] == "paused":
+            state.update(
+                {
+                    "phase": "paused",
+                    "paused_by": actor.strip(),
+                    "paused_at": changed_at,
+                    "updated_at": changed_at,
+                }
+            )
+            _atomic_json_write(task_dir / "status.json", state)
+        elif action == "resume":
+            state.update(
+                {
+                    "phase": "queued",
+                    "resumed_by": actor.strip(),
+                    "resumed_at": changed_at,
+                    "updated_at": changed_at,
+                }
+            )
+            _atomic_json_write(task_dir / "status.json", state)
+            resident.start_background()
+        return self.status(task_id)
+
+    def execute_queued(
+        self,
+        task_id: str,
+        control_probe: Callable[[], Optional[str]],
+    ) -> Mapping[str, Any]:
+        task_dir, _ = self._task(task_id)
+        state = self._state(task_dir)
+        if state.get("phase") not in ("queued", "running", "paused"):
+            raise ContractViolation(
+                f"task {task_id} cannot run from phase {state.get('phase', 'preparing')}"
+            )
+        approval = _read_json(task_dir / "approval.json", "task approval")
+        if set(approval) != {
+            "schema_version",
+            "task_id",
+            "actor",
+            "plan_digest",
+            "approved_at",
+        }:
+            raise ContractViolation("task approval has an invalid contract")
+        actor = approval.get("actor")
+        digest = approval.get("plan_digest")
+        if (
+            approval.get("schema_version") != USER_TASK_SCHEMA_VERSION
+            or approval.get("task_id") != task_id
+            or not isinstance(actor, str)
+            or not actor.strip()
+            or not isinstance(digest, str)
+            or not digest
+        ):
+            raise ContractViolation("task approval fields are invalid")
+        return self._workflow(task_dir).execute(actor, digest, control_probe)
+
+    def record_queue_failure(self, task_id: str, failure: str) -> None:
+        task_dir, _ = self._task(task_id)
+        state = dict(self._state(task_dir))
+        if state.get("phase") in _TERMINAL_PHASES:
+            return
+        failed_at = self._clock()
         state.update(
             {
-                "phase": "cancelled",
-                "cancelled_by": actor.strip(),
-                "cancelled_at": cancelled_at,
-                "updated_at": cancelled_at,
+                "phase": "failed",
+                "success": False,
+                "failure": failure,
+                "finished_at": failed_at,
+                "updated_at": failed_at,
             }
         )
         _atomic_json_write(task_dir / "status.json", state)
-        return self.status(task_id)
+
+    def execution_phase(self, task_id: str) -> str:
+        task_dir, _ = self._task(task_id)
+        return str(self._state(task_dir).get("phase", "preparing"))
 
     def result(self, task_id: str) -> Mapping[str, Any]:
         task_dir, _ = self._task(task_id)
@@ -389,6 +560,20 @@ class UserTaskModule:
             agent_os_root=self.agent_os.root,
         )
 
+    def _resident(self):
+        if self._resident_factory is not None:
+            return self._resident_factory()
+        from .resident import ResidentCoordinator
+
+        return ResidentCoordinator(self.home)
+
+    def _resident_if_initialized(self):
+        if self._resident_factory is not None:
+            return self._resident_factory()
+        if not (self.home / "runtime" / "resident" / "queue.json").is_file():
+            return None
+        return self._resident()
+
     @staticmethod
     def _state(task_dir: Path) -> Mapping[str, Any]:
         report = task_dir / "report.json"
@@ -419,10 +604,12 @@ class UserTaskModule:
         return {
             "preparing": "Preparing an execution plan",
             "awaiting_approval": "Plan ready and waiting for approval",
+            "queued": "Approved task is queued for background execution",
             "running": "Executing the approved plan",
+            "paused": "Task is paused at a safe checkpoint",
             "succeeded": "Verified result is ready",
             "failed": "Task stopped without a verified result",
-            "cancelled": "Task was cancelled before execution",
+            "cancelled": "Task was cancelled",
         }.get(phase, f"Task is {phase}")
 
     @staticmethod
