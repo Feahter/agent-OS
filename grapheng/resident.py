@@ -21,6 +21,11 @@ from typing import Any, Callable, Dict, Mapping, Optional, Protocol, Union
 
 from .errors import ContractViolation
 from .model import GraphSpec
+from .task_center import (
+    TASK_CENTER_SCHEMA_VERSION,
+    NotificationSink,
+    ResidentNotificationJournal,
+)
 
 
 RESIDENT_QUEUE_SCHEMA_VERSION = 2
@@ -100,6 +105,7 @@ class ResidentCoordinator:
         clock: Callable[[], float] = time.time,
         poll_seconds: float = 0.2,
         heartbeat_seconds: float = 1.0,
+        notification_sink: Optional[NotificationSink] = None,
     ):
         self.home = home.expanduser().absolute()
         self.root = self.home / "runtime" / "resident"
@@ -110,7 +116,12 @@ class ResidentCoordinator:
         self.queue_lock_path = self.root / "queue.lock"
         self.instance_lock_path = self.root / "instance.lock"
         self.instance_path = self.root / "instance.json"
-        for path in (self.queue_path, self.queue_lock_path, self.instance_lock_path, self.instance_path):
+        for path in (
+            self.queue_path,
+            self.queue_lock_path,
+            self.instance_lock_path,
+            self.instance_path,
+        ):
             if path.is_symlink():
                 raise ContractViolation("resident runtime files cannot be symlinks")
         self._clock = clock
@@ -131,6 +142,12 @@ class ResidentCoordinator:
             self._job_handlers.setdefault(kind, handler)
         self._job_handlers.setdefault(
             "engineering", _EngineeringJobHandler(self._task_module_factory)
+        )
+        self._notification_sink = notification_sink
+        self._notifications = (
+            ResidentNotificationJournal(self.root, notification_sink, self._clock)
+            if notification_sink is not None
+            else None
         )
         self._stop = threading.Event()
         if not self.queue_path.exists():
@@ -198,6 +215,88 @@ class ResidentCoordinator:
         with _file_lock(self.queue_lock_path):
             item = self._read_queue()["items"].get(job_id)
             return dict(item) if isinstance(item, dict) else None
+
+    def task_center(self, limit: int = 20) -> Mapping[str, Any]:
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 200
+        ):
+            raise ContractViolation("task center limit must be between 1 and 200")
+        with _file_lock(self.queue_lock_path):
+            queued = {
+                job_id: dict(item)
+                for job_id, item in self._read_queue()["items"].items()
+                if isinstance(item, dict)
+            }
+        items = dict(queued)
+        for kind, handler in self._job_handlers.items():
+            discover = getattr(handler, "discover", None)
+            if not callable(discover):
+                continue
+            try:
+                references = tuple(discover())
+            except Exception:
+                continue
+            for reference in references:
+                try:
+                    self._validate_job(kind, reference)
+                    phase = str(handler.inspect(reference))
+                except Exception:
+                    continue
+                job_id = self._job_id(kind, reference)
+                if job_id in items:
+                    continue
+                items[job_id] = {
+                    "job_id": job_id,
+                    "kind": kind,
+                    "reference": reference,
+                    "priority": None,
+                    "sequence": None,
+                    "state": phase,
+                    "requested_action": None,
+                    "submitted_at": None,
+                    "updated_at": None,
+                    "attempts": 0,
+                    "error": None,
+                    "_scheduled": False,
+                }
+        jobs = [self._project_item(item) for item in items.values()]
+        jobs.sort(
+            key=lambda item: (
+                0
+                if item["attention_required"]
+                else 1
+                if item["state"] not in _TERMINAL_STATES
+                else 2,
+                -float(item["updated_at"] or 0.0),
+                str(item["job_id"]),
+            )
+        )
+        counts = {
+            "total": len(jobs),
+            "active": sum(item["state"] not in _TERMINAL_STATES for item in jobs),
+            "needs_attention": sum(item["attention_required"] for item in jobs),
+            "succeeded": sum(item["state"] == "succeeded" for item in jobs),
+            "failed": sum(item["state"] == "failed" for item in jobs),
+            "cancelled": sum(item["state"] == "cancelled" for item in jobs),
+        }
+        reported_usage = [item["usage"] for item in jobs if item["usage"] is not None]
+        usage = {
+            "tokens_used": sum(item["tokens_used"] for item in reported_usage),
+            "cost_usd": sum(item["cost_usd"] for item in reported_usage),
+            "jobs_reported": len(reported_usage),
+            "complete": len(reported_usage) == len(jobs),
+        }
+        return {
+            "schema_version": TASK_CENTER_SCHEMA_VERSION,
+            "generated_at": self._clock(),
+            "resident_running": self.is_running(),
+            "desktop_notifications": self._desktop_notifications_enabled(),
+            "counts": counts,
+            "usage": usage,
+            "jobs": jobs[:limit],
+        }
 
     def request(
         self,
@@ -410,6 +509,7 @@ class ResidentCoordinator:
             return dict(item)
 
     def _settle(self, job_id: str, phase: str, error: Optional[str]) -> None:
+        settled = None
         with _file_lock(self.queue_lock_path):
             queue = self._read_queue()
             item = queue["items"].get(job_id)
@@ -425,6 +525,12 @@ class ResidentCoordinator:
             item["updated_at"] = self._clock()
             queue["updated_at"] = item["updated_at"]
             self._write_queue(queue)
+            settled = dict(item)
+        if settled is not None and self._notifications is not None:
+            try:
+                self._notifications.dispatch(settled, self._project_item(settled))
+            except Exception:
+                pass
 
     def _recover_interrupted(self) -> None:
         with _file_lock(self.queue_lock_path):
@@ -480,6 +586,7 @@ class ResidentCoordinator:
                     "pid": os.getpid(),
                     "heartbeat_at": self._clock(),
                     "queue_schema_version": RESIDENT_QUEUE_SCHEMA_VERSION,
+                    "desktop_notifications": self._notification_sink is not None,
                 },
             )
             self._stop.wait(self._heartbeat_seconds)
@@ -571,6 +678,103 @@ class ResidentCoordinator:
     def _write_queue(self, value: Mapping[str, Any]) -> None:
         _atomic_json_write(self.queue_path, value)
 
+    def _project_item(self, item: Mapping[str, Any]) -> Mapping[str, Any]:
+        kind = str(item["kind"])
+        reference = str(item["reference"])
+        state = str(item["state"])
+        details: Mapping[str, Any] = {}
+        describe = getattr(self._job_handlers[kind], "describe", None)
+        if callable(describe):
+            try:
+                candidate = describe(reference)
+                if isinstance(candidate, Mapping):
+                    details = candidate
+            except Exception:
+                details = {}
+        if item.get("_scheduled") is False:
+            state = str(details.get("phase", state))
+        summary = details.get("summary")
+        if not isinstance(summary, str) or not summary:
+            summary = self._state_summary(kind, state)
+        next_action = details.get("next_action")
+        if next_action is not None and not isinstance(next_action, str):
+            next_action = None
+        if next_action is None:
+            next_action = self._state_next_action(state)
+        attention_required = bool(details.get("approval_required", False)) or state in {
+            "awaiting_approval",
+            "waiting",
+            "paused",
+            "failed",
+            "escalated",
+        }
+        usage = details.get("usage")
+        projected_usage = None
+        if isinstance(usage, Mapping):
+            tokens = usage.get("tokens_used", 0)
+            cost = usage.get("cost_usd", 0.0)
+            if (
+                not isinstance(tokens, bool)
+                and isinstance(tokens, int)
+                and not isinstance(cost, bool)
+                and isinstance(cost, (int, float))
+            ):
+                projected_usage = {
+                    "tokens_used": tokens,
+                    "cost_usd": float(cost),
+                }
+        return {
+            "job_id": str(item["job_id"]),
+            "kind": kind,
+            "reference": reference,
+            "state": state,
+            "summary": summary,
+            "next_action": next_action,
+            "attention_required": attention_required,
+            "scheduled": item.get("_scheduled") is not False,
+            "priority": item.get("priority"),
+            "attempts": int(item.get("attempts", 0)),
+            "updated_at": item.get("updated_at"),
+            "usage": projected_usage,
+        }
+
+    def _desktop_notifications_enabled(self) -> bool:
+        if not self.is_running():
+            return False
+        try:
+            value = json.loads(self.instance_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        return value.get("desktop_notifications") is True
+
+    @staticmethod
+    def _state_summary(kind: str, state: str) -> str:
+        label = {"engineering": "Task", "graph": "Graph", "orca": "Orca job"}[kind]
+        return {
+            "awaiting_approval": f"{label} is waiting for approval",
+            "queued": f"{label} is queued",
+            "running": f"{label} is running",
+            "waiting": f"{label} needs input",
+            "paused": f"{label} is paused",
+            "pause_requested": f"{label} will pause at the next safe checkpoint",
+            "cancel_requested": f"{label} will cancel at the next safe checkpoint",
+            "succeeded": f"{label} completed successfully",
+            "failed": f"{label} stopped without a verified result",
+            "cancelled": f"{label} was cancelled",
+        }.get(state, f"{label} is {state}")
+
+    @staticmethod
+    def _state_next_action(state: str) -> Optional[str]:
+        if state == "awaiting_approval":
+            return "approve"
+        if state == "waiting":
+            return "respond"
+        if state == "paused":
+            return "resume"
+        if state in _TERMINAL_STATES:
+            return "result"
+        return "status"
+
     def _empty_queue(self) -> Dict[str, Any]:
         return {
             "schema_version": RESIDENT_QUEUE_SCHEMA_VERSION,
@@ -609,6 +813,36 @@ class _EngineeringJobHandler:
     def inspect(self, task_id: str) -> str:
         phase = str(self._factory().execution_phase(task_id))
         return "queued" if phase in ("running", "paused") else phase
+
+    def discover(self):
+        root = getattr(self._factory(), "tasks_root", None)
+        if not isinstance(root, Path) or not root.is_dir():
+            return ()
+        return tuple(
+            path.name
+            for path in sorted(root.iterdir())
+            if path.is_dir()
+            and not path.is_symlink()
+            and _TASK_ID.fullmatch(path.name) is not None
+        )
+
+    def describe(self, task_id: str) -> Mapping[str, Any]:
+        module = self._factory()
+        status = getattr(module, "status", None)
+        if not callable(status):
+            phase = self.inspect(task_id)
+            return {"phase": phase}
+        value = status(task_id)
+        return {
+            key: value.get(key)
+            for key in (
+                "phase",
+                "summary",
+                "next_action",
+                "approval_required",
+                "usage",
+            )
+        }
 
     def execute(
         self, task_id: str, control_probe: Callable[[], Optional[str]]

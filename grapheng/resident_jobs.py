@@ -132,6 +132,32 @@ class AdvancedGraphJob:
             return "failed"
         return "queued" if all(item.status == "allow" for item in blocked) else "waiting"
 
+    def describe(self, run_id: str) -> Mapping[str, Any]:
+        phase = self.inspect(run_id)
+        approvals = self.inbox.list(run_id)
+        pending = tuple(item for item in approvals if item.status == "pending")
+        if pending:
+            summary = (
+                f"Graph needs approval for {pending[0].gate}"
+                if len(pending) == 1
+                else f"Graph needs {len(pending)} approvals"
+            )
+        else:
+            summary = {
+                "queued": "Graph is ready to run",
+                "running": "Graph is running",
+                "waiting": "Graph needs input",
+                "succeeded": "Graph completed successfully",
+                "failed": "Graph stopped without a verified result",
+                "cancelled": "Graph was cancelled",
+            }.get(phase, f"Graph is {phase}")
+        return {
+            "phase": phase,
+            "summary": summary,
+            "next_action": "approval" if pending else None,
+            "approval_required": bool(pending),
+        }
+
     def execute(
         self, run_id: str, control_probe: Callable[[], Optional[str]]
     ) -> Mapping[str, Any]:
@@ -242,6 +268,53 @@ class OrcaResidentJob:
         if snapshot.phase in ("waiting_for_input", "escalated"):
             return "waiting"
         return snapshot.phase
+
+    def describe(self, reference: str) -> Mapping[str, Any]:
+        graph, job_root, workspace = self._definition(reference)
+        if not (job_root / "state.json").is_file():
+            return {
+                "phase": "queued",
+                "summary": "Orca job is ready to run",
+                "next_action": "status",
+                "approval_required": False,
+            }
+        snapshot = self._coordinator_factory(graph, job_root, workspace).inspect()
+        if snapshot.pending_questions:
+            phase = "waiting"
+            summary = (
+                "Orca worker needs an answer"
+                if len(snapshot.pending_questions) == 1
+                else f"Orca workers need {len(snapshot.pending_questions)} answers"
+            )
+            next_action = "answer"
+        elif snapshot.pending_escalations:
+            phase = "waiting"
+            summary = (
+                "Orca worker escalation needs a decision"
+                if len(snapshot.pending_escalations) == 1
+                else f"{len(snapshot.pending_escalations)} Orca escalations need decisions"
+            )
+            next_action = "resolve-escalation"
+        else:
+            phase = snapshot.phase
+            summary = {
+                "queued": "Orca job is ready to run",
+                "running": "Orca job is running",
+                "succeeded": "Orca job completed successfully",
+                "failed": "Orca job stopped without a verified result",
+                "cancelled": "Orca job was cancelled",
+            }.get(phase, f"Orca job is {phase}")
+            next_action = None
+        return {
+            "phase": phase,
+            "summary": summary,
+            "next_action": next_action,
+            "approval_required": False,
+            "usage": {
+                "tokens_used": snapshot.tokens_used,
+                "cost_usd": snapshot.cost_usd,
+            },
+        }
 
     def execute(
         self, reference: str, control_probe: Callable[[], Optional[str]]

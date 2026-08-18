@@ -58,7 +58,7 @@ P1.4 需要选择三个外部项目并调用真实 Agent，可能产生模型费
 - `PYTHONPYCACHEPREFIX=/tmp/agent-os-pycache python3 -m compileall -q grapheng tests`：通过。
 - `uv build --offline`：sdist 和 wheel 构建成功，包含意图编译模块与测试。
 
-## P4：本地常驻协调器（P4.1–P4.3）
+## P4：本地常驻协调器（P4.1–P4.4）
 
 ### 已完成
 
@@ -69,6 +69,10 @@ P1.4 需要选择三个外部项目并调用真实 Agent，可能产生模型费
 - Orca 作业通过同一常驻生命周期调用原 `OrcaCoordinator`；materialize、dispatch、cleanup、ack 和受控合并继续由 Effect Journal 防重复。
 - Orca 取消会在安全检查点停止活动 dispatch、执行既有保留/清理策略并持久化终态；重启重复取消不会重放外部副作用。
 - 故障注入覆盖“Graph 已完成节点后等待审批”和“Orca 已完成外部副作用但队列尚未落终态”两个崩溃点。
+- `agent-os center` 将工程任务、高级 Graph 和 Orca 状态投影到同一份一屏摘要；关注项优先，显示上限不影响全量统计，`--json` 提供稳定机器输出。
+- 未进入驻留队列的待审批工程任务也从原任务目录发现；摘要直接读取各模块事实状态，不复制计划、Graph、Orca 或审批内容。
+- macOS `osascript` 与 Linux `notify-send` 通过参数数组调用，不经过 shell；通知文本有边界，等待、暂停、成功、失败与取消事件持久去重。
+- 通知尝试采用 bounded at-most-once 语义；发送失败被隔离，不改变任务终态。通知日志只属于 `runtime/resident`，不会进入可迁移 RSI 状态。
 
 ### 状态归属
 
@@ -79,7 +83,8 @@ P1.4 需要选择三个外部项目并调用真实 Agent，可能产生模型费
 
 ### 验证
 
-- `PYTHONPYCACHEPREFIX=/tmp/agent-os-pycache python3 -m unittest discover -s tests -v`：199 项通过。
+- `PYTHONPYCACHEPREFIX=/tmp/agent-os-pycache python3 -m unittest tests.test_task_center tests.test_resident -v`：18 项通过。
+- `PYTHONPYCACHEPREFIX=/tmp/agent-os-pycache python3 -m unittest discover -s tests -v`：206 项通过。
 - `PYTHONPYCACHEPREFIX=/tmp/agent-os-pycache python3 -m compileall -q grapheng tests`：通过。
 - `uv build --offline`：sdist 和 wheel 构建成功，包含异构常驻作业适配器。
 - 故障测试额外覆盖：Orca 从崩溃恢复后的暂停态收到取消请求，只停止并清理活动 dispatch 一次。

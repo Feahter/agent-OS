@@ -150,6 +150,12 @@ from .resident import (
     ResidentCoordinator,
     ResidentJobHandler,
 )
+from .task_center import (
+    RESIDENT_NOTIFICATION_SCHEMA_VERSION,
+    TASK_CENTER_SCHEMA_VERSION,
+    DesktopNotificationSink,
+    NotificationSink,
+)
 from .singleflight import (
     FlightDelivery,
     RemoteFlightError,
@@ -263,6 +269,7 @@ __all__ = [
     "RegressionSuite",
     "RELEASE_SCHEMA_VERSION",
     "RESIDENT_QUEUE_SCHEMA_VERSION",
+    "RESIDENT_NOTIFICATION_SCHEMA_VERSION",
     "ResidentCoordinator",
     "ResidentJobHandler",
     "RemoteFlightError",
@@ -277,6 +284,7 @@ __all__ = [
     "SingleFlightCoordinator",
     "SingleFlightTimeoutError",
     "TASK_INTENT_SCHEMA_VERSION",
+    "TASK_CENTER_SCHEMA_VERSION",
     "TASK_TEMPLATES",
     "TaskIntent",
     "USER_TASK_SCHEMA_VERSION",
@@ -298,6 +306,8 @@ __all__ = [
     "dispatch_id_from_receipt",
     "graph_event_from_orca_message",
     "default_project_policy",
+    "DesktopNotificationSink",
+    "NotificationSink",
     "inspect_project",
     "validate_graph",
     "discover_local_executors",

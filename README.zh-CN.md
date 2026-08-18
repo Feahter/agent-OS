@@ -101,9 +101,14 @@ agent-os control task-0123456789abcdef pause --actor operator
 agent-os control task-0123456789abcdef resume --actor operator
 agent-os control task-0123456789abcdef reprioritize --priority 20 --actor operator
 agent-os control task-0123456789abcdef cancel --actor operator
+
+agent-os center
+agent-os center --json
 ```
 
 暂停和取消会在 Agent 调用或验证步骤之间的下一个安全检查点生效；已经开始的单次 Agent 调用会先运行到该检查点，系统不会假装支持任意时刻强行挂起。进程重启或任务继续后，已完成的写操作会从 Effect Receipt 恢复，不会静默重放。
+
+`center` 是工程任务、高级 Graph 和 Orca 作业共用的一屏任务中心。需要审批、回答或恢复的事项优先显示，其后是运行中与已完成任务；显示条数限制不会截断总数统计。常驻协调器在 macOS 或 Linux 上调用系统原生通知能力，提示等待、暂停和任务终态。通知采用尽力投递和持久去重，通知失败不会改变任务结果；通知记录只保存在 `runtime/resident`，不会进入可迁移 RSI 状态。
 
 首批模板为 `fix`、`test`、`refactor`、`research` 和 `release`，默认自动识别，也可用 `--template` 指定；调研任务会被强制为只读。目标过于含糊或找不到可信验证命令时，`do` 会在调用 Agent 前停止并说明缺少什么。若要自定义检查与预算，可先运行 `agent-os engineer init --workspace /path/to/project`，再编辑 `.agent-os/engineering.json`。
 

@@ -24,8 +24,9 @@ from .optimization import (
 from .orca import OrcaGraphCompiler
 from .policy import AllowListGatePolicy
 from .publication import VerifiedResultPublisher
+from .resident import ResidentCoordinator
 from .runtime import GraphRuntime, NodeOutcome, NodeRegistry
-from .tasks import UserTaskModule
+from .tasks import UserTaskModule, default_agent_os_home
 from .validation import validate_graph
 
 
@@ -343,6 +344,51 @@ def _run_user_task_command(args) -> int:
     return 1 if value.get("phase") == "failed" else 0
 
 
+def _print_task_center(value, json_output: bool) -> None:
+    if json_output:
+        print(json.dumps(value, ensure_ascii=False, sort_keys=True))
+        return
+    counts = value["counts"]
+    resident = "running" if value["resident_running"] else "stopped"
+    notifications = "on" if value["desktop_notifications"] else "off"
+    print(
+        "Agent OS Task Center: "
+        f"{counts['active']} active · "
+        f"{counts['needs_attention']} need attention · "
+        f"resident {resident} · notifications {notifications}"
+    )
+    usage = value["usage"]
+    completeness = "complete" if usage["complete"] else "partial"
+    print(
+        f"Usage: {usage['tokens_used']} tokens · "
+        f"${usage['cost_usd']:.4f} · {completeness}"
+    )
+    jobs = value["jobs"]
+    if not jobs:
+        print("No tasks yet.")
+        return
+    for job in jobs:
+        marker = (
+            "!"
+            if job["attention_required"]
+            else "✓"
+            if job["state"] == "succeeded"
+            else "·"
+        )
+        priority = (
+            f" · priority {job['priority']}"
+            if job["priority"] is not None
+            else ""
+        )
+        print(
+            f"{marker} {job['kind']} {job['reference']} · "
+            f"{job['state']}{priority}"
+        )
+        print(f"  {job['summary']}")
+        if job.get("next_action"):
+            print(f"  Next: {job['next_action']}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="agent-os")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -380,6 +426,10 @@ def main() -> int:
     result_parser.add_argument("task_id")
     result_parser.add_argument("--home", type=Path)
     result_parser.add_argument("--json", action="store_true", dest="json_output")
+    center_parser = subparsers.add_parser("center")
+    center_parser.add_argument("--home", type=Path)
+    center_parser.add_argument("--limit", type=int, default=20)
+    center_parser.add_argument("--json", action="store_true", dest="json_output")
     validate_parser = subparsers.add_parser("validate")
     validate_parser.add_argument("spec", type=Path)
     demo_parser = subparsers.add_parser("demo")
@@ -536,6 +586,13 @@ def main() -> int:
 
     if args.command in ("do", "status", "approve", "control", "result"):
         return _run_user_task_command(args)
+
+    if args.command == "center":
+        value = ResidentCoordinator(
+            args.home or default_agent_os_home()
+        ).task_center(args.limit)
+        _print_task_center(value, args.json_output)
+        return 0
 
     if args.command == "engineer":
         if args.action != "status" and args.workspace is None:

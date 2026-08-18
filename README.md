@@ -101,9 +101,14 @@ agent-os control task-0123456789abcdef pause --actor operator
 agent-os control task-0123456789abcdef resume --actor operator
 agent-os control task-0123456789abcdef reprioritize --priority 20 --actor operator
 agent-os control task-0123456789abcdef cancel --actor operator
+
+agent-os center
+agent-os center --json
 ```
 
 Pause and cancellation take effect at the next safe checkpoint between Agent calls or verification steps. An in-flight Agent process is allowed to reach that checkpoint; Agent OS does not claim arbitrary mid-call suspension. After restart or resume, completed mutating calls are recovered from Effect Receipts instead of being replayed.
+
+`center` is the one-glance task view for engineering tasks, advanced Graph runs and Orca jobs. Items that need approval, an answer or recovery are shown first, followed by active and completed work; totals are not truncated by the display limit. The resident uses the host's native notification command on macOS or Linux for waiting, paused and terminal events. Delivery is best-effort and durably deduplicated: a notification failure never changes the task result. Notification history stays in `runtime/resident` and is excluded from portable RSI state.
 
 The first templates are `fix`, `test`, `refactor`, `research` and `release`. Selection is automatic, or can be overridden with `--template`. Research tasks are enforced as read-only. If the goal is too vague or no trusted verification command can be found, `do` stops before calling an agent and tells you what context is missing. For custom checks and budgets, run `agent-os engineer init --workspace /path/to/project` once and edit `.agent-os/engineering.json`.
 

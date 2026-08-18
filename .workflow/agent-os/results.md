@@ -56,6 +56,8 @@
 - 持久迁移审计记录源/目标版本、转换器和变更路径，但不保存源机器绝对路径。
 - `OrcaCoordinator` 已形成独立持久状态机；GE 独占依赖调度、并发、token、retry、gate 和发布决策，Orca 独占 Run/Task/Dispatch/worker 生命周期。
 - 工程任务、高级 Graph 和 Orca 已收束到同一个本地常驻优先级队列；队列只保存状态定位符和调度控制，不复制三个执行模块的事实状态。
+- `agent-os center` 只读投影工程任务、高级 Graph 和 Orca 的事实状态，统一展示关注项、运行状态、费用与 Token；显示上限不影响全量统计。
+- 本地桌面通知覆盖等待、暂停和终态，使用系统命令参数数组、持久去重和故障隔离；通知日志属于运行态，不进入 RSI 迁移包。
 - 高级 Graph 可先由 `LocalControlPlane.prepare` 持久化，再由常驻进程启动；阻塞 gate 仍唯一读取 `ApprovalInbox`，allow 后自动恢复且 checkpoint 节点不重复。
 - Orca 常驻恢复继续经过原 `OrcaCoordinator` 与 Effect Journal；队列落盘前崩溃时只对账终态，不重复 materialize、dispatch、cleanup 或 ack。
 - 独立就绪节点按并发上限成波启动，依赖节点只在上游 Artifact 成功提交后启动；临时 token 预留不足会等待下一波，真实用量越界则失败关闭。
@@ -98,7 +100,10 @@
 
 ```text
 python3 -m unittest discover -s tests -v
-Ran 161 tests — OK
+Ran 206 tests — OK
+
+python3 -m unittest tests.test_task_center tests.test_resident -v
+Ran 18 tests — OK
 
 python3 -m unittest tests.test_engineering -v
 Ran 15 tests — OK
