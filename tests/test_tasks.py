@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -155,6 +156,68 @@ class UserTaskModuleTests(unittest.TestCase):
         self.assertNotIn(objective, bundle_text)
         self.assertNotIn(str(self.workspace), bundle_text)
         self.assertFalse((tasks.state_root / "tasks").exists())
+
+    def test_do_infers_policy_and_exposes_reviewable_intent(self):
+        policy_path = self.workspace / ".agent-os" / "engineering.json"
+        policy_path.unlink()
+        (self.workspace / "pyproject.toml").write_text(
+            "[project]\nname = 'sample'\n", encoding="utf-8"
+        )
+        (self.workspace / "tests").mkdir()
+        subprocess.run(("git", "init", "-q"), cwd=self.workspace, check=True)
+        subprocess.run(("git", "add", "."), cwd=self.workspace, check=True)
+        subprocess.run(
+            (
+                "git", "-c", "user.email=test@example.com", "-c",
+                "user.name=Test User", "commit", "-qm", "initial",
+            ),
+            cwd=self.workspace,
+            check=True,
+        )
+        tasks = self.module()
+
+        submitted = tasks.do(
+            "修复 value 计算错误并补回归测试",
+            self.workspace,
+            constraints=("Keep the public interface stable",),
+        )
+        intent = submitted["intent"]
+
+        self.assertEqual("fix", intent["template"])
+        self.assertEqual(["python"], intent["project_kinds"])
+        self.assertEqual(
+            [["python3", "-m", "unittest", "discover", "-s", "tests"]],
+            intent["verification_commands"],
+        )
+        self.assertEqual(
+            ["Keep the public interface stable"], intent["constraints"]
+        )
+        self.assertEqual("succeeded", tasks.approve(submitted["task_id"], "operator")["phase"])
+
+    def test_clarification_failure_does_not_allocate_or_call_an_agent(self):
+        policy_path = self.workspace / ".agent-os" / "engineering.json"
+        policy_path.unlink()
+        tasks = self.module()
+
+        with self.assertRaisesRegex(ContractViolation, "needs clarification"):
+            tasks.do("处理一下", self.workspace)
+
+        self.assertEqual([], list(tasks.tasks_root.iterdir()))
+
+    def test_intent_tampering_invalidates_approval(self):
+        tasks = self.module()
+        task_id = tasks.do(
+            "Refactor value handling",
+            self.workspace,
+            constraints=("Preserve behavior",),
+        )["task_id"]
+        plan_path = tasks.tasks_root / task_id / "plan.json"
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        plan["intent"]["constraints"] = ["Changed after planning"]
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+
+        with self.assertRaisesRegex(ContractViolation, "digest mismatch"):
+            tasks.approve(task_id, "operator")
 
     def test_cli_has_human_and_machine_readable_status(self):
         value = {

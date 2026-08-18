@@ -263,6 +263,23 @@ def _print_user_task(value, json_output: bool) -> None:
         "cancelled": "Task was cancelled before execution",
     }.get(phase, f"Task is {phase}")
     print(f"Task {task_id}: {summary}")
+    intent = value.get("intent")
+    if isinstance(intent, dict):
+        project = ", ".join(intent.get("project_kinds", ())) or "generic"
+        mode = "change" if intent.get("mutation_allowed", True) else "read-only"
+        print(f"Intent: {intent.get('template', 'general')} · {project} · {mode}")
+        if intent.get("objective"):
+            print(f"Goal: {intent['objective']}")
+        for constraint in intent.get("constraints", ()):
+            print(f"Constraint: {constraint}")
+        commands = intent.get("verification_commands", ())
+        for command in commands:
+            if isinstance(command, list):
+                print(f"Verify: {' '.join(command)}")
+    proposed_plan = value.get("proposed_plan")
+    if isinstance(proposed_plan, dict):
+        for step in proposed_plan.get("steps", ()):
+            print(f"Plan: {step}")
     verification = value.get("verification")
     if isinstance(verification, dict) and phase in ("succeeded", "failed"):
         print(f"Verification: {'passed' if verification.get('passed') else 'not passed'}")
@@ -290,7 +307,13 @@ def _print_user_task(value, json_output: bool) -> None:
 def _run_user_task_command(args) -> int:
     tasks = UserTaskModule(args.home)
     if args.command == "do":
-        value = tasks.do(args.objective, args.workspace, args.policy)
+        value = tasks.do(
+            args.objective,
+            args.workspace,
+            args.policy,
+            args.template,
+            args.constraint,
+        )
     elif args.command == "status":
         value = tasks.status(args.task_id)
     elif args.command == "approve":
@@ -310,6 +333,10 @@ def main() -> int:
     do_parser.add_argument("objective")
     do_parser.add_argument("--workspace", type=Path, required=True)
     do_parser.add_argument("--policy", type=Path)
+    do_parser.add_argument(
+        "--template", choices=("fix", "test", "refactor", "research", "release")
+    )
+    do_parser.add_argument("--constraint", action="append", default=[])
     do_parser.add_argument("--home", type=Path)
     do_parser.add_argument("--json", action="store_true", dest="json_output")
     status_parser = subparsers.add_parser("status")

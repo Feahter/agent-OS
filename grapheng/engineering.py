@@ -14,11 +14,12 @@ from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 from .agents import AgentRequest, AgentResult, ExecutorRegistry
 from .control import EffectJournal
 from .errors import ContractViolation
+from .intents import TaskIntent
 from .learning import RSILoop
 
 
 ENGINEERING_POLICY_SCHEMA_VERSION = 1
-ENGINEERING_PLAN_SCHEMA_VERSION = 2
+ENGINEERING_PLAN_SCHEMA_VERSION = 3
 ENGINEERING_REPORT_SCHEMA_VERSION = 1
 _ROLES = ("explore", "plan", "implement", "review", "repair")
 
@@ -247,6 +248,7 @@ class ProjectPolicy:
 @dataclass(frozen=True)
 class EngineeringPlan:
     objective: str
+    intent: Mapping[str, Any]
     exploration: Any
     plan: Any
     policy_digest: str
@@ -260,6 +262,7 @@ class EngineeringPlan:
     def create(
         cls,
         objective: str,
+        intent: Mapping[str, Any],
         exploration: Any,
         plan: Any,
         policy_digest: str,
@@ -268,9 +271,13 @@ class EngineeringPlan:
         preparation_usage: Mapping[str, Any],
         created_at: float,
     ) -> "EngineeringPlan":
+        compiled_intent = TaskIntent.from_dict(dict(intent))
+        if compiled_intent.objective != objective:
+            raise ContractViolation("engineering plan objective does not match task intent")
         body = {
             "schema_version": ENGINEERING_PLAN_SCHEMA_VERSION,
             "objective": objective,
+            "intent": compiled_intent.to_dict(),
             "exploration": exploration,
             "plan": plan,
             "policy_digest": policy_digest,
@@ -287,6 +294,7 @@ class EngineeringPlan:
         return {
             "schema_version": ENGINEERING_PLAN_SCHEMA_VERSION,
             "objective": self.objective,
+            "intent": dict(self.intent),
             "exploration": self.exploration,
             "plan": self.plan,
             "policy_digest": self.policy_digest,
@@ -302,6 +310,7 @@ class EngineeringPlan:
         required = {
             "schema_version",
             "objective",
+            "intent",
             "exploration",
             "plan",
             "policy_digest",
@@ -311,17 +320,33 @@ class EngineeringPlan:
             "created_at",
             "digest",
         }
-        if not isinstance(value, dict) or set(value) != required:
+        legacy_required = required - {"intent"}
+        if not isinstance(value, dict):
             raise ContractViolation("engineering plan has an invalid contract")
-        if value["schema_version"] != ENGINEERING_PLAN_SCHEMA_VERSION:
+        schema_version = value.get("schema_version")
+        if schema_version == 2:
+            if set(value) != legacy_required:
+                raise ContractViolation("engineering plan has an invalid contract")
+            body = {key: value[key] for key in legacy_required if key != "digest"}
+            if value["digest"] != _canonical_digest(body):
+                raise ContractViolation("engineering plan digest mismatch")
+            intent = TaskIntent.legacy(str(value["objective"])).to_dict()
+        elif schema_version == ENGINEERING_PLAN_SCHEMA_VERSION:
+            if set(value) != required:
+                raise ContractViolation("engineering plan has an invalid contract")
+            body = {key: value[key] for key in required if key != "digest"}
+            if value["digest"] != _canonical_digest(body):
+                raise ContractViolation("engineering plan digest mismatch")
+            intent = TaskIntent.from_dict(value["intent"]).to_dict()
+        else:
             raise ContractViolation("unsupported engineering plan schema_version")
-        body = {key: value[key] for key in required if key != "digest"}
-        if value["digest"] != _canonical_digest(body):
-            raise ContractViolation("engineering plan digest mismatch")
         if not isinstance(value["objective"], str) or not value["objective"].strip():
             raise ContractViolation("engineering plan objective cannot be empty")
+        if intent["objective"] != value["objective"]:
+            raise ContractViolation("engineering plan objective does not match task intent")
         return cls(
             objective=value["objective"],
+            intent=intent,
             exploration=value["exploration"],
             plan=value["plan"],
             policy_digest=str(value["policy_digest"]),
@@ -428,9 +453,29 @@ class EngineeringWorkflow:
     def report_path(self) -> Path:
         return self.task_dir / "report.json"
 
-    def prepare(self, objective: str) -> EngineeringPlan:
+    def prepare(
+        self,
+        objective: str,
+        intent: Optional[Mapping[str, Any]] = None,
+    ) -> EngineeringPlan:
         if not isinstance(objective, str) or not objective.strip():
             raise ContractViolation("engineering objective cannot be empty")
+        compiled_intent = (
+            TaskIntent.from_dict(dict(intent))
+            if intent is not None
+            else TaskIntent.basic(objective, self.policy.check_commands)
+        )
+        if compiled_intent.objective != objective.strip():
+            raise ContractViolation("engineering objective does not match task intent")
+        if compiled_intent.needs_clarification:
+            raise ContractViolation("task intent still requires clarification")
+        if (
+            compiled_intent.project_kinds != ("legacy",)
+            and compiled_intent.verification_commands != self.policy.check_commands
+        ):
+            raise ContractViolation(
+                "task intent verification does not match engineering policy"
+            )
         self._require_uninitialized_task()
         if self.policy.max_agent_calls < 2:
             raise ContractViolation(
@@ -444,7 +489,7 @@ class EngineeringWorkflow:
             "explore",
             "Read the project and identify relevant architecture, constraints, risks, and files. Do not modify anything.",
             {
-                "objective": objective,
+                "task_intent": compiled_intent.to_dict(),
                 "project_instructions": instructions,
                 "workspace_fingerprint": workspace_digest,
             },
@@ -458,7 +503,7 @@ class EngineeringWorkflow:
             "plan",
             "Produce a small-step implementation plan with explicit verification and rollback points. Do not modify anything.",
             {
-                "objective": objective,
+                "task_intent": compiled_intent.to_dict(),
                 "exploration": exploration.outputs["exploration"],
                 "project_instructions": instructions,
                 "workspace_fingerprint": workspace_digest,
@@ -482,7 +527,8 @@ class EngineeringWorkflow:
             "elapsed_seconds": self._monotonic() - started,
         }
         plan = EngineeringPlan.create(
-            objective,
+            objective.strip(),
+            compiled_intent.to_dict(),
             exploration.outputs["exploration"],
             proposal.outputs["plan"],
             self.policy.digest,
@@ -516,6 +562,14 @@ class EngineeringWorkflow:
             raise ContractViolation("engineering approval does not match plan digest")
         if plan.policy_digest != self.policy.digest:
             raise ContractViolation("engineering policy changed after planning")
+        compiled_intent = TaskIntent.from_dict(plan.intent)
+        if (
+            compiled_intent.project_kinds != ("legacy",)
+            and compiled_intent.verification_commands != self.policy.check_commands
+        ):
+            raise ContractViolation(
+                "task intent verification does not match engineering policy"
+            )
         instructions = self._instructions()
         if plan.instructions_digest != _canonical_digest(instructions):
             raise ContractViolation("project instructions changed after planning")
@@ -526,6 +580,8 @@ class EngineeringWorkflow:
                 raise ContractViolation("engineering workspace changed after planning")
         started = self._monotonic()
         protected = self._protected_snapshot()
+        execution_workspace_digest = self._workspace_fingerprint()
+        mutation_allowed = compiled_intent.mutation_allowed
         preparation_usage = _validated_usage(
             plan.preparation_usage, "engineering preparation_usage"
         )
@@ -551,32 +607,45 @@ class EngineeringWorkflow:
             "reality_anchor": {"passed": False},
             "failure": None,
         }
-        last_mutating_task = ""
+        last_execution_task = ""
         self._write_running_state(state)
         try:
             result = self._bounded_agent_call(
                 state,
                 started,
                 "implement",
-                "Implement the approved plan in small, reviewable changes. Obey project instructions and do not touch protected paths.",
+                (
+                    "Carry out the approved read-only research plan and return evidence-backed findings. Do not modify the workspace."
+                    if not mutation_allowed
+                    else "Implement the approved plan in small, reviewable changes. Obey project instructions and do not touch protected paths."
+                ),
                 {
-                    "objective": plan.objective,
+                    "task_intent": compiled_intent.to_dict(),
                     "approved_plan": plan.plan,
                     "exploration": plan.exploration,
                     "project_instructions": instructions,
                     "workspace_fingerprint": plan.workspace_digest,
                 },
                 ("implementation_summary",),
-                tools=("read", "shell", "edit", "write"),
-                mutating=True,
+                tools=(
+                    ("read", "shell", "edit", "write")
+                    if mutation_allowed
+                    else ("read", "shell")
+                ),
+                mutating=mutation_allowed,
                 effect_index=0,
             )
-            last_mutating_task = result["task_id"]
+            last_execution_task = result["task_id"]
             state["implementation"] = {
                 "task_id": result["task_id"],
                 "summary": result["outputs"]["implementation_summary"],
             }
             self._assert_protected_unchanged(protected)
+            if (
+                not mutation_allowed
+                and execution_workspace_digest != self._workspace_fingerprint()
+            ):
+                raise ContractViolation("read-only research changed the workspace")
 
             while True:
                 self._require_time(started)
@@ -590,6 +659,10 @@ class EngineeringWorkflow:
                 )
                 self._write_running_state(state)
                 if not all(item.passed for item in checks):
+                    if not mutation_allowed:
+                        state["phase"] = "failed"
+                        state["failure"] = "read_only_verification_failed"
+                        break
                     repair_input = {
                         "kind": "check_failure",
                         "checks": [item.to_dict() for item in checks if not item.passed],
@@ -601,7 +674,7 @@ class EngineeringWorkflow:
                         "review",
                         "Independently review the approved plan, current workspace, and check evidence. Do not modify anything. Approve only when the implementation is correct and complete.",
                         {
-                            "objective": plan.objective,
+                            "task_intent": compiled_intent.to_dict(),
                             "approved_plan": plan.plan,
                             "checks": [item.to_dict() for item in checks],
                             "project_instructions": instructions,
@@ -641,12 +714,16 @@ class EngineeringWorkflow:
                             "review_approved": True,
                             "review_task_id": review["task_id"],
                         }
-                        if self.rsi_loop is not None and last_mutating_task:
+                        if self.rsi_loop is not None and last_execution_task:
                             self.rsi_loop.feedback(
-                                last_mutating_task,
+                                last_execution_task,
                                 float(score),
                                 "engineering-independent-review",
                             )
+                        break
+                    if not mutation_allowed:
+                        state["phase"] = "failed"
+                        state["failure"] = "read_only_review_rejected"
                         break
                     repair_input = {
                         "kind": "review_findings",
@@ -665,7 +742,7 @@ class EngineeringWorkflow:
                     "repair",
                     "Repair only the reported check failures or review findings. Preserve correct work and do not touch protected paths.",
                     {
-                        "objective": plan.objective,
+                        "task_intent": compiled_intent.to_dict(),
                         "approved_plan": plan.plan,
                         "repair_input": repair_input,
                         "project_instructions": instructions,
@@ -676,7 +753,7 @@ class EngineeringWorkflow:
                     mutating=True,
                     effect_index=state["review_cycles"],
                 )
-                last_mutating_task = repair["task_id"]
+                last_execution_task = repair["task_id"]
                 state["repairs"].append(
                     {
                         "cycle": state["review_cycles"],

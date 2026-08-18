@@ -74,20 +74,21 @@ agent-os demo examples/minimal_graph.json --work-dir /tmp/agent-os-demo
 
 ### 日常任务入口
 
-每个项目只需初始化一次安全与验证策略。之后无论底层选择哪个本地 Agent，都使用同样五个动作：
+无论底层选择哪个本地 Agent，都使用同样五个动作。常见 Python、Node、Rust、Go 和 Make 项目可自动推断有限的验证命令；需要明确项目规则时再初始化策略：
 
 ```bash
-agent-os engineer init --workspace /path/to/project
-
 agent-os do "修复登录超时并补回归测试" \
-  --workspace /path/to/project
+  --workspace /path/to/project \
+  --constraint "保持公开接口不变"
 
 agent-os status task-0123456789abcdef
 agent-os approve task-0123456789abcdef --actor operator
 agent-os result task-0123456789abcdef
 ```
 
-`do` 只进行只读探索和计划，返回稳定 task ID，然后停在绑定计划摘要的审批点。`approve` 只执行这份已批准计划，完成有限检查和独立审查后才返回。批准前可用 `control TASK_ID cancel --actor NAME` 取消任务。五个动作都可加 `--json` 获得机器可读输出。
+`do` 会先把目标编译成可审阅意图，再进行只读探索和计划，返回稳定 task ID，并停在绑定摘要的审批点。审批同时绑定目标、约束、模板、验证命令、项目规则和计划步骤，任一内容变化都会使原审批失效。`approve` 只执行这份计划，完成有限检查和独立审查后才返回。批准前可用 `control TASK_ID cancel --actor NAME` 取消任务。五个动作都可加 `--json` 获得机器可读输出。
+
+首批模板为 `fix`、`test`、`refactor`、`research` 和 `release`，默认自动识别，也可用 `--template` 指定；调研任务会被强制为只读。目标过于含糊或找不到可信验证命令时，`do` 会在调用 Agent 前停止并说明缺少什么。若要自定义检查与预算，可先运行 `agent-os engineer init --workspace /path/to/project`，再编辑 `.agent-os/engineering.json`。
 
 默认主目录是 `~/.agent-os`，可用 `AGENT_OS_HOME` 或 `--home` 覆盖。`tasks/` 保存运行态，也是状态和结果的唯一事实来源；`state/` 只保存可迁移、无 prompt 的学习与策略状态。原始目标、项目路径和运行证据不会进入状态导出包。
 

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import subprocess
@@ -14,6 +15,7 @@ from grapheng import (
     EngineeringWorkflow,
     ExecutorCapabilities,
     ExecutorRegistry,
+    IntentCompiler,
     ProjectPolicy,
     RSILoop,
 )
@@ -179,6 +181,23 @@ class EngineeringTests(unittest.TestCase):
         with self.assertRaisesRegex(ContractViolation, "digest mismatch"):
             EngineeringPlan.load(workflow.plan_path)
         self.assertEqual(64, len(plan.digest))
+
+    def test_version_two_plan_remains_loadable_for_migration(self):
+        workflow, _, plan = self.prepared()
+        value = plan.to_dict()
+        value.pop("intent")
+        value["schema_version"] = 2
+        value.pop("digest")
+        encoded = json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        value["digest"] = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        workflow.plan_path.write_text(json.dumps(value), encoding="utf-8")
+
+        loaded = EngineeringPlan.load(workflow.plan_path)
+
+        self.assertEqual("legacy", loaded.intent["project"]["kinds"][0])
+        self.assertEqual(plan.objective, loaded.objective)
 
     def test_task_directory_cannot_be_reused_for_a_new_plan(self):
         workflow, executor, _ = self.prepared()
@@ -391,6 +410,48 @@ class EngineeringTests(unittest.TestCase):
         (self.workspace / "app.py").write_text("VALUE = 2\n", encoding="utf-8")
 
         with self.assertRaisesRegex(ContractViolation, "workspace changed"):
+            workflow.execute("operator", plan.digest)
+
+    def test_research_template_is_read_only_and_still_independently_reviewed(self):
+        policy = self.policy()
+        intent = IntentCompiler().compile(
+            "Research the value flow and recommend next steps",
+            self.workspace,
+            check_commands=policy.check_commands,
+        )
+        rsi = RSILoop(self.root / "research-learning", clock=lambda: 100.0)
+        workflow, executor = self.workflow(policy=policy, rsi=rsi)
+        plan = workflow.prepare(intent.objective, intent.to_dict())
+
+        report = workflow.execute("operator", plan.digest)
+        implementation = next(
+            item for item in executor.requests if item.task_type == "engineering.implement"
+        )
+
+        self.assertTrue(report["success"])
+        self.assertEqual(("read", "shell"), implementation.tools)
+        self.assertNotIn("edit", implementation.tools)
+        self.assertNotIn("write", implementation.tools)
+        self.assertTrue(implementation.reuse_allowed)
+        self.assertEqual(1, len(rsi.feedback_journal.read()))
+
+    def test_research_template_fails_if_executor_changes_workspace(self):
+        policy = self.policy()
+        intent = IntentCompiler().compile(
+            "调研 value 的数据流",
+            self.workspace,
+            check_commands=policy.check_commands,
+        )
+
+        def mutate_during_research(_request):
+            (self.workspace / "app.py").write_text("VALUE = 2\n", encoding="utf-8")
+
+        workflow, _ = self.workflow(
+            scripts={"implement": [mutate_during_research]}, policy=policy
+        )
+        plan = workflow.prepare(intent.objective, intent.to_dict())
+
+        with self.assertRaisesRegex(ContractViolation, "read-only research changed"):
             workflow.execute("operator", plan.digest)
 
     def test_indeterminate_mutating_effect_is_not_replayed(self):

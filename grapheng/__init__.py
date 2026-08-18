@@ -90,6 +90,14 @@ from .optimization import (
 )
 from .os import AgentOS
 from .learning import FeedbackJournal, ObservationJournal, QualityFeedback, RSICandidate, RSILoop
+from .intents import (
+    TASK_INTENT_SCHEMA_VERSION,
+    TASK_TEMPLATES,
+    IntentCompiler,
+    ProjectProfile,
+    TaskIntent,
+    inspect_project,
+)
 from .merge import (
     CONTROLLED_MERGE_SCHEMA_VERSION,
     ControlledGitMerger,
@@ -207,6 +215,7 @@ __all__ = [
     "GraphRuntime",
     "GraphSpec",
     "GraphValidationError",
+    "IntentCompiler",
     "LocalControlPlane",
     "LearnedExecutorEstimate",
     "LearnedRoutingPolicy",
@@ -236,6 +245,7 @@ __all__ = [
     "PiAgentExecutor",
     "PolicyRouter",
     "ProjectPolicy",
+    "ProjectProfile",
     "PROVIDER_GOVERNANCE_SCHEMA_VERSION",
     "ProviderAdmission",
     "ProviderGovernanceStore",
@@ -258,6 +268,9 @@ __all__ = [
     "MigrationStep",
     "SingleFlightCoordinator",
     "SingleFlightTimeoutError",
+    "TASK_INTENT_SCHEMA_VERSION",
+    "TASK_TEMPLATES",
+    "TaskIntent",
     "USER_TASK_SCHEMA_VERSION",
     "UserTaskModule",
     "RouteDecision",
@@ -277,6 +290,7 @@ __all__ = [
     "dispatch_id_from_receipt",
     "graph_event_from_orca_message",
     "default_project_policy",
+    "inspect_project",
     "validate_graph",
     "discover_local_executors",
     "default_bundle_migrations",

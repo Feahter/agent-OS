@@ -7,11 +7,12 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 from .adapters import discover_local_executors
-from .engineering import EngineeringWorkflow, ProjectPolicy
+from .engineering import EngineeringPlan, EngineeringWorkflow, ProjectPolicy
 from .errors import ContractViolation
+from .intents import IntentCompiler, TaskIntent
 from .learning import RSILoop
 from .os import AgentOS
 
@@ -69,6 +70,7 @@ class UserTaskModule:
         workflow_factory: Optional[
             Callable[[Path, Path, ProjectPolicy, AgentOS], EngineeringWorkflow]
         ] = None,
+        intent_compiler: Optional[IntentCompiler] = None,
         clock: Callable[[], float] = time.time,
         id_factory: Optional[Callable[[], str]] = None,
     ):
@@ -87,6 +89,7 @@ class UserTaskModule:
         self.tasks_root.mkdir(parents=True, exist_ok=True)
         self.agent_os = AgentOS(self.state_root)
         self._workflow_factory = workflow_factory
+        self._intent_compiler = intent_compiler or IntentCompiler()
         self._clock = clock
         self._id_factory = id_factory or (
             lambda: f"task-{uuid.uuid4().hex[:16]}"
@@ -97,6 +100,8 @@ class UserTaskModule:
         objective: str,
         workspace: Path,
         policy_path: Optional[Path] = None,
+        template: Optional[str] = None,
+        constraints: Sequence[str] = (),
     ) -> Mapping[str, Any]:
         if not isinstance(objective, str) or not objective.strip():
             raise ContractViolation("task objective cannot be empty")
@@ -107,6 +112,30 @@ class UserTaskModule:
             policy_path.expanduser().resolve()
             if policy_path is not None
             else workspace / ".agent-os" / "engineering.json"
+        )
+        configured_policy = None
+        if resolved_policy.exists() or resolved_policy.is_symlink():
+            configured_policy = ProjectPolicy.load(workspace, resolved_policy)
+        elif policy_path is not None:
+            raise ContractViolation(
+                f"engineering policy does not exist: {resolved_policy}"
+            )
+        intent = self._intent_compiler.compile(
+            objective,
+            workspace,
+            (
+                configured_policy.check_commands
+                if configured_policy is not None
+                else None
+            ),
+            template,
+            constraints,
+        )
+        if intent.needs_clarification:
+            questions = " ".join(intent.clarification_questions)
+            raise ContractViolation(f"task needs clarification before planning: {questions}")
+        policy = configured_policy or ProjectPolicy(
+            check_commands=intent.verification_commands
         )
         task_id, task_dir = self._allocate_task_dir()
         _atomic_json_write(
@@ -120,15 +149,15 @@ class UserTaskModule:
                 "created_at": self._clock(),
             },
         )
-        workflow = self._workflow(task_dir)
-        workflow.prepare(objective.strip())
+        workflow = self._workflow(task_dir, policy)
+        workflow.prepare(objective.strip(), intent.to_dict())
         return self.status(task_id)
 
     def status(self, task_id: str) -> Mapping[str, Any]:
         task_dir, metadata = self._task(task_id)
         state = self._state(task_dir)
         phase = str(state.get("phase", "preparing"))
-        return {
+        value = {
             "schema_version": USER_TASK_SCHEMA_VERSION,
             "task_id": task_id,
             "kind": metadata["kind"],
@@ -149,6 +178,23 @@ class UserTaskModule:
             "approval_required": phase == "awaiting_approval",
             "failure": state.get("failure"),
         }
+        plan_path = task_dir / "plan.json"
+        if plan_path.is_file():
+            engineering_plan = EngineeringPlan.load(plan_path)
+            intent = TaskIntent.from_dict(engineering_plan.intent)
+            value["intent"] = {
+                "template": intent.template,
+                "objective": intent.objective,
+                "constraints": list(intent.constraints),
+                "project_kinds": list(intent.project_kinds),
+                "verification_commands": [
+                    list(command) for command in intent.verification_commands
+                ],
+                "mutation_allowed": intent.mutation_allowed,
+                "assumptions": list(intent.assumptions),
+            }
+            value["proposed_plan"] = engineering_plan.plan
+        return value
 
     def approve(self, task_id: str, actor: str) -> Mapping[str, Any]:
         if not isinstance(actor, str) or not actor.strip():
@@ -308,10 +354,23 @@ class UserTaskModule:
             raise ContractViolation("task metadata fields are invalid")
         return task_dir, metadata
 
-    def _workflow(self, task_dir: Path) -> EngineeringWorkflow:
+    def _workflow(
+        self,
+        task_dir: Path,
+        policy_override: Optional[ProjectPolicy] = None,
+    ) -> EngineeringWorkflow:
         metadata = _read_json(task_dir / "task.json", "task metadata")
         workspace = Path(str(metadata["workspace"]))
-        policy = ProjectPolicy.load(workspace, Path(str(metadata["policy"])))
+        policy_path = Path(str(metadata["policy"]))
+        if policy_override is not None:
+            policy = policy_override
+        elif policy_path.exists() or policy_path.is_symlink():
+            policy = ProjectPolicy.load(workspace, policy_path)
+        else:
+            intent = TaskIntent.from_dict(
+                EngineeringPlan.load(task_dir / "plan.json").intent
+            )
+            policy = ProjectPolicy(check_commands=intent.verification_commands)
         if self._workflow_factory is not None:
             return self._workflow_factory(
                 workspace, task_dir, policy, self.agent_os

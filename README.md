@@ -74,20 +74,21 @@ agent-os demo examples/minimal_graph.json --work-dir /tmp/agent-os-demo
 
 ### Daily task interface
 
-Initialize a project's safety and verification policy once, then use the same five actions regardless of which local agent is selected:
+Use the same five actions regardless of which local agent is selected. Agent OS can infer bounded checks for common Python, Node, Rust, Go and Make projects; initialize a policy when you want explicit project rules:
 
 ```bash
-agent-os engineer init --workspace /path/to/project
-
 agent-os do "Fix the login timeout and add a regression test" \
-  --workspace /path/to/project
+  --workspace /path/to/project \
+  --constraint "Keep the public API stable"
 
 agent-os status task-0123456789abcdef
 agent-os approve task-0123456789abcdef --actor operator
 agent-os result task-0123456789abcdef
 ```
 
-`do` performs read-only exploration and planning, returns a stable task ID, and stops at a digest-bound approval. `approve` executes the exact approved plan and returns only after bounded checks and an independent review. Use `control TASK_ID cancel --actor NAME` to cancel a task before approval. Add `--json` to any of the five actions for machine-readable output.
+`do` compiles the goal into a reviewable intent, performs read-only exploration and planning, returns a stable task ID, and stops at a digest-bound approval. The approval binds the goal, constraints, template, verification commands, project rules and proposed steps; any change invalidates it. `approve` executes only that plan and returns after bounded checks and an independent review. Use `control TASK_ID cancel --actor NAME` to cancel before approval. Add `--json` to any action for machine-readable output.
+
+The first templates are `fix`, `test`, `refactor`, `research` and `release`. Selection is automatic, or can be overridden with `--template`. Research tasks are enforced as read-only. If the goal is too vague or no trusted verification command can be found, `do` stops before calling an agent and tells you what context is missing. For custom checks and budgets, run `agent-os engineer init --workspace /path/to/project` once and edit `.agent-os/engineering.json`.
 
 The default home is `~/.agent-os`; override it with `AGENT_OS_HOME` or `--home`. Operational task state stays under `tasks/` and remains the single source for status and results. Portable, prompt-free learning and policy state stays under `state/`; raw objectives, project paths and runtime evidence are deliberately excluded from state exports.
 
