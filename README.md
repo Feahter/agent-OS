@@ -78,6 +78,26 @@ Run the test suite:
 PYTHONPATH=. python3 -m unittest discover -s tests -v
 ```
 
+### Baseline user outcomes
+
+Evaluation records retain task classification, verification, duration, cost, intervention and recovery metrics. They do not copy objectives, project paths, prompts or raw responses:
+
+```bash
+agent-os evaluate record-engineering \
+  --root /path/to/evaluation-state \
+  --case examples/evaluation_case.json \
+  --report /path/to/task/report.json \
+  --run-id pilot-001 \
+  --user-inputs 2 \
+  --human-decisions 1
+
+agent-os evaluate baseline \
+  --root /path/to/evaluation-state \
+  --name v0.0.1
+```
+
+Baselines measure time, cost and intervention per verified result. Existing baseline names cannot be overwritten, so later versions can produce comparable snapshots from the same cases.
+
 ### Use the engineering workflow
 
 Initialize a project policy, then keep per-task state outside the target workspace:

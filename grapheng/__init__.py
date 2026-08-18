@@ -50,6 +50,14 @@ from .engineering import (
     ProjectPolicy,
     default_project_policy,
 )
+from .evaluation import (
+    EVALUATION_BASELINE_SCHEMA_VERSION,
+    EVALUATION_CASE_SCHEMA_VERSION,
+    EVALUATION_RECORD_SCHEMA_VERSION,
+    EvaluationCase,
+    EvaluationLab,
+    EvaluationRecord,
+)
 from .governance import (
     PROVIDER_GOVERNANCE_SCHEMA_VERSION,
     ProviderAdmission,
@@ -177,8 +185,14 @@ __all__ = [
     "ENGINEERING_PLAN_SCHEMA_VERSION",
     "ENGINEERING_POLICY_SCHEMA_VERSION",
     "ENGINEERING_REPORT_SCHEMA_VERSION",
+    "EVALUATION_BASELINE_SCHEMA_VERSION",
+    "EVALUATION_CASE_SCHEMA_VERSION",
+    "EVALUATION_RECORD_SCHEMA_VERSION",
     "EngineeringPlan",
     "EngineeringWorkflow",
+    "EvaluationCase",
+    "EvaluationLab",
+    "EvaluationRecord",
     "FeedbackJournal",
     "FlightDelivery",
     "FailurePattern",

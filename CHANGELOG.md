@@ -2,6 +2,11 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## Unreleased
+
+- 增加隐私最小化的用户结果评测、工程报告导入和不可覆盖的基线快照。
+- 增加 `evaluate record-engineering / baseline / status` 命令。
+
 ## 0.0.1 - 2026-08-17
 
 首个公开预览版本：

@@ -78,6 +78,26 @@ agent-os demo examples/minimal_graph.json --work-dir /tmp/agent-os-demo
 PYTHONPATH=. python3 -m unittest discover -s tests -v
 ```
 
+### 建立用户结果基线
+
+评测记录只保留任务类别、验证结果、耗时、费用、人工介入和恢复指标，不复制目标、项目路径、prompt 或原始响应：
+
+```bash
+agent-os evaluate record-engineering \
+  --root /path/to/evaluation-state \
+  --case examples/evaluation_case.json \
+  --report /path/to/task/report.json \
+  --run-id pilot-001 \
+  --user-inputs 2 \
+  --human-decisions 1
+
+agent-os evaluate baseline \
+  --root /path/to/evaluation-state \
+  --name v0.0.1
+```
+
+基线以“每个验证成功结果”的时间、费用和人工介入衡量体验。已有名称不能覆盖，后续版本可以用相同评测场景生成新快照进行比较。
+
 ### 使用工程工作流
 
 先初始化项目策略。每个任务的状态目录必须放在目标工作区之外：

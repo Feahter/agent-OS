@@ -10,6 +10,7 @@ from .console import ApprovalInbox, OperationsConsole
 from .console_server import OperationsServer
 from .distribution import AgentOSDistribution
 from .engineering import EngineeringWorkflow, ProjectPolicy, default_project_policy
+from .evaluation import EvaluationCase, EvaluationLab
 from .learning import RSILoop
 from .model import GraphSpec
 from .os import AgentOS
@@ -219,6 +220,36 @@ def _run_engineering_command(args, parser, agent_os) -> int:
     return 0 if value.get("success", True) else 1
 
 
+def _run_evaluation_command(args, parser) -> int:
+    lab = EvaluationLab(args.root)
+    if args.action == "record-engineering":
+        if args.case is None or args.report is None or not args.run_id:
+            parser.error(
+                "evaluate record-engineering requires --case, --report, and --run-id"
+            )
+        if args.user_inputs is None or args.human_decisions is None:
+            parser.error(
+                "evaluate record-engineering requires --user-inputs and --human-decisions"
+            )
+        value = lab.record_engineering(
+            EvaluationCase.load(args.case),
+            args.run_id,
+            args.report,
+            args.user_inputs,
+            args.human_decisions,
+            args.recovery_attempted,
+            args.recovery_succeeded,
+        ).to_dict()
+    elif args.action == "baseline":
+        if not args.name:
+            parser.error("evaluate baseline requires --name")
+        value = lab.create_baseline(args.name)
+    else:
+        value = lab.status()
+    print(json.dumps(value, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="grapheng")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -361,6 +392,19 @@ def main() -> int:
     engineer_parser.add_argument("--approved-by")
     engineer_parser.add_argument("--plan-digest")
     engineer_parser.add_argument("--agent-os-root", type=Path)
+    evaluation_parser = subparsers.add_parser("evaluate")
+    evaluation_parser.add_argument(
+        "action", choices=("record-engineering", "baseline", "status")
+    )
+    evaluation_parser.add_argument("--root", type=Path, required=True)
+    evaluation_parser.add_argument("--case", type=Path)
+    evaluation_parser.add_argument("--report", type=Path)
+    evaluation_parser.add_argument("--run-id")
+    evaluation_parser.add_argument("--name")
+    evaluation_parser.add_argument("--user-inputs", type=int)
+    evaluation_parser.add_argument("--human-decisions", type=int)
+    evaluation_parser.add_argument("--recovery-attempted", action="store_true")
+    evaluation_parser.add_argument("--recovery-succeeded", action="store_true")
     args = parser.parse_args()
 
     if args.command == "engineer":
@@ -389,6 +433,9 @@ def main() -> int:
     if agent_os_root is not None and legacy_roots:
         parser.error("--agent-os-root cannot be combined with legacy state roots")
     agent_os = AgentOS(agent_os_root) if agent_os_root is not None else None
+
+    if args.command == "evaluate":
+        return _run_evaluation_command(args, parser)
 
     if args.command == "engineer":
         return _run_engineering_command(args, parser, agent_os)

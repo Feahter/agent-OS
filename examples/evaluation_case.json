@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "case_id": "fix-small-001",
+  "task_type": "engineering.fix",
+  "difficulty": "small",
+  "data_classification": "public",
+  "tags": ["python", "regression-test"]
+}
