@@ -2,7 +2,7 @@
 
 **用 Graph Engineering 编排编码 Agent。**
 
-[English](README.md) | [简体中文](README.zh-CN.md)
+[English](README.md) | [简体中文](README.zh-CN.md) | [长期路线图](ROADMAP.zh-CN.md)
 
 [![Version](https://img.shields.io/badge/version-0.0.1-blue.svg)](https://github.com/Feahter/agent-OS/releases/tag/v0.0.1)
 [![CI](https://github.com/Feahter/agent-OS/actions/workflows/ci.yml/badge.svg)](https://github.com/Feahter/agent-OS/actions/workflows/ci.yml)
@@ -205,7 +205,7 @@ tests/        契约、恢复和跨进程集成测试
 
 ## 参与贡献
 
-提交 Pull Request 前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。安全问题按 [SECURITY.md](SECURITY.md) 的方式私密报告。
+项目将按用户目标驱动、统一控制面、受治理 RSI 和状态可迁移的方向逐步演进，详见[长期路线图](ROADMAP.zh-CN.md)。提交 Pull Request 前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。安全问题按 [SECURITY.md](SECURITY.md) 的方式私密报告。
 
 ## 许可证
 

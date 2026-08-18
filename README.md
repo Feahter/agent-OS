@@ -2,7 +2,7 @@
 
 **Graph-engineered orchestration for coding agents.**
 
-[English](README.md) | [简体中文](README.zh-CN.md)
+[English](README.md) | [简体中文](README.zh-CN.md) | [Roadmap](ROADMAP.md)
 
 [![Version](https://img.shields.io/badge/version-0.0.1-blue.svg)](https://github.com/Feahter/agent-OS/releases/tag/v0.0.1)
 [![CI](https://github.com/Feahter/agent-OS/actions/workflows/ci.yml/badge.svg)](https://github.com/Feahter/agent-OS/actions/workflows/ci.yml)
@@ -205,7 +205,7 @@ tests/        contract, recovery and cross-process integration tests
 
 ## Contributing
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Security issues should follow [SECURITY.md](SECURITY.md).
+The project will evolve around intent-driven use, one control plane, governed RSI and portable state. See the [long-term roadmap](ROADMAP.md). Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Security issues should follow [SECURITY.md](SECURITY.md).
 
 ## License
 
