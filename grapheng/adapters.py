@@ -27,6 +27,15 @@ from .reuse import VerifiedArtifactCache
 
 CANONICAL_TOOLS = ("edit", "read", "shell", "write")
 _DISCOVERY_PROBE_TIMEOUT_SECONDS = 10
+_CLAUDE_REQUIRED_HELP_FLAGS = (
+    "--print",
+    "--output-format",
+    "--json-schema",
+    "--no-session-persistence",
+    "--permission-mode",
+    "--tools",
+    "--max-budget-usd",
+)
 
 
 def _json_object(text: str) -> Mapping[str, Any]:
@@ -147,6 +156,19 @@ class CliAgentAdapter(ABC):
 class ClaudeCodeExecutor(CliAgentAdapter):
     tool_map = {"read": "Read", "shell": "Bash", "edit": "Edit", "write": "Write"}
 
+    def __init__(
+        self,
+        command: Sequence[str],
+        safe_mode_flag: Optional[bool] = None,
+    ):
+        super().__init__(command)
+        detected = (
+            _claude_safe_mode_flag(command)
+            if safe_mode_flag is None
+            else safe_mode_flag
+        )
+        self._safe_mode_flag = detected is True
+
     @property
     def capabilities(self) -> ExecutorCapabilities:
         return ExecutorCapabilities(
@@ -170,18 +192,23 @@ class ClaudeCodeExecutor(CliAgentAdapter):
             "--json-schema",
             json.dumps(schema, separators=(",", ":")),
             "--no-session-persistence",
-            "--safe-mode",
             "--permission-mode",
             "dontAsk",
             "--tools",
             ",".join(mapped_tools),
         ]
+        if self._safe_mode_flag:
+            arguments.insert(arguments.index("--permission-mode"), "--safe-mode")
         if request.model:
             arguments.extend(("--model", request.model))
         if request.max_cost_usd is not None:
             arguments.extend(("--max-budget-usd", str(request.max_cost_usd)))
         arguments.append(_prompt(request))
-        completed = self.run_cli(arguments, request)
+        completed = self.run_cli(
+            arguments,
+            request,
+            {"CLAUDE_CODE_SAFE_MODE": "1"},
+        )
         self.require_success(completed, self.capabilities.executor_id)
         try:
             envelope = json.loads(completed.stdout)
@@ -532,6 +559,25 @@ def _codex_is_usable(command: str) -> bool:
     return completed.returncode == 0
 
 
+def _claude_safe_mode_flag(command: Sequence[str]) -> Optional[bool]:
+    try:
+        completed = subprocess.run(
+            (*command, "--help"),
+            capture_output=True,
+            text=True,
+            timeout=_DISCOVERY_PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    help_text = f"{completed.stdout or ''}\n{completed.stderr or ''}"
+    if completed.returncode != 0 or any(
+        flag not in help_text for flag in _CLAUDE_REQUIRED_HELP_FLAGS
+    ):
+        return None
+    return "--safe-mode" in help_text
+
+
 def _opencode_is_usable(command: str) -> bool:
     try:
         completed = subprocess.run(
@@ -553,7 +599,11 @@ def discover_local_executors(
     registry = ExecutorRegistry(router, reuse_store)
     claude = shutil.which("claude")
     if claude:
-        registry.register(ClaudeCodeExecutor((claude,)))
+        safe_mode_flag = _claude_safe_mode_flag((claude,))
+        if safe_mode_flag is not None:
+            registry.register(
+                ClaudeCodeExecutor((claude,), safe_mode_flag=safe_mode_flag)
+            )
     pi = shutil.which("pi")
     if pi:
         registry.register(PiAgentExecutor((pi,)))

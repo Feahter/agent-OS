@@ -113,6 +113,57 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(5, result.tokens_used)
         self.assertEqual("claude-session", result.session_id)
 
+    def test_claude_discovery_falls_back_to_safe_mode_environment(self):
+        calls = []
+
+        def which(command):
+            return "/fake/claude" if command == "claude" else None
+
+        def runner(command, **kwargs):
+            calls.append((tuple(command), kwargs.get("env")))
+            if command[-1] == "--help":
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout=(
+                        "--print --output-format --json-schema "
+                        "--no-session-persistence --permission-mode --tools "
+                        "--max-budget-usd"
+                    ),
+                    stderr="",
+                )
+            if "--safe-mode" in command:
+                return subprocess.CompletedProcess(
+                    command, 1, stdout="", stderr="unknown option '--safe-mode'"
+                )
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps(
+                    {
+                        "type": "result",
+                        "subtype": "success",
+                        "is_error": False,
+                        "structured_output": {"answer": "claude"},
+                        "usage": {"input_tokens": 2, "output_tokens": 3},
+                    }
+                ),
+                stderr="",
+            )
+
+        with patch("grapheng.adapters.shutil.which", side_effect=which), patch(
+            "grapheng.adapters.subprocess.run", side_effect=runner
+        ), tempfile.TemporaryDirectory() as directory:
+            registry = discover_local_executors()
+            result = registry.execute(
+                request(Path(directory)), executor_id="claude-code"
+            )
+
+        self.assertEqual({"answer": "claude"}, result.outputs)
+        execution_command, environment = calls[-1]
+        self.assertNotIn("--safe-mode", execution_command)
+        self.assertEqual("1", environment["CLAUDE_CODE_SAFE_MODE"])
+
     def test_pi_adapter_normalizes_jsonl_result_and_usage(self):
         with tempfile.TemporaryDirectory() as directory:
             executor = PiAgentExecutor((sys.executable, str(FIXTURE), "pi"))

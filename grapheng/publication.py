@@ -368,6 +368,7 @@ class VerifiedResultPublisher:
                 model=spec.model,
                 tools=spec.tools,
                 timeout_seconds=spec.timeout_seconds,
+                max_tokens=source.max_tokens,
                 max_cost_usd=spec.max_cost_usd,
                 data_classification=spec.data_classification,
                 task_type=spec.task_type,

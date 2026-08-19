@@ -85,6 +85,41 @@ class AgentTests(unittest.TestCase):
             with self.assertRaisesRegex(ContractViolation, "cost_budget"):
                 registry.execute(request)
 
+    def test_agent_node_token_budget_fails_before_unbounded_executor_runs(self):
+        graph = GraphSpec.from_dict(
+            {
+                "id": "hard-token-budget",
+                "require_reality_anchor": False,
+                "nodes": [
+                    {
+                        "id": "answer",
+                        "kind": "agent",
+                        "writes": ["answer"],
+                        "estimated_tokens": 5,
+                        "max_tokens": 10,
+                        "agent": {
+                            "executor": "memory",
+                            "prompt": "Answer",
+                        },
+                    }
+                ],
+            }
+        )
+        executor = MemoryExecutor()
+        executors = ExecutorRegistry()
+        executors.register(executor)
+        registry = NodeRegistry()
+
+        with tempfile.TemporaryDirectory() as directory:
+            registry.register(
+                "agent",
+                AgentNodeHandler(graph, executors, Path(directory)),
+            )
+            result = GraphRuntime(graph, registry).run()
+
+        self.assertFalse(result.success)
+        self.assertEqual([], executor.requests)
+
     def test_graph_routes_agent_node_and_commits_outputs(self):
         graph = GraphSpec.from_dict(
             {
@@ -114,7 +149,9 @@ class AgentTests(unittest.TestCase):
             }
         )
         executors = ExecutorRegistry()
-        memory = MemoryExecutor()
+        memory = MemoryExecutor(
+            features=("structured_output", "tool_policy", "token_budget")
+        )
         executors.register(memory)
         nodes = NodeRegistry()
         nodes.register("seed", lambda context: {"question": "hello"})
@@ -134,6 +171,7 @@ class AgentTests(unittest.TestCase):
         self.assertEqual({"question": "hello"}, memory.requests[0].inputs)
         self.assertEqual("coding", memory.requests[0].task_type)
         self.assertEqual("general-purpose", memory.requests[0].model_family)
+        self.assertEqual(10, memory.requests[0].max_tokens)
         completed = next(
             event
             for event in events

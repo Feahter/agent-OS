@@ -1,7 +1,6 @@
 {
   "id": "verified-reuse-agents",
   "max_concurrency": 1,
-  "max_tokens": 1200,
   "require_reality_anchor": true,
   "nodes": [
     {
@@ -9,7 +8,6 @@
       "kind": "agent",
       "writes": ["answer"],
       "estimated_tokens": 700,
-      "max_tokens": 800,
       "agent": {
         "executor": "codex",
         "prompt": "Inspect the workspace and return a factual answer.",
@@ -27,7 +25,6 @@
       "reads": ["answer"],
       "writes": ["verification"],
       "estimated_tokens": 300,
-      "max_tokens": 400,
       "verifier_for": "answer",
       "reality_anchor": true,
       "verified_reuse": {

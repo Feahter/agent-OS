@@ -120,6 +120,10 @@ class OrcaGraphCompiler:
             raise ContractViolation(
                 f"agent node {node.id} sets max_cost_usd, which Orca cannot enforce"
             )
+        if node.max_tokens is not None:
+            raise ContractViolation(
+                f"agent node {node.id} sets max_tokens, which Orca cannot enforce"
+            )
         if node.retry.max_attempts > 3:
             raise ContractViolation(
                 f"agent node {node.id} exceeds Orca's three-attempt dispatch limit"

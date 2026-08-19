@@ -87,6 +87,10 @@ def validation_issues(graph: GraphSpec) -> Tuple[str, ...]:
         if node.kind != "agent" and node.agent is not None:
             issues.append(f"non-agent node {node.id} cannot have an agent configuration")
         if node.agent is not None:
+            if graph.max_tokens is not None and node.max_tokens is None:
+                issues.append(
+                    f"agent node {node.id} requires max_tokens when graph max_tokens is set"
+                )
             if graph.max_cost_usd is not None and node.agent.max_cost_usd is None:
                 issues.append(
                     f"agent node {node.id} requires max_cost_usd when graph max_cost_usd is set"

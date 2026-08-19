@@ -897,6 +897,7 @@ class OrcaCoordinator:
                 model=node.agent.model,
                 tools=node.agent.tools,
                 timeout_seconds=node.agent.timeout_seconds,
+                max_tokens=node.max_tokens,
                 max_cost_usd=node.agent.max_cost_usd,
                 data_classification=node.agent.data_classification,
                 task_type=node.agent.task_type,

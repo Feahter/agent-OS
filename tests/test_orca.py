@@ -150,6 +150,27 @@ class OrcaTests(unittest.TestCase):
         with self.assertRaisesRegex(ContractViolation, "cannot enforce"):
             OrcaGraphCompiler().compile(GraphSpec.from_dict(data))
 
+    def test_compiler_rejects_unenforceable_token_budget(self):
+        data = {
+            "id": "orca-token-budget",
+            "require_reality_anchor": False,
+            "nodes": [
+                {
+                    "id": "costly",
+                    "kind": "agent",
+                    "writes": ["answer"],
+                    "max_tokens": 100,
+                    "agent": {
+                        "executor": "codex",
+                        "prompt": "work",
+                    },
+                }
+            ],
+        }
+
+        with self.assertRaisesRegex(ContractViolation, "cannot enforce"):
+            OrcaGraphCompiler().compile(GraphSpec.from_dict(data))
+
     def test_backend_materializes_run_tasks_deps_and_gate(self):
         runner = FakeRunner(
             [

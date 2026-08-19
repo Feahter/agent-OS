@@ -1,7 +1,6 @@
 {
   "id": "orca-isolated-review",
   "max_concurrency": 2,
-  "max_tokens": 2400,
   "require_reality_anchor": true,
   "nodes": [
     {
@@ -9,7 +8,6 @@
       "kind": "agent",
       "writes": ["draft"],
       "estimated_tokens": 900,
-      "max_tokens": 1400,
       "reality_anchor": true,
       "retry": {"max_attempts": 2},
       "agent": {
@@ -33,7 +31,6 @@
       "reads": ["draft"],
       "writes": ["reviewed_report"],
       "estimated_tokens": 500,
-      "max_tokens": 1000,
       "gate": "approve-review",
       "verifier_for": "codex-draft",
       "agent": {

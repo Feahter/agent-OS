@@ -393,6 +393,7 @@ class VerifiedArtifactCache:
             "executor_id": executor_id,
             "model_family": request.model_family,
             "model": request.model,
+            "max_tokens": request.max_tokens,
             "max_cost_usd": request.max_cost_usd,
             "tools": sorted(set(request.tools)),
             "output_contract": sorted(set(request.output_keys)),

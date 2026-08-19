@@ -225,6 +225,8 @@ resident.start_background()
 
 A node can read only declared artifacts and must produce exactly its declared outputs. Graph validation rejects cycles, missing producers, unordered writes, unsafe shared workspaces and ungrounded terminal paths before execution starts.
 
+`estimated_tokens` is an admission estimate. For Agent nodes, `max_tokens` is a hard execution contract: Agent OS forwards it to the request, requires an executor with the `token_budget` capability, and refuses to start an unbounded executor. A graph-level `max_tokens` therefore requires every Agent node to declare its own `max_tokens`; concurrent admission conservatively reserves those hard limits. The bundled CLI adapters currently report token usage but do not claim a native hard token limit, so token-capped Agent graphs fail before a model call. Use an executor that explicitly implements `token_budget`, or use Claude Code's `agent.max_cost_usd` hard dollar limit and treat `estimated_tokens` plus observed usage as measurements. Orca also rejects token- or dollar-capped nodes until its worker protocol can enforce them during execution.
+
 ## Supported tools
 
 | Tool | Verified version (Darwin arm64) | Protocol | Integration |
@@ -235,7 +237,7 @@ A node can read only declared artifacts and must produce exactly its declared ou
 | [OpenCode](https://opencode.ai/) | `1.18.18` | `run-jsonl-v1` | Local CLI adapter |
 | Orca | `1.4.180` | `orca-json-command-v1` | Graph compiler, backend and coordinator |
 
-Adapters translate the common `read / shell / edit / write` tool contract into each product's protocol. The original tool set was verified on Darwin arm64 on 2026-08-18; OpenCode was verified from its official Darwin arm64 release binary on 2026-08-19. Evidence is version-controlled and travels with release bundles. Certification is platform-scoped: the same version on another OS or architecture is reported as `unverified_platform` and is not included in `ready_executors`.
+Adapters translate the common `read / shell / edit / write` tool contract into each product's protocol. Claude Code discovery also adapts to versions that temporarily omit the `--safe-mode` flag: isolation remains enabled through `CLAUDE_CODE_SAFE_MODE=1`, while versions that expose the flag receive both forms. This is separate from `--permission-mode dontAsk`, which governs tool authorization rather than configuration isolation. The original tool set was verified on Darwin arm64 on 2026-08-18; OpenCode was verified from its official Darwin arm64 release binary on 2026-08-19. Evidence is version-controlled and travels with release bundles. Certification is platform-scoped: the same version on another OS or architecture is reported as `unverified_platform` and is not included in `ready_executors`.
 
 `CliAgentAdapter` is the public kit for new local CLI integrations. It centralizes bounded process execution, environment isolation, timeout and process-fault classification, while the existing `AgentExecutor` protocol remains the single runtime seam. OpenCode uses non-interactive JSONL, `--pure`, project-config isolation and deny-by-default permissions; it reports observed token and cost data but does not claim an unsupported hard cost limit. OpenCode owns its session persistence, so its product session data is not copied into Agent OS portable bundles.
 

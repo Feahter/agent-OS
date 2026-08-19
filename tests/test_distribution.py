@@ -443,7 +443,7 @@ class DistributionTests(unittest.TestCase):
 
         self.assertEqual([1, 2], matrix["state"]["importable_bundle_schema_versions"])
         self.assertEqual([], matrix["runtime"]["third_party_runtime_dependencies"])
-        self.assertEqual(3, matrix["matrix_schema_version"])
+        self.assertEqual(4, matrix["matrix_schema_version"])
         self.assertEqual(
             {
                 "openclaw",

@@ -1,7 +1,6 @@
 {
   "id": "heterogeneous-review",
   "max_concurrency": 2,
-  "max_tokens": 2000,
   "require_reality_anchor": true,
   "nodes": [
     {
@@ -9,7 +8,6 @@
       "kind": "agent",
       "writes": ["draft"],
       "estimated_tokens": 800,
-      "max_tokens": 1200,
       "reality_anchor": true,
       "agent": {
         "executor": "claude-code",
@@ -29,7 +27,6 @@
       "reads": ["draft"],
       "writes": ["reviewed_report"],
       "estimated_tokens": 400,
-      "max_tokens": 800,
       "verifier_for": "research",
       "agent": {
         "executor": "pi-agent",

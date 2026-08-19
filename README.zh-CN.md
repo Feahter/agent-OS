@@ -224,6 +224,8 @@ resident.start_background()
 
 节点只能读取声明过的 Artifact，返回值必须精确匹配 `writes`。执行前的图校验会拒绝环、缺失生产者、无序写入、不安全的共享工作区和没有 Reality Anchor 的终点路径。
 
+`estimated_tokens` 是准入估算。对于 Agent 节点，`max_tokens` 是硬执行契约：Agent OS 会把它传入请求，要求执行器声明 `token_budget` 能力；无法执行硬上限时，会在启动进程和调用模型前拒绝。图级 `max_tokens` 因此要求每个 Agent 节点都声明自己的 `max_tokens`，并发准入会保守预留这些硬上限。当前内置 CLI Adapter 只能上报 Token 用量，尚未宣称具备原生硬 Token 上限，因此带 Token 上限的 Agent 图会在模型调用前失败关闭。此时应使用明确实现 `token_budget` 的执行器，或使用 Claude Code 的 `agent.max_cost_usd` 硬美元上限，把 `estimated_tokens` 和实际用量作为计量数据。Orca 在 worker 协议能于执行中落实预算之前，也会拒绝带 Token 或美元上限的节点。
+
 ## 支持的工具
 
 | 工具 | 已验证版本（Darwin arm64） | 协议 | 接入方式 |
@@ -234,7 +236,7 @@ resident.start_background()
 | [OpenCode](https://opencode.ai/) | `1.18.18` | `run-jsonl-v1` | 本地 CLI Adapter |
 | Orca | `1.4.180` | `orca-json-command-v1` | 图编译器、后端与协调器 |
 
-Adapter 会把统一的 `read / shell / edit / write` 工具契约翻译成各产品协议。原有工具于 2026-08-18 在 Darwin arm64 上完成只读协议验收，OpenCode 则于 2026-08-19 使用官方 Darwin arm64 发布二进制完成验收。证据保存在版本库并随发行包迁移。认证范围包含平台：同一版本出现在其他操作系统或架构时会标记为 `unverified_platform`，且不会进入 `ready_executors`。
+Adapter 会把统一的 `read / shell / edit / write` 工具契约翻译成各产品协议。Claude Code 发现还会适配暂时没有 `--safe-mode` 参数的版本：隔离仍由 `CLAUDE_CODE_SAFE_MODE=1` 开启；参数存在时则同时使用两种入口。它与 `--permission-mode dontAsk` 并不等价，后者只管理工具授权，不负责隔离本地配置。原有工具于 2026-08-18 在 Darwin arm64 上完成只读协议验收，OpenCode 则于 2026-08-19 使用官方 Darwin arm64 发布二进制完成验收。证据保存在版本库并随发行包迁移。认证范围包含平台：同一版本出现在其他操作系统或架构时会标记为 `unverified_platform`，且不会进入 `ready_executors`。
 
 `CliAgentAdapter` 是新增本地 CLI 集成的公共开发包。它统一有限进程执行、环境隔离、超时和进程故障分类，运行时仍只保留现有 `AgentExecutor` 这一条接缝。OpenCode 使用非交互 JSONL、`--pure`、项目配置隔离和默认拒绝权限；它会上报实际 Token 与费用供 RSI 学习，但不会伪装成支持硬费用上限。OpenCode 会话仍由产品自身持久化，其会话数据不会复制进 Agent OS 可迁移包。
 

@@ -30,7 +30,7 @@ from .os import AGENT_OS_SCHEMA_VERSION, AgentOS
 
 RELEASE_SCHEMA_VERSION = 1
 DIAGNOSTIC_SCHEMA_VERSION = 4
-COMPATIBILITY_MATRIX_VERSION = 3
+COMPATIBILITY_MATRIX_VERSION = 4
 _RELEASE_KIND = "grapheng-agent-os-release"
 _MINIMUM_PYTHON = (3, 9)
 _SOURCE_FILES = (
@@ -108,12 +108,11 @@ _COMMAND_PROBES = (
             "--output-format",
             "--json-schema",
             "--no-session-persistence",
-            "--safe-mode",
             "--permission-mode",
             "--tools",
             "--max-budget-usd",
         ),
-        ClaudeCodeExecutor(("claude",)).capabilities.features,
+        ClaudeCodeExecutor(("claude",), safe_mode_flag=True).capabilities.features,
     ),
     _CommandProbe(
         "codex",

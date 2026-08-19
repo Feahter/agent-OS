@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+- 修复 Claude Code `--safe-mode` 在版本间漂移导致的启动失败；按本机协议自适应参数，同时始终保持安全模式环境隔离。
+- 将 Agent 节点 `max_tokens` 提升为执行器硬能力契约；无硬 Token 上限的执行器和 Orca worker 会在调用前失败关闭，复用键与并发预留同步纳入该边界。
 - 提供公共 `CliAgentAdapter` 开发包，并新增经过版本/平台认证的 OpenCode JSONL 执行器、默认拒绝权限、故障注入和 RSI 费用观测。
 - 修复 Intel macOS 上 Codex 启动脚本存在但架构原生程序缺失时仍被注册的问题，并将平台纳入兼容认证。
 - 增加目标意图编译、五类高频任务模板、显式约束与可审阅计划摘要。

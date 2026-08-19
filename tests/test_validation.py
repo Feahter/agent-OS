@@ -283,6 +283,22 @@ class ValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(GraphValidationError, "requires max_cost_usd"):
             validate_graph(spec)
 
+    def test_graph_token_budget_requires_agent_hard_cap(self):
+        spec = graph(
+            [
+                {
+                    "id": "worker",
+                    "kind": "agent",
+                    "writes": ["result"],
+                    "agent": {"prompt": "work"},
+                }
+            ],
+            max_tokens=100,
+        )
+
+        with self.assertRaisesRegex(GraphValidationError, "requires max_tokens"):
+            validate_graph(spec)
+
     def test_controlled_merge_requires_isolated_source_workspace(self):
         spec = graph(
             self.controlled_merge_nodes(source_workspace={"mode": "shared"})

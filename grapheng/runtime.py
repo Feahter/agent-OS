@@ -274,6 +274,12 @@ class GraphRuntime:
         )
 
     @staticmethod
+    def _token_reservation(node: NodeSpec) -> int:
+        if node.agent is not None and node.max_tokens is not None:
+            return node.max_tokens
+        return node.estimated_tokens
+
+    @staticmethod
     def _cost_reservation(node: NodeSpec) -> float:
         if node.agent is not None and node.agent.max_cost_usd is not None:
             return node.agent.max_cost_usd
@@ -419,7 +425,8 @@ class GraphRuntime:
                         self._emit("node_blocked", run_id, node.id, payload={"reason": "gate", "gate": node.gate})
                         changed = True
                         continue
-                    if not ledger.can_reserve(node.estimated_tokens):
+                    token_reservation = self._token_reservation(node)
+                    if not ledger.can_reserve(token_reservation):
                         statuses[node.id] = NodeStatus.BLOCKED
                         self._emit("node_blocked", run_id, node.id, payload={"reason": "token_budget"})
                         changed = True
@@ -433,9 +440,9 @@ class GraphRuntime:
                     if len(futures) >= self.graph.max_concurrency:
                         break
                     attempts[node.id] += 1
-                    ledger.reserve(node.estimated_tokens)
+                    ledger.reserve(token_reservation)
                     cost_ledger.reserve(cost_reservation)
-                    reservations[node.id] = (node.estimated_tokens, cost_reservation)
+                    reservations[node.id] = (token_reservation, cost_reservation)
                     statuses[node.id] = NodeStatus.RUNNING
                     handler = handlers[node.id]
                     future = executor.submit(

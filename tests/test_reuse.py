@@ -21,7 +21,7 @@ from grapheng import (
 class CountingExecutor:
     def __init__(self, started=None, release=None, error=None):
         self._capabilities = ExecutorCapabilities(
-            "counting", ("structured_output",), ()
+            "counting", ("structured_output", "token_budget"), ()
         )
         self.started = started
         self.release = release
@@ -63,6 +63,32 @@ def make_request(workspace, task_id="task", **overrides):
 
 
 class ReuseTests(unittest.TestCase):
+    def test_stricter_token_budget_never_reuses_a_looser_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            cache = VerifiedArtifactCache(root / "reuse")
+            executor = CountingExecutor()
+            registry = ExecutorRegistry(reuse_store=cache)
+            registry.register(executor)
+            original_request = make_request(workspace, max_tokens=100)
+            original = registry.execute(original_request)
+            cache.publish_verified(
+                original_request,
+                original,
+                source_run_id="run-1",
+                verification_id="anchor-1",
+                quality_score=1.0,
+            )
+
+            stricter = registry.execute(
+                make_request(workspace, "run-2", max_tokens=50)
+            )
+
+        self.assertEqual("miss", stricter.reuse_status)
+        self.assertEqual(2, executor.calls)
+
     def test_only_explicitly_verified_result_is_persisted_and_reused(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

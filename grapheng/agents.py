@@ -44,6 +44,7 @@ class AgentRequest:
     model: Optional[str] = None
     tools: Tuple[str, ...] = ()
     timeout_seconds: int = 300
+    max_tokens: Optional[int] = None
     max_cost_usd: Optional[float] = None
     data_classification: str = "public"
     task_type: str = "general"
@@ -64,6 +65,12 @@ class AgentRequest:
             or self.timeout_seconds < 1
         ):
             raise ContractViolation("agent timeout_seconds must be a positive integer")
+        if self.max_tokens is not None and (
+            isinstance(self.max_tokens, bool)
+            or not isinstance(self.max_tokens, int)
+            or self.max_tokens < 1
+        ):
+            raise ContractViolation("agent max_tokens must be a positive integer")
         if self.max_cost_usd is not None and (
             isinstance(self.max_cost_usd, bool)
             or not isinstance(self.max_cost_usd, (int, float))
@@ -189,6 +196,8 @@ class ExecutorRegistry:
             implied_features.add("tool_policy")
         if request.max_cost_usd is not None:
             implied_features.add("cost_budget")
+        if request.max_tokens is not None:
+            implied_features.add("token_budget")
         all_features = set(required_features) | implied_features
         candidates = []
         for candidate_id in sorted(self._executors):

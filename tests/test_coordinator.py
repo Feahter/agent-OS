@@ -9,6 +9,7 @@ from pathlib import Path
 from grapheng import (
     AllowListGatePolicy,
     ContractViolation,
+    GraphValidationError,
     GraphSpec,
     OrcaCoordinator,
     OrcaMaterializedRun,
@@ -555,7 +556,7 @@ class OrcaCoordinatorTests(unittest.TestCase):
         self.assertEqual(1, len(backend.finishes))
         self.assertEqual(["delivery-mixed"], backend.acks)
 
-    def test_token_reservation_waits_but_actual_overage_fails_closed(self):
+    def test_token_budget_fails_before_orca_materialization(self):
         value = graph(
             [
                 node("first", estimated_tokens=4),
@@ -567,28 +568,10 @@ class OrcaCoordinatorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             backend = FakeBackend()
-            coordinator = self.coordinator(root, value, backend)
-            started = coordinator.start()
-            backend.enqueue("delivery-first", done("first", tokens=1))
-            next_wave = coordinator.advance(timeout_ms=10)
+            with self.assertRaisesRegex(GraphValidationError, "requires max_tokens"):
+                self.coordinator(root, value, backend)
 
-        self.assertEqual("pending", started.statuses["second"])
-        self.assertEqual("running", next_wave.statuses["second"])
-
-        overage = graph(
-            [node("work", estimated_tokens=4)], max_tokens=5
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            backend = FakeBackend()
-            coordinator = self.coordinator(root, overage, backend)
-            coordinator.start()
-            backend.enqueue("delivery-over", done("work", tokens=6))
-            failed = coordinator.advance(timeout_ms=10)
-
-        self.assertEqual("failed", failed.phase)
-        self.assertEqual(0, failed.tokens_used)
-        self.assertEqual({}, failed.artifacts)
+        self.assertEqual(0, backend.materialize_calls)
 
     def test_isolated_change_set_conflict_fails_without_committing_outputs(self):
         value = graph(
