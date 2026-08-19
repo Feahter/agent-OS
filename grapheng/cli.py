@@ -1,5 +1,6 @@
 import argparse
 import json
+import shlex
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -389,9 +390,48 @@ def _print_task_center(value, json_output: bool) -> None:
             print(f"  Next: {job['next_action']}")
 
 
+def _print_setup(value, json_output: bool) -> None:
+    if json_output:
+        print(json.dumps(value, ensure_ascii=False, sort_keys=True))
+        return
+    labels = {
+        "ready": "ready",
+        "ready_with_warnings": "ready with warnings",
+        "needs_agent": "needs a coding Agent",
+        "blocked": "blocked",
+    }
+    readiness = value["readiness"]
+    print(f"Agent OS setup: {labels.get(readiness, readiness)}")
+    state = "initialized" if value["initialized"] else "already initialized"
+    print(f"State: {state} · {value['root']}")
+    executors = ", ".join(value["ready_executors"]) or "none"
+    print(f"Ready coding Agents: {executors}")
+    print(f"Orca: {'ready' if value['ready_for_orca'] else 'not ready'}")
+    print("Safety: environment inspection only · 0 model calls")
+    notable = [item for item in value["checks"] if item["status"] != "pass"]
+    if notable:
+        print("Checks:")
+        for check in notable:
+            print(f"- {check['status'].upper()} {check['check_id']}: {check['summary']}")
+    actions = value["next_actions"]
+    if not actions:
+        print("Next: agent-os do \"YOUR_GOAL\" --workspace /path/to/project")
+        return
+    print("Next steps:")
+    for action in actions:
+        print(f"- [{action['priority']}] {action['summary']}")
+        command = action.get("command")
+        if command:
+            print(f"  Run: {shlex.join(command)}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="agent-os")
     subparsers = parser.add_subparsers(dest="command", required=True)
+    setup_parser = subparsers.add_parser("setup")
+    setup_parser.add_argument("--home", type=Path)
+    setup_parser.add_argument("--source-root", type=Path)
+    setup_parser.add_argument("--json", action="store_true", dest="json_output")
     do_parser = subparsers.add_parser("do")
     do_parser.add_argument("objective")
     do_parser.add_argument("--workspace", type=Path, required=True)
@@ -583,6 +623,17 @@ def main() -> int:
     evaluation_parser.add_argument("--recovery-attempted", action="store_true")
     evaluation_parser.add_argument("--recovery-succeeded", action="store_true")
     args = parser.parse_args()
+
+    if args.command == "setup":
+        value = AgentOSDistribution(source_root=args.source_root).setup(
+            args.home or default_agent_os_home()
+        )
+        _print_setup(value, args.json_output)
+        return (
+            0
+            if value["ready_for_agent_execution"] and not value["blocking_checks"]
+            else 2
+        )
 
     if args.command in ("do", "status", "approve", "control", "result"):
         return _run_user_task_command(args)

@@ -68,9 +68,16 @@ git clone https://github.com/Feahter/agent-OS.git
 cd agent-OS
 python3 -m pip install -e .
 
+agent-os setup
+
 agent-os validate examples/minimal_graph.json
 agent-os demo examples/minimal_graph.json --work-dir /tmp/agent-os-demo
 ```
+
+`setup` 会初始化本地可迁移状态，检查 Python、文件系统语义、Codex、Claude
+Code、Pi 和可选 Orca，并按优先级给出修复步骤。它只执行 help/version 探测，
+不会调用模型。需要版本化诊断数据时使用 `--json`，需要更换本地状态目录时使用
+`--home /path/to/state`。
 
 ### 日常任务入口
 

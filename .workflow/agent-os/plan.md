@@ -214,3 +214,15 @@
 - CLI 提供 `engineer init / plan / run / status / ship`；`run` 强制绑定计划摘要，`ship` 只允许交互确认。
 - 单次 `task-dir` 不得与项目工作区或 Agent OS 根目录相互嵌套，也不得复用于新任务；普通仓库与链接
   worktree 的 Git 指针、HEAD、index、config、refs 均纳入保护快照。
+
+## Phase F — 0.1 用户旅程收束
+
+### F1：首次设置与可执行诊断
+[deps: E5, E6] [status: completed]
+
+- `agent-os setup` 一次完成本地可迁移状态初始化、运行环境检查和 Agent 自动发现。
+- 诊断区分 blocked、needs agent、ready with warnings 与 ready，不再用单一 healthy 掩盖可用性。
+- 非通过项生成带优先级、稳定 action id 和参数数组复跑命令的结构化修复建议。
+- 默认输出面向人的摘要，`--json` 保留版本化机器契约；两种输出共享同一诊断事实。
+- Setup 只执行本地文件系统与 help/version 探测，明确记录 0 次模型调用，不创建 Orca 对象。
+- 全新机器安装演练和真实 Agent/Orca 灰度仍作为外部证据门槛，不由离线测试替代。

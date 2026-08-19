@@ -1,11 +1,15 @@
+import contextlib
+import io
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from grapheng import AgentOS, AgentOSDistribution, ContractViolation
+from grapheng.cli import main
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -58,6 +62,10 @@ class DistributionTests(unittest.TestCase):
             item["check_id"]: item["status"] for item in report["checks"]
         }
         self.assertTrue(report["healthy"])
+        self.assertEqual(3, report["diagnostic_schema_version"])
+        self.assertEqual("ready", report["readiness"])
+        self.assertEqual([], report["blocking_checks"])
+        self.assertEqual([], report["next_actions"])
         self.assertTrue(report["ready_for_agent_execution"])
         self.assertEqual(
             ["claude-code", "codex", "pi-agent"], report["ready_executors"]
@@ -177,6 +185,115 @@ class DistributionTests(unittest.TestCase):
             [{"architecture": "arm64", "operating_system": "Darwin"}],
             codex["details"]["verified_platforms"],
         )
+        action = next(
+            item
+            for item in report["next_actions"]
+            if item["check_id"] == "adapter:codex"
+        )
+        self.assertEqual("certify_adapter", action["action_id"])
+        self.assertEqual("recommended", action["priority"])
+        self.assertIsInstance(action["command"], list)
+
+    def test_setup_initializes_state_and_explains_missing_agents_without_model_calls(self):
+        distribution = AgentOSDistribution(PROJECT_ROOT, which=lambda command: None)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "agent-os"
+            first = distribution.setup(root)
+            second = distribution.setup(root)
+
+        self.assertTrue(first["initialized"])
+        self.assertFalse(second["initialized"])
+        self.assertEqual(0, first["model_calls"])
+        self.assertEqual("needs_agent", first["readiness"])
+        self.assertFalse(first["ready_for_agent_execution"])
+        self.assertEqual(
+            "enable_agent_execution", first["next_actions"][0]["action_id"]
+        )
+        self.assertEqual("required", first["next_actions"][0]["priority"])
+        self.assertEqual(
+            "pass",
+            next(
+                item["status"]
+                for item in first["checks"]
+                if item["check_id"] == "state:agent-os"
+            ),
+        )
+
+    def test_setup_does_not_initialize_an_existing_nonempty_directory(self):
+        distribution = AgentOSDistribution(PROJECT_ROOT, which=lambda command: None)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "unrelated"
+            root.mkdir()
+            marker = root / "keep.txt"
+            marker.write_text("keep", encoding="utf-8")
+
+            report = distribution.setup(root)
+
+            self.assertEqual("keep", marker.read_text(encoding="utf-8"))
+            self.assertFalse((root / "manifest.json").exists())
+
+        self.assertFalse(report["initialized"])
+        self.assertEqual("blocked", report["readiness"])
+        action = next(
+            item
+            for item in report["next_actions"]
+            if item["check_id"] == "state:agent-os"
+        )
+        self.assertEqual("restore_or_choose_state", action["action_id"])
+        self.assertNotIn("command", action)
+
+    def test_cli_setup_has_human_and_json_outputs(self):
+        report = {
+            "initialized": True,
+            "root": "/tmp/agent-os",
+            "readiness": "ready_with_warnings",
+            "ready_executors": ["codex"],
+            "ready_for_agent_execution": True,
+            "ready_for_orca": False,
+            "blocking_checks": [],
+            "checks": [
+                {
+                    "check_id": "orchestration:orca",
+                    "status": "warn",
+                    "summary": "Optional command orca is not installed",
+                    "details": {},
+                }
+            ],
+            "next_actions": [
+                {
+                    "action_id": "install_adapter",
+                    "check_id": "orchestration:orca",
+                    "priority": "optional",
+                    "summary": "Install orca if orchestration is needed.",
+                    "command": ["agent-os", "setup", "--home", "/tmp/agent-os"],
+                }
+            ],
+            "model_calls": 0,
+        }
+        distribution = Mock()
+        distribution.setup.return_value = report
+        human = io.StringIO()
+        with patch(
+            "grapheng.cli.AgentOSDistribution", return_value=distribution
+        ), patch.object(
+            sys, "argv", ["agent-os", "setup", "--home", "/tmp/agent-os"]
+        ), contextlib.redirect_stdout(human):
+            self.assertEqual(0, main())
+
+        machine = io.StringIO()
+        with patch(
+            "grapheng.cli.AgentOSDistribution", return_value=distribution
+        ), patch.object(
+            sys,
+            "argv",
+            ["agent-os", "setup", "--home", "/tmp/agent-os", "--json"],
+        ), contextlib.redirect_stdout(machine):
+            self.assertEqual(0, main())
+
+        self.assertIn("ready with warnings", human.getvalue())
+        self.assertIn("0 model calls", human.getvalue())
+        self.assertIn("[optional] Install orca", human.getvalue())
+        self.assertEqual(report, json.loads(machine.getvalue()))
 
     def test_doctor_fails_closed_on_probe_timeout_and_process_crash(self):
         def which(command):

@@ -24,7 +24,7 @@ from .os import AGENT_OS_SCHEMA_VERSION, AgentOS
 
 
 RELEASE_SCHEMA_VERSION = 1
-DIAGNOSTIC_SCHEMA_VERSION = 2
+DIAGNOSTIC_SCHEMA_VERSION = 3
 COMPATIBILITY_MATRIX_VERSION = 2
 _RELEASE_KIND = "grapheng-agent-os-release"
 _MINIMUM_PYTHON = (3, 9)
@@ -249,15 +249,50 @@ class AgentOSDistribution:
             if probe.role == "agent"
             and statuses.get(f"adapter:{probe.probe_id}") == "pass"
         ]
+        blocking_checks = [
+            item.check_id
+            for item in checks
+            if item.status == "fail"
+            and not item.check_id.startswith(("adapter:", "orchestration:"))
+        ]
+        if blocking_checks:
+            readiness = "blocked"
+        elif not ready_executors:
+            readiness = "needs_agent"
+        elif any(item.status != "pass" for item in checks):
+            readiness = "ready_with_warnings"
+        else:
+            readiness = "ready"
         return {
             "diagnostic_schema_version": DIAGNOSTIC_SCHEMA_VERSION,
             "observed_at": self._clock(),
+            "root": str(agent_os_root.resolve()),
             "healthy": all(item.status != "fail" for item in checks),
+            "readiness": readiness,
+            "blocking_checks": blocking_checks,
             "ready_for_agent_execution": bool(ready_executors),
             "ready_executors": ready_executors,
             "ready_for_orca": statuses.get("orchestration:orca") == "pass",
             "checks": [item.to_dict() for item in checks],
+            "next_actions": self._next_actions(
+                agent_os_root, checks, bool(ready_executors)
+            ),
             "compatibility": self.compatibility_matrix(),
+        }
+
+    def setup(self, agent_os_root: Path) -> Mapping[str, Any]:
+        """Initialize portable state and return a no-model first-use diagnostic."""
+        initialized = False
+        if not agent_os_root.is_symlink() and (
+            not agent_os_root.exists()
+            or (agent_os_root.is_dir() and not any(agent_os_root.iterdir()))
+        ):
+            AgentOS(agent_os_root)
+            initialized = True
+        return {
+            **self.doctor(agent_os_root),
+            "initialized": initialized,
+            "model_calls": 0,
         }
 
     def rehearse(
@@ -602,6 +637,130 @@ class AgentOSDistribution:
                 "last_verified_at": last_verified_at,
             },
         )
+
+    def _next_actions(
+        self,
+        agent_os_root: Path,
+        checks: Sequence[DiagnosticCheck],
+        ready_for_agent_execution: bool,
+    ) -> Sequence[Mapping[str, Any]]:
+        rerun = ["agent-os", "setup", "--home", str(agent_os_root.resolve())]
+        actions = []
+        for check in checks:
+            if check.status == "pass":
+                continue
+            if check.check_id == "state:agent-os" and agent_os_root.exists():
+                actions.append(
+                    {
+                        "action_id": "restore_or_choose_state",
+                        "check_id": check.check_id,
+                        "priority": "required",
+                        "summary": (
+                            "Restore a valid Agent OS state, or choose a new empty "
+                            "directory with --home; existing files were not modified."
+                        ),
+                    }
+                )
+                continue
+            action = self._action_for_check(
+                check,
+                rerun,
+                ready_for_agent_execution,
+            )
+            if action is not None:
+                actions.append(action)
+        if not ready_for_agent_execution:
+            actions.append(
+                {
+                    "action_id": "enable_agent_execution",
+                    "check_id": "agent-execution",
+                    "priority": "required",
+                    "summary": (
+                        "Install or repair at least one supported coding Agent, "
+                        "then rerun setup."
+                    ),
+                    "command": rerun,
+                }
+            )
+        priority_order = {"required": 0, "recommended": 1, "optional": 2}
+        return sorted(actions, key=lambda item: priority_order[item["priority"]])
+
+    @staticmethod
+    def _action_for_check(
+        check: DiagnosticCheck,
+        rerun: Sequence[str],
+        ready_for_agent_execution: bool,
+    ) -> Optional[Mapping[str, Any]]:
+        check_id = check.check_id
+        if check_id == "runtime:python":
+            return {
+                "action_id": "upgrade_python",
+                "check_id": check_id,
+                "priority": "required",
+                "summary": "Install Python 3.9 or newer, then rerun setup.",
+                "command": list(rerun),
+            }
+        if check_id == "runtime:source":
+            return {
+                "action_id": "repair_installation",
+                "check_id": check_id,
+                "priority": "required",
+                "summary": "Reinstall Agent OS from a complete release, then rerun setup.",
+                "command": list(rerun),
+            }
+        if check_id == "runtime:filesystem":
+            return {
+                "action_id": "choose_supported_filesystem",
+                "check_id": check_id,
+                "priority": "required",
+                "summary": (
+                    "Move Agent OS state to a local filesystem with POSIX locks and "
+                    "atomic replacement."
+                ),
+                "command": list(rerun),
+            }
+        if check_id == "state:agent-os":
+            return {
+                "action_id": "initialize_state",
+                "check_id": check_id,
+                "priority": "required",
+                "summary": "Initialize or restore the Agent OS state directory.",
+                "command": list(rerun),
+            }
+        if not check_id.startswith(("adapter:", "orchestration:")):
+            return None
+        target = check_id.split(":", 1)[1]
+        role = "Orca" if check_id.startswith("orchestration:") else "coding Agent"
+        priority = (
+            "optional"
+            if check_id.startswith("orchestration:") or ready_for_agent_execution
+            else "recommended"
+        )
+        support_status = check.details.get("support_status")
+        if support_status in ("unverified_version", "unverified_platform"):
+            summary = (
+                f"{target} matches the protocol but is not certified here; use a "
+                f"verified version/platform or add compatibility evidence before enabling it."
+            )
+            action_id = "certify_adapter"
+        elif support_status == "protocol_mismatch" or check.status == "fail":
+            summary = (
+                f"Repair or change the installed {target} version until its required "
+                "protocol flags are available."
+            )
+            action_id = "repair_adapter"
+        else:
+            summary = (
+                f"Install {target} from its official instructions if this {role} is needed."
+            )
+            action_id = "install_adapter"
+        return {
+            "action_id": action_id,
+            "check_id": check_id,
+            "priority": priority,
+            "summary": summary,
+            "command": list(rerun),
+        }
 
     def _compatibility_evidence(self) -> Mapping[str, Any]:
         path = self.source_root / _COMPATIBILITY_EVIDENCE_PATH

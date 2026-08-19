@@ -1,4 +1,4 @@
-# Agent OS Phase A–E6 验收结果
+# Agent OS Phase A–F1 验收结果
 
 ## 已交付
 
@@ -97,12 +97,16 @@
 - 探索、计划和审查仍可按工作区指纹安全复用；最终审查分数进入现有 RSI 质量反馈。
 - `task-dir` 与 workspace、Agent OS 根目录必须完全分离且只能绑定一次任务，避免旧报告、receipt 或迁移
   状态被覆盖/混用；`engineer init / plan / run / status / ship` 已接入 CLI。
+- `agent-os setup` 已形成首次使用入口：幂等初始化本地状态，并复用 `AgentOSDistribution` 完成环境与 Agent 诊断。
+- 诊断 schema v3 明确区分 blocked、needs agent、ready with warnings 与 ready，同时公开阻塞检查、可用执行器和结构化下一步。
+- Python、源码、文件系统、状态、缺失 Agent、协议漂移、未认证版本/平台均映射为带优先级的修复动作；复跑命令使用参数数组。
+- 默认摘要只展示用户需要处理的检查，`--json` 输出同一事实；setup 只检查 help/version，明确为 0 次模型调用。
 
 ## 验证
 
 ```text
-python3 -m unittest discover -s tests -v
-Ran 206 tests — OK
+PYTHONPATH=. python3 -m unittest discover -s tests -v
+Ran 216 tests — OK
 
 python3 -m unittest tests.test_task_center tests.test_resident -v
 Ran 18 tests — OK
@@ -115,8 +119,11 @@ Ran 15 tests — OK
 链接 worktree Git 元数据、完整调用/成本计量、剩余时长裁剪、一次性任务目录、非交互审批防绕过、
 不确定写副作用禁止重放、只读/写复用边界、RSI 反馈以及 init/status CLI；未调用真实模型
 
-python3 -m unittest tests.test_distribution -v
-Ran 5 tests — OK
+PYTHONPATH=. python3 -m unittest tests.test_distribution -v
+Ran 11 tests — OK
+
+PYTHONPATH=. python3 -m grapheng.cli setup --home /tmp/agent-os-setup-smoke --source-root .
+本机状态初始化成功；Codex、Pi、Orca ready，Claude Code 版本未认证并收到 optional 修复建议；0 次模型调用
 
 python3 -m unittest tests.test_console -v
 Ran 5 tests — OK
@@ -156,6 +163,9 @@ rsi-opt suggest → evaluate → approve → activate → orca-plan
 
 PYTHONPYCACHEPREFIX=/tmp/grapheng-pycache python3 -m compileall -q grapheng tests
 通过
+
+uv build --offline
+sdist 与 wheel 构建成功
 
 OperationsServer loopback HTTP 冒烟验收
 GET / 返回 200，实时页面与 Cache-Control: no-store 生效

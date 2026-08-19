@@ -68,9 +68,17 @@ git clone https://github.com/Feahter/agent-OS.git
 cd agent-OS
 python3 -m pip install -e .
 
+agent-os setup
+
 agent-os validate examples/minimal_graph.json
 agent-os demo examples/minimal_graph.json --work-dir /tmp/agent-os-demo
 ```
+
+`setup` initializes the local portable state, inspects Python, filesystem semantics,
+Codex, Claude Code, Pi and optional Orca, then prints prioritized repair steps. It
+uses only help/version probes and makes zero model calls. Add `--json` for the
+versioned diagnostic contract or `--home /path/to/state` to choose another local
+state directory.
 
 ### Daily task interface
 

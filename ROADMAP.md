@@ -56,7 +56,7 @@ As of 2026-08-19, the repository is published as the `0.0.1` preview, while impl
 | P2: unified task interface | Complete in preview | `do / status / approve / control / result` share one task state and preserve GraphSpec as the advanced interface. |
 | P3: intent compilation | Complete in preview | Fix, test, refactor, research and release-preparation goals compile into reviewable plans with safe defaults. |
 | P4: resident coordination | Complete in preview | Background queues, priority, pause/resume/cancel, crash recovery, task summaries, notifications and the Orca lifecycle share one control plane. |
-| P5: compatibility and faults | P5.1–P5.2 complete; P5.3 pending | Versioned, platform-scoped protocol evidence and offline fault injection exist. Current certification is Darwin arm64; real model-output and Orca lifecycle pilots still require explicit authorization. |
+| P5: compatibility and faults | P5.1–P5.2 complete; P5.3 pending | Versioned, platform-scoped protocol evidence, offline fault injection and a zero-model first-use setup with actionable remediation exist. Current certification is Darwin arm64; clean-machine and real model-output/Orca lifecycle pilots remain pending. |
 | P6: personal RSI and cost | Pending | Starts after the real-project baseline. User-controlled memory and policy gains must remain inspectable, reversible and bounded by frozen quality gates. |
 
 The combined P1.4/P5.3 pilot is the only near-term package that intentionally spends model tokens or modifies external projects. It must remain opt-in with named projects, budgets, stop conditions and recorded intervention.
@@ -86,7 +86,7 @@ Key outcomes:
 - Human-readable progress, errors and results rather than internal JSON noise.
 - Real end-to-end compatibility tests for Codex, Claude Code, Pi and Orca.
 
-Preview status: the unified task actions, intent compiler, five initial templates, resident execution and platform-aware diagnostics are implemented. The remaining gate is a clean-machine first-use journey backed by the authorized real-project pilots.
+Preview status: the unified task actions, intent compiler, five initial templates, resident execution and a human-readable `agent-os setup` journey are implemented. Setup safely initializes local state, classifies readiness and emits structured remediation without model calls. The remaining gate is clean-machine rehearsal backed by the authorized real-project pilots.
 
 Exit gates: a new user starts a first task within five minutes; common single-repository tasks reach verified results; interrupted tasks resume with one command.
 
@@ -203,7 +203,7 @@ Every RSI optimization has hard constraints: no safety regression, quality at or
 ## Near-term priority order
 
 1. **Run the combined P1.4/P5.3 pilot after explicit authorization.** Use three low-risk projects and fixed budgets to measure verified success, false completion, intervention, latency, token use and cost across Codex, Claude Code, Pi and Orca.
-2. **Close the first-use and compatibility gaps.** Rehearse a clean install, make `doctor` provide actionable remediation, evolve evidence into per-version and per-platform records, and publish explicit supported, unverified and broken states.
+2. **Complete clean-install evidence.** The zero-model `setup` flow now initializes state, reports supported/unverified/broken states and provides actionable remediation. Next, rehearse it on clean environments and add evidence for each supported version/platform combination.
 3. **Define the 0.1 compatibility line.** Mark which task, artifact, event, policy and state interfaces are public; add migration fixtures and upgrade rehearsals before promising stability.
 4. **Start P6 personal RSI from the frozen baseline.** Add inspect/correct/forget/export controls for memory, then optimize agent, model, context and verification choices behind quality and budget gates.
 5. **Extract the Agent Adapter kit.** Turn the proven Codex, Claude Code, Pi and Orca seam into documented capability negotiation and conformance tests so future agents integrate without core-runtime changes.
