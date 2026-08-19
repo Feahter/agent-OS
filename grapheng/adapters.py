@@ -170,7 +170,6 @@ class ClaudeCodeExecutor(CliAgentAdapter):
             "--json-schema",
             json.dumps(schema, separators=(",", ":")),
             "--no-session-persistence",
-            "--safe-mode",
             "--permission-mode",
             "dontAsk",
             "--tools",
