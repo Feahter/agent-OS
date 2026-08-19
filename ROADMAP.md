@@ -45,17 +45,33 @@ The public surface should converge on five stable actions:
 
 These actions should sit at deep module seams: the public interface stays small while graph compilation, agent differences, context management, recovery and learning remain in the implementation. GraphSpec and policy interfaces remain available to advanced users without becoming onboarding requirements.
 
+## Current delivery snapshot
+
+As of 2026-08-19, the repository is published as the `0.0.1` preview, while implementation has already reached into several 0.1 and 0.2 capabilities. The milestone numbers below describe maturity and user evidence, not whether the first implementation exists.
+
+| Work package | Status | Evidence and remaining gate |
+| --- | --- | --- |
+| Trusted foundation | Preview shipped | Graph execution, artifacts, approvals, budgets, recovery, controlled merge, verified reuse, governed learning and portable state are implemented. |
+| P1: real-project evaluation | P1.1–P1.3 complete; P1.4 pending | Privacy-minimized records and immutable baselines exist. Three authorized real-project pilots still need to establish quality, intervention, latency and cost baselines. |
+| P2: unified task interface | Complete in preview | `do / status / approve / control / result` share one task state and preserve GraphSpec as the advanced interface. |
+| P3: intent compilation | Complete in preview | Fix, test, refactor, research and release-preparation goals compile into reviewable plans with safe defaults. |
+| P4: resident coordination | Complete in preview | Background queues, priority, pause/resume/cancel, crash recovery, task summaries, notifications and the Orca lifecycle share one control plane. |
+| P5: compatibility and faults | P5.1–P5.2 complete; P5.3 pending | Versioned, platform-scoped protocol evidence and offline fault injection exist. Current certification is Darwin arm64; real model-output and Orca lifecycle pilots still require explicit authorization. |
+| P6: personal RSI and cost | Pending | Starts after the real-project baseline. User-controlled memory and policy gains must remain inspectable, reversible and bounded by frozen quality gates. |
+
+The combined P1.4/P5.3 pilot is the only near-term package that intentionally spends model tokens or modifies external projects. It must remain opt-in with named projects, budgets, stop conditions and recorded intervention.
+
 ## Milestones
 
-### 0.0.x: trusted foundation — current
+### 0.0.x: trusted foundation — current release line
 
-Prove that heterogeneous agents can share governed execution semantics. The current base includes the graph runtime, artifact contracts, Codex/Claude Code/Pi adapters, Orca coordination, approvals, budgets, recovery, controlled merge, verified reuse, Reality Anchors, governed RSI and portable state.
+Prove that heterogeneous agents can share governed execution semantics. The current base includes the graph runtime, artifact contracts, Codex/Claude Code/Pi adapters, Orca coordination, approvals, budgets, recovery, controlled merge, verified reuse, Reality Anchors, governed RSI and portable state. It also contains preview implementations from later milestones; those capabilities are not considered mature until their user-outcome gates pass.
 
 Exit gates:
 
-- Core contracts have stable automated and fault-injection coverage.
-- At least three monitored real-project pilots establish success, failure, intervention and cost baselines.
-- Preview interfaces are clearly separated from interfaces intended for compatibility.
+- **Met:** core contracts have stable automated and fault-injection coverage.
+- **Pending authorization:** at least three monitored real-project pilots establish success, failure, intervention and cost baselines.
+- **In progress:** preview interfaces are clearly separated from interfaces intended for compatibility.
 
 ### 0.1: first-use success
 
@@ -69,6 +85,8 @@ Key outcomes:
 - Safe defaults and questions only when critical context is missing.
 - Human-readable progress, errors and results rather than internal JSON noise.
 - Real end-to-end compatibility tests for Codex, Claude Code, Pi and Orca.
+
+Preview status: the unified task actions, intent compiler, five initial templates, resident execution and platform-aware diagnostics are implemented. The remaining gate is a clean-machine first-use journey backed by the authorized real-project pilots.
 
 Exit gates: a new user starts a first task within five minutes; common single-repository tasks reach verified results; interrupted tasks resume with one command.
 
@@ -85,6 +103,8 @@ Key outcomes:
 - Discoverable project configuration with inheritable personal, team and project policy.
 - A stable Agent Adapter kit and protocol conformance tests.
 
+Preview status: the resident queue, unified lifecycle, task center, notifications and recovery paths are implemented. The remaining work is long-running soak evidence, discoverable configuration and a public Adapter kit whose interface can be supported across releases.
+
 Exit gates: long work survives terminal exit; common failures are self-recoverable; users no longer open each agent tool to discover task truth.
 
 ### 0.3: personal RSI and cost intelligence
@@ -99,6 +119,8 @@ Key outcomes:
 - Joint optimization of quality, latency, cost and human intervention.
 - Explanations for what was learned, why behavior changed and which tasks are affected.
 - Frozen regression suites, offline evaluation, human approval, canaries and automatic rollback.
+
+Preview status: prompt-free observations, governed candidates, regression evaluation, approval, canary and rollback primitives exist. Personal and project memory controls, real-task baselines and measurable cost improvements are still pending.
 
 Exit gates: quality holds on a fixed regression set; repeated-task cost and duration measurably improve; any learned behavior can be understood and reverted.
 
@@ -180,12 +202,11 @@ Every RSI optimization has hard constraints: no safety regression, quality at or
 
 ## Near-term priority order
 
-1. Build a real-project evaluation set and baseline the user journey, quality, intervention, latency and cost.
-2. Converge on the `do / status / approve / control / result` task interface while keeping GraphSpec as an advanced interface.
-3. Add intent compilation and high-frequency task templates that produce reviewable execution plans.
-4. Turn the coordinator into a reliable resident local process with background work, notification and recovery.
-5. Establish a monitored compatibility matrix and fault-injection suite for real agents and Orca.
-6. Use those baselines to introduce personal RSI, context reuse and cost optimization without opaque self-learning.
+1. **Run the combined P1.4/P5.3 pilot after explicit authorization.** Use three low-risk projects and fixed budgets to measure verified success, false completion, intervention, latency, token use and cost across Codex, Claude Code, Pi and Orca.
+2. **Close the first-use and compatibility gaps.** Rehearse a clean install, make `doctor` provide actionable remediation, evolve evidence into per-version and per-platform records, and publish explicit supported, unverified and broken states.
+3. **Define the 0.1 compatibility line.** Mark which task, artifact, event, policy and state interfaces are public; add migration fixtures and upgrade rehearsals before promising stability.
+4. **Start P6 personal RSI from the frozen baseline.** Add inspect/correct/forget/export controls for memory, then optimize agent, model, context and verification choices behind quality and budget gates.
+5. **Extract the Agent Adapter kit.** Turn the proven Codex, Claude Code, Pi and Orca seam into documented capability negotiation and conformance tests so future agents integrate without core-runtime changes.
 
 ## Explicit non-goals
 
@@ -198,4 +219,4 @@ Every RSI optimization has hard constraints: no safety regression, quality at or
 
 ## Roadmap governance
 
-Before implementation, every milestone item should state the user problem, target measure, non-goals, risks, migration impact and exit gate. Before release, it needs evidence from real tasks, not unit tests alone. Feedback may change the sequence, but the north star, user experience contract, safety floor and portability principle require an explicit design decision to change.
+Before implementation, every milestone item should state the user problem, target measure, non-goals, risks, migration impact and exit gate. Before release, it needs evidence from real tasks, not unit tests alone. Roadmap updates must distinguish implemented code, released contracts, pending evidence and work that requires user authorization. Feedback may change the sequence, but the north star, user experience contract, safety floor and portability principle require an explicit design decision to change.
