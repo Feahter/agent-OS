@@ -24,6 +24,7 @@ from .reuse import VerifiedArtifactCache
 
 
 CANONICAL_TOOLS = ("edit", "read", "shell", "write")
+_DISCOVERY_PROBE_TIMEOUT_SECONDS = 10
 
 
 def _json_object(text: str) -> Mapping[str, Any]:
@@ -358,6 +359,20 @@ class CodexExecutor(_CliExecutor):
         )
 
 
+def _codex_is_usable(command: str) -> bool:
+    try:
+        completed = subprocess.run(
+            (command, "exec", "--help"),
+            capture_output=True,
+            text=True,
+            timeout=_DISCOVERY_PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0
+
+
 def discover_local_executors(
     router: Optional[PolicyRouter] = None,
     reuse_store: Optional[VerifiedArtifactCache] = None,
@@ -370,6 +385,6 @@ def discover_local_executors(
     if pi:
         registry.register(PiAgentExecutor((pi,)))
     codex = shutil.which("codex")
-    if codex:
+    if codex and _codex_is_usable(codex):
         registry.register(CodexExecutor((codex,)))
     return registry

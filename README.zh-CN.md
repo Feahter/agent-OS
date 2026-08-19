@@ -218,14 +218,16 @@ resident.start_background()
 
 ## 支持的工具
 
-| 工具 | 已验证版本 | 协议 | 接入方式 |
+| 工具 | 已验证版本（Darwin arm64） | 协议 | 接入方式 |
 | --- | --- | --- | --- |
 | Codex | `0.148.0-alpha.9` | `exec-jsonl-v1` | 本地 CLI Adapter |
 | Claude Code | `2.1.234` | `json-envelope-v1` | 本地 CLI Adapter |
 | Pi | `0.84.1` | `message-end-jsonl-v1` | 本地 CLI Adapter |
 | Orca | `1.4.180` | `orca-json-command-v1` | 图编译器、后端与协调器 |
 
-Adapter 会把统一的 `read / shell / edit / write` 工具契约翻译成各产品协议。上述版本于 2026-08-18 在 Darwin arm64 上完成只读协议验收，证据保存在版本库并随发行包迁移。执行器发现只运行 `--help`、`--version` 等协议检查，不会调用模型；Orca 版本从应用包读取。版本与证据完全匹配时标记为已验证，协议匹配但版本未知时只警告且不认证为可执行，协议缺项则失败关闭。
+Adapter 会把统一的 `read / shell / edit / write` 工具契约翻译成各产品协议。上述版本于 2026-08-18 在 Darwin arm64 上完成只读协议验收，证据保存在版本库并随发行包迁移。认证范围包含平台：同一版本出现在其他操作系统或架构时会标记为 `unverified_platform`，且不会进入 `ready_executors`。
+
+Codex 执行器发现会运行安全启动探测，诊断则运行帮助和版本探测；两者都不会调用模型，Orca 版本从应用包读取。Codex 在注册前会运行 `codex exec --help`，因为 npm 启动脚本可执行并不能证明对应架构的原生程序实际存在。Codex `0.148.0-alpha.9` 尚未在 Darwin x86_64 上通过认证。版本和平台与证据完全匹配时才标记为已验证；协议匹配但版本或平台未知时只警告且不认证为可执行；程序缺失或协议缺项则失败关闭。
 
 离线故障基线覆盖限流、超时、进程崩溃、损坏输出和协议漂移。限流与超时被归类为可重试故障，但仍受图重试、预算和供应商治理约束；进程崩溃和未知协议不会被伪装成成功结果。
 

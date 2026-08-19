@@ -218,14 +218,16 @@ A node can read only declared artifacts and must produce exactly its declared ou
 
 ## Supported tools
 
-| Tool | Verified version | Protocol | Integration |
+| Tool | Verified version (Darwin arm64) | Protocol | Integration |
 | --- | --- | --- | --- |
 | Codex | `0.148.0-alpha.9` | `exec-jsonl-v1` | Local CLI adapter |
 | Claude Code | `2.1.234` | `json-envelope-v1` | Local CLI adapter |
 | Pi | `0.84.1` | `message-end-jsonl-v1` | Local CLI adapter |
 | Orca | `1.4.180` | `orca-json-command-v1` | Graph compiler, backend and coordinator |
 
-Adapters translate the common `read / shell / edit / write` tool contract into each product's protocol. The versions above were verified on Darwin arm64 on 2026-08-18. Evidence is version-controlled and travels with release bundles. Discovery runs only protocol checks such as `--help` and `--version`; it does not call a model, and Orca's version is read from its application bundle. An exact evidence match is verified, a protocol-compatible unknown version is warned but not certified as ready, and missing protocol features fail closed.
+Adapters translate the common `read / shell / edit / write` tool contract into each product's protocol. The versions above were verified on Darwin arm64 on 2026-08-18. Evidence is version-controlled and travels with release bundles. Certification is platform-scoped: the same version on another OS or architecture is reported as `unverified_platform` and is not included in `ready_executors`.
+
+Codex discovery runs a safe startup probe, while diagnostics run help and version probes; neither calls a model, and Orca's version is read from its application bundle. Codex discovery executes `codex exec --help` before registration because an executable npm launcher does not prove that its architecture-specific native binary is present. Codex `0.148.0-alpha.9` is not certified for Darwin x86_64. An exact version and platform evidence match is verified, a compatible unknown version or platform is warned but not certified as ready, and missing executables or protocol features fail closed.
 
 The offline fault baseline covers rate limits, timeouts, process crashes, damaged output and protocol drift. Rate limits and timeouts are classified as retryable while remaining governed by graph retry, budget and provider policies. A crashed process or unknown protocol can never be reported as a successful result.
 

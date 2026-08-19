@@ -96,6 +96,8 @@ P1.4 需要选择三个外部项目并调用真实 Agent，可能产生模型费
 - `AgentOSDistribution` 继续作为兼容性唯一事实模块；没有为诊断、发行或 RSI 新建平行状态。
 - 版本库保存 Codex `0.148.0-alpha.9`、Claude Code `2.1.234`、Pi `0.84.1`、Orca `1.4.180` 的协议、平台和最近验证时间，证据随自包含发行包迁移。
 - `doctor` 同时投影安装版本、认证版本、支持状态和最近验证时间；精确证据命中为 pass，协议匹配但版本未认证为 warn 且不进入 ready，协议漂移为 fail。
+- 兼容认证同时匹配操作系统和 CPU 架构；版本相同但平台未认证时标记为 `unverified_platform`，不进入 `ready_executors`。
+- Codex 本地发现会先运行零费用的 `codex exec --help` 启动探测；npm 启动脚本存在但架构原生程序缺失时不再注册执行器，避免任务启动后才以 ENOENT 失败。
 - Orca CLI 没有独立版本输出时，从其 macOS 应用包读取版本；其他平台无法确认版本时保守保持未认证状态。
 - fake CLI 故障注入覆盖超时、限流、进程崩溃和损坏输出；命令探测额外覆盖超时、崩溃和协议漂移，所有路径都不调用模型。
 - 限流与超时进入可重试错误类型，仍由既有 Graph retry、预算、供应商限流和熔断共同约束；普通进程失败和协议损坏失败关闭。
@@ -118,3 +120,16 @@ P1.4 需要选择三个外部项目并调用真实 Agent，可能产生模型费
 ### 待授权
 
 - P5.3 与 P1.4 合并执行低风险真实项目灰度，验证真实模型输出和 Orca 生命周期，并记录 token、费用、耗时与人工介入。
+
+## Issue #1：Intel macOS Codex 启动失败
+
+- 根因不是 PATH 中的 npm 启动脚本缺少执行权限，而是启动脚本内部选择的 x86_64 原生程序不存在；`shutil.which()` 或 `os.access(..., X_OK)` 都无法单独识别这一情况。
+- `discover_local_executors()` 在注册 Codex 前运行 `codex exec --help`，探测失败、超时或启动异常时跳过该执行器，不产生模型调用和费用。
+- `doctor` 将当前操作系统和 CPU 架构纳入认证判断；版本匹配但平台不在证据范围内时返回 `unverified_platform`，不再进入 `ready_executors`。
+- 双语 README 的兼容表显式限定为 Darwin arm64，并说明 Codex `0.148.0-alpha.9` 未在 Darwin x86_64 上认证。
+
+### 验证
+
+- 缺失 x86_64 原生程序、可用 Codex 启动链、未认证平台三条定向回归测试通过。
+- `PYTHONPYCACHEPREFIX=/tmp/agent-os-issue-1-pycache PYTHONPATH=. python3 -m unittest discover -s tests -v`：213 项通过。
+- Darwin arm64 本机零费用探测：Codex 可发现且 `doctor` 为 pass；未发送 prompt，token 与模型费用均为 0。

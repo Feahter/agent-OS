@@ -2,6 +2,7 @@ import fcntl
 import hashlib
 import json
 import os
+import platform
 import plistlib
 import re
 import shutil
@@ -197,8 +198,9 @@ class AgentOSDistribution:
                     "required_help_flags": list(probe.required_help_flags),
                     "diagnostic_side_effect": "help/version only; no model or Orca object creation",
                     "support": {
-                        "policy": "exact version with matching protocol evidence",
+                        "policy": "exact version and platform with matching protocol evidence",
                         "verified_versions": evidence["adapters"][probe.probe_id],
+                        "verified_platforms": [evidence["platform"]],
                         "last_verified_at": max(
                             item["validated_at"]
                             for item in evidence["adapters"][probe.probe_id]
@@ -537,7 +539,13 @@ class AgentOSDistribution:
             flag for flag in probe.required_help_flags if flag not in help_text
         ]
         version = self._installed_version(probe, path, version_result)
-        verified = self._compatibility_evidence()["adapters"][probe.probe_id]
+        evidence = self._compatibility_evidence()
+        verified = evidence["adapters"][probe.probe_id]
+        verified_platforms = [evidence["platform"]]
+        running_platform = {
+            "architecture": platform.machine(),
+            "operating_system": platform.system(),
+        }
         verified_versions = [item["version"] for item in verified]
         last_verified_at = max(item["validated_at"] for item in verified)
         if help_result.returncode != 0 or missing:
@@ -554,12 +562,17 @@ class AgentOSDistribution:
                     "version": version,
                     "support_status": "protocol_mismatch",
                     "verified_versions": verified_versions,
+                    "running_platform": running_platform,
+                    "verified_platforms": verified_platforms,
                     "last_verified_at": last_verified_at,
                 },
             )
-        support_status = (
-            "verified" if version in verified_versions else "unverified_version"
-        )
+        if version not in verified_versions:
+            support_status = "unverified_version"
+        elif running_platform not in verified_platforms:
+            support_status = "unverified_platform"
+        else:
+            support_status = "verified"
         version_status = (
             "pass"
             if version_result.returncode == 0 and support_status == "verified"
@@ -569,6 +582,8 @@ class AgentOSDistribution:
             summary = f"Command {probe.command} satisfies the verified Adapter protocol"
         elif support_status == "verified":
             summary = f"Command {probe.command} matches a verified version but its version probe failed"
+        elif support_status == "unverified_platform":
+            summary = f"Command {probe.command} matches a verified version on an unverified platform"
         else:
             summary = f"Command {probe.command} matches the protocol but its version is not verified"
         return DiagnosticCheck(
@@ -582,6 +597,8 @@ class AgentOSDistribution:
                 "version": version,
                 "support_status": support_status,
                 "verified_versions": verified_versions,
+                "running_platform": running_platform,
+                "verified_platforms": verified_platforms,
                 "last_verified_at": last_verified_at,
             },
         )
@@ -590,11 +607,17 @@ class AgentOSDistribution:
         path = self.source_root / _COMPATIBILITY_EVIDENCE_PATH
         evidence = self._read_json(path)
         adapters = evidence.get("adapters")
+        evidence_platform = evidence.get("platform")
         if (
             evidence.get("schema_version")
             != _COMPATIBILITY_EVIDENCE_SCHEMA_VERSION
             or not isinstance(evidence.get("verification_scope"), str)
-            or not isinstance(evidence.get("platform"), dict)
+            or not isinstance(evidence_platform, dict)
+            or set(evidence_platform) != {"architecture", "operating_system"}
+            or not all(
+                isinstance(value, str) and value.strip()
+                for value in evidence_platform.values()
+            )
             or not isinstance(adapters, dict)
         ):
             raise ContractViolation("invalid compatibility evidence envelope")

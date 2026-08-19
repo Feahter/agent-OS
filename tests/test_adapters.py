@@ -1,7 +1,9 @@
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from grapheng import (
     AgentExecutionError,
@@ -12,6 +14,7 @@ from grapheng import (
     ClaudeCodeExecutor,
     CodexExecutor,
     PiAgentExecutor,
+    discover_local_executors,
 )
 
 
@@ -31,6 +34,44 @@ def request(workspace, output_keys=("answer",)):
 
 
 class AdapterTests(unittest.TestCase):
+    def test_discovery_skips_codex_when_safe_startup_probe_reports_missing_binary(self):
+        def which(command):
+            return "/fake/codex" if command == "codex" else None
+
+        missing_binary = "spawn /fake/vendor/x86_64-apple-darwin/codex ENOENT"
+        with patch("grapheng.adapters.shutil.which", side_effect=which), patch(
+            "grapheng.adapters.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                ("/fake/codex", "exec", "--help"),
+                1,
+                stdout="",
+                stderr=missing_binary,
+            ),
+        ):
+            registry = discover_local_executors()
+
+        self.assertEqual((), registry.capabilities())
+
+    def test_discovery_registers_codex_when_safe_startup_probe_succeeds(self):
+        def which(command):
+            return "/fake/codex" if command == "codex" else None
+
+        with patch("grapheng.adapters.shutil.which", side_effect=which), patch(
+            "grapheng.adapters.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                ("/fake/codex", "exec", "--help"),
+                0,
+                stdout="--json --ephemeral --sandbox --output-schema",
+                stderr="",
+            ),
+        ):
+            registry = discover_local_executors()
+
+        self.assertEqual(
+            ["codex"],
+            [capabilities.executor_id for capabilities in registry.capabilities()],
+        )
+
     def test_claude_adapter_normalizes_result_and_usage(self):
         with tempfile.TemporaryDirectory() as directory:
             executor = ClaudeCodeExecutor((sys.executable, str(FIXTURE), "claude"))

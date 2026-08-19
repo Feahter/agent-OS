@@ -3,6 +3,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from grapheng import AgentOS, AgentOSDistribution, ContractViolation
 
@@ -145,6 +146,35 @@ class DistributionTests(unittest.TestCase):
         self.assertFalse(report["ready_for_agent_execution"])
         self.assertEqual("warn", codex["status"])
         self.assertEqual("unverified_version", codex["details"]["support_status"])
+
+    def test_doctor_does_not_certify_versions_on_an_unverified_platform(self):
+        base = AgentOSDistribution(PROJECT_ROOT)
+        which, runner, _ = fake_probe_environment(base)
+        distribution = AgentOSDistribution(
+            PROJECT_ROOT, which=which, runner=runner
+        )
+        with patch("platform.machine", return_value="x86_64"), patch(
+            "platform.system", return_value="Darwin"
+        ), tempfile.TemporaryDirectory() as directory:
+            agent_os = AgentOS(Path(directory) / "agent-os")
+            report = distribution.doctor(agent_os.root)
+
+        codex = next(
+            item for item in report["checks"] if item["check_id"] == "adapter:codex"
+        )
+        self.assertTrue(report["healthy"])
+        self.assertFalse(report["ready_for_agent_execution"])
+        self.assertEqual([], report["ready_executors"])
+        self.assertEqual("warn", codex["status"])
+        self.assertEqual("unverified_platform", codex["details"]["support_status"])
+        self.assertEqual(
+            {"architecture": "x86_64", "operating_system": "Darwin"},
+            codex["details"]["running_platform"],
+        )
+        self.assertEqual(
+            [{"architecture": "arm64", "operating_system": "Darwin"}],
+            codex["details"]["verified_platforms"],
+        )
 
     def test_doctor_fails_closed_on_probe_timeout_and_process_crash(self):
         def which(command):
