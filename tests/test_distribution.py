@@ -47,7 +47,9 @@ class DistributionTests(unittest.TestCase):
         distribution = AgentOSDistribution(
             PROJECT_ROOT, which=which, runner=runner
         )
-        with tempfile.TemporaryDirectory() as directory:
+        with patch("platform.machine", return_value="arm64"), patch(
+            "platform.system", return_value="Darwin"
+        ), tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             agent_os = AgentOS(root / "agent-os")
             report = distribution.doctor(agent_os.root)
