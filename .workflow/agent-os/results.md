@@ -223,3 +223,27 @@ sdist 与 wheel 构建成功
 agent-os setup --home /tmp/agent-os-discovery-smoke-20260819 --source-root .
 本机初始化成功，显示 0 次模型调用；新增候选均未安装，未产生误发现或误认证
 ```
+
+## 公共 Adapter Kit 与 OpenCode 执行器（2026-08-19）
+
+- 原私有 CLI 基类已深化为公共 `CliAgentAdapter`，现有 `AgentExecutor` 继续作为唯一运行时接口。
+- OpenCode v1.18.18 通过官方 Darwin arm64 发布二进制的 `--version` 与 `run --help` 只读验收；兼容证据绑定官方制品 URL 和 SHA-256。
+- OpenCode 执行采用 `run --format json --pure`，禁用项目配置，以默认拒绝策略最小映射 `read / shell / edit / write`，不会启用 `--auto`。
+- JSONL Adapter 归一化最终结构化文本、会话 ID、跨步骤 Token 与费用；error、429、损坏 JSONL、超时、进程崩溃和协议漂移均失败关闭。
+- 实际费用、延迟、成功和故障复用现有 Registry → PolicyRouter 脱敏观测；OpenCode 不宣称未提供的硬费用上限。
+- OpenCode 已从 `discovered_agents` 晋升为 `ready_executors` 候选；版本、平台或 help 协议不匹配时仍不会被认证。
+- 产品会话继续由 OpenCode 自身管理，不进入 Agent OS 可迁移包；OpenClaw、Hermes、Aider、Gemini CLI 与 GitHub Copilot CLI 保持仅发现。
+
+```text
+PYTHONPATH=. python3 -m unittest discover -s tests -v
+Ran 223 tests — OK
+
+PYTHONPYCACHEPREFIX=/tmp/agent-os-opencode-pycache python3 -m compileall -q grapheng tests
+通过
+
+uv build --offline
+sdist 与 wheel 构建成功
+
+官方 opencode-darwin-arm64 v1.18.18 --version / run --help
+版本与 --format、--model、--pure 协议验收通过；未安装、未调用模型
+```

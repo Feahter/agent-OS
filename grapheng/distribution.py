@@ -14,7 +14,12 @@ from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
-from .adapters import ClaudeCodeExecutor, CodexExecutor, PiAgentExecutor
+from .adapters import (
+    ClaudeCodeExecutor,
+    CodexExecutor,
+    OpenCodeExecutor,
+    PiAgentExecutor,
+)
 from .coordinator import ORCA_COORDINATOR_SCHEMA_VERSION
 from .errors import ContractViolation
 from .governance import PROVIDER_GOVERNANCE_SCHEMA_VERSION
@@ -134,6 +139,14 @@ _COMMAND_PROBES = (
         PiAgentExecutor(("pi",)).capabilities.features,
     ),
     _CommandProbe(
+        "opencode",
+        "opencode",
+        "run-jsonl-v1",
+        ("run", "--help"),
+        ("--format", "--model", "--pure"),
+        OpenCodeExecutor(("opencode",)).capabilities.features,
+    ),
+    _CommandProbe(
         "orca",
         "orca",
         "orca-json-command-v1",
@@ -150,12 +163,6 @@ _COMMAND_PROBES = (
 )
 
 _DISCOVERY_PROBES = (
-    _DiscoveryProbe(
-        "opencode",
-        "OpenCode",
-        ("opencode",),
-        "https://opencode.ai/",
-    ),
     _DiscoveryProbe(
         "openclaw",
         "OpenClaw",
@@ -288,6 +295,7 @@ class AgentOSDistribution:
                     "worktrees",
                     "runtime artifacts",
                     "raw prompts and inputs",
+                    "agent product sessions",
                     "unverified results",
                     "active leases",
                     "routing governance runtime",

@@ -1,4 +1,6 @@
+from abc import ABC, abstractmethod
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -61,7 +63,9 @@ def _prompt(request: AgentRequest) -> str:
     )
 
 
-class _CliExecutor:
+class CliAgentAdapter(ABC):
+    """Shared process, timeout, fault, environment, and tool-mapping Adapter kit."""
+
     tool_map: Mapping[str, str] = {}
 
     def __init__(self, command: Sequence[str]):
@@ -69,7 +73,20 @@ class _CliExecutor:
             raise ContractViolation("agent command cannot be empty")
         self._command = tuple(command)
 
-    def _mapped_tools(self, tools: Sequence[str]) -> Tuple[str, ...]:
+    @property
+    def command(self) -> Tuple[str, ...]:
+        return self._command
+
+    @property
+    @abstractmethod
+    def capabilities(self) -> ExecutorCapabilities:
+        """Describe the normalized features and tools provided by this Adapter."""
+
+    @abstractmethod
+    def execute(self, request: AgentRequest) -> AgentResult:
+        """Execute one normalized Agent OS request."""
+
+    def map_tools(self, tools: Sequence[str]) -> Tuple[str, ...]:
         try:
             return tuple(self.tool_map[tool] for tool in tools)
         except KeyError as error:
@@ -77,7 +94,15 @@ class _CliExecutor:
                 f"executor {self.capabilities.executor_id} does not map tool {error.args[0]}"
             ) from error
 
-    def _run(self, arguments: Sequence[str], request: AgentRequest) -> subprocess.CompletedProcess:
+    def run_cli(
+        self,
+        arguments: Sequence[str],
+        request: AgentRequest,
+        environment: Optional[Mapping[str, str]] = None,
+    ) -> subprocess.CompletedProcess:
+        process_environment = os.environ.copy()
+        if environment:
+            process_environment.update(environment)
         try:
             return subprocess.run(
                 [*self._command, *arguments],
@@ -86,6 +111,7 @@ class _CliExecutor:
                 text=True,
                 timeout=request.timeout_seconds,
                 check=False,
+                env=process_environment,
             )
         except FileNotFoundError as error:
             raise AgentExecutionError(
@@ -98,7 +124,9 @@ class _CliExecutor:
             ) from error
 
     @staticmethod
-    def _require_success(completed: subprocess.CompletedProcess, executor_id: str) -> None:
+    def require_success(
+        completed: subprocess.CompletedProcess, executor_id: str
+    ) -> None:
         if completed.returncode != 0:
             detail = (completed.stderr or completed.stdout).strip()
             if len(detail) > 1000:
@@ -116,7 +144,7 @@ class _CliExecutor:
             )
 
 
-class ClaudeCodeExecutor(_CliExecutor):
+class ClaudeCodeExecutor(CliAgentAdapter):
     tool_map = {"read": "Read", "shell": "Bash", "edit": "Edit", "write": "Write"}
 
     @property
@@ -134,7 +162,7 @@ class ClaudeCodeExecutor(_CliExecutor):
             "required": list(request.output_keys),
             "additionalProperties": False,
         }
-        mapped_tools = self._mapped_tools(request.tools)
+        mapped_tools = self.map_tools(request.tools)
         arguments = [
             "--print",
             "--output-format",
@@ -153,8 +181,8 @@ class ClaudeCodeExecutor(_CliExecutor):
         if request.max_cost_usd is not None:
             arguments.extend(("--max-budget-usd", str(request.max_cost_usd)))
         arguments.append(_prompt(request))
-        completed = self._run(arguments, request)
-        self._require_success(completed, self.capabilities.executor_id)
+        completed = self.run_cli(arguments, request)
+        self.require_success(completed, self.capabilities.executor_id)
         try:
             envelope = json.loads(completed.stdout)
         except json.JSONDecodeError as error:
@@ -194,7 +222,7 @@ class ClaudeCodeExecutor(_CliExecutor):
         )
 
 
-class PiAgentExecutor(_CliExecutor):
+class PiAgentExecutor(CliAgentAdapter):
     tool_map = {"read": "read", "shell": "bash", "edit": "edit", "write": "write"}
 
     @property
@@ -206,7 +234,7 @@ class PiAgentExecutor(_CliExecutor):
         )
 
     def execute(self, request: AgentRequest) -> AgentResult:
-        mapped_tools = self._mapped_tools(request.tools)
+        mapped_tools = self.map_tools(request.tools)
         arguments = [
             "--mode",
             "json",
@@ -222,8 +250,8 @@ class PiAgentExecutor(_CliExecutor):
         if request.model:
             arguments.extend(("--model", request.model))
         arguments.append(_prompt(request))
-        completed = self._run(arguments, request)
-        self._require_success(completed, self.capabilities.executor_id)
+        completed = self.run_cli(arguments, request)
+        self.require_success(completed, self.capabilities.executor_id)
         final_message: Optional[Mapping[str, Any]] = None
         for line in completed.stdout.splitlines():
             if not line.strip():
@@ -269,7 +297,7 @@ class PiAgentExecutor(_CliExecutor):
         )
 
 
-class CodexExecutor(_CliExecutor):
+class CodexExecutor(CliAgentAdapter):
     @property
     def capabilities(self) -> ExecutorCapabilities:
         return ExecutorCapabilities(
@@ -312,12 +340,12 @@ class CodexExecutor(_CliExecutor):
             if not any((parent / ".git").exists() for parent in (request.workspace, *request.workspace.parents)):
                 arguments.append("--skip-git-repo-check")
             arguments.append(_prompt(request))
-            completed = self._run(arguments, request)
+            completed = self.run_cli(arguments, request)
         finally:
             if schema_path is not None:
                 schema_path.unlink(missing_ok=True)
 
-        self._require_success(completed, self.capabilities.executor_id)
+        self.require_success(completed, self.capabilities.executor_id)
         final_text: Optional[str] = None
         session_id: Optional[str] = None
         usage: Mapping[str, Any] = {}
@@ -359,10 +387,155 @@ class CodexExecutor(_CliExecutor):
         )
 
 
+class OpenCodeExecutor(CliAgentAdapter):
+    """OpenCode JSONL Adapter with a deny-by-default tool permission envelope."""
+
+    @property
+    def capabilities(self) -> ExecutorCapabilities:
+        return ExecutorCapabilities(
+            "opencode",
+            ("model_selection", "structured_output", "token_usage", "tool_policy"),
+            CANONICAL_TOOLS,
+        )
+
+    @staticmethod
+    def _permission_policy(tools: Sequence[str]) -> Mapping[str, str]:
+        allowed = set(tools)
+        unknown = allowed - set(CANONICAL_TOOLS)
+        if unknown:
+            raise ContractViolation(
+                f"executor opencode does not map tool {sorted(unknown)[0]}"
+            )
+        return {
+            "*": "deny",
+            "read": "allow" if "read" in allowed else "deny",
+            "glob": "allow" if "read" in allowed else "deny",
+            "grep": "allow" if "read" in allowed else "deny",
+            "list": "allow" if "read" in allowed else "deny",
+            "bash": "allow" if "shell" in allowed else "deny",
+            "edit": "allow" if allowed & {"edit", "write"} else "deny",
+            "question": "deny",
+            "plan_enter": "deny",
+            "plan_exit": "deny",
+            "webfetch": "deny",
+        }
+
+    @staticmethod
+    def _event_error(executor_id: str, detail: Any) -> None:
+        if isinstance(detail, str):
+            text = detail
+        else:
+            try:
+                text = json.dumps(detail, ensure_ascii=False, sort_keys=True)
+            except (TypeError, ValueError):
+                text = repr(detail)
+        normalized = text.lower()
+        if any(
+            marker in normalized
+            for marker in ("rate limit", "rate_limit", "too many requests", "429")
+        ):
+            raise AgentRateLimitError(f"agent {executor_id} was rate limited: {text}")
+        raise AgentExecutionError(f"agent {executor_id} reported an error: {text}")
+
+    def execute(self, request: AgentRequest) -> AgentResult:
+        arguments = ["run", "--format", "json", "--pure"]
+        if request.model:
+            arguments.extend(("--model", request.model))
+        arguments.append(_prompt(request))
+        permissions = self._permission_policy(request.tools)
+        completed = self.run_cli(
+            arguments,
+            request,
+            {
+                "OPENCODE_PERMISSION": json.dumps(
+                    permissions,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                "OPENCODE_DISABLE_PROJECT_CONFIG": "true",
+            },
+        )
+        self.require_success(completed, self.capabilities.executor_id)
+
+        final_text: Optional[str] = None
+        session_id: Optional[str] = None
+        tokens = 0
+        cost = 0.0
+        cost_observed = False
+        for line in completed.stdout.splitlines():
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise AgentProtocolError(
+                    f"invalid OpenCode JSONL event: {error}"
+                ) from error
+            if not isinstance(event, dict) or not isinstance(event.get("type"), str):
+                raise AgentProtocolError("invalid OpenCode JSONL event envelope")
+            if event.get("sessionID"):
+                session_id = str(event["sessionID"])
+            event_type = event["type"]
+            part = event.get("part")
+            if event_type == "text" and isinstance(part, dict):
+                if isinstance(part.get("text"), str):
+                    final_text = part["text"]
+            elif event_type == "step_finish" and isinstance(part, dict):
+                usage = (
+                    part.get("tokens")
+                    if isinstance(part.get("tokens"), dict)
+                    else {}
+                )
+                step_tokens = _non_negative_int(usage.get("total"))
+                if not step_tokens:
+                    step_tokens = sum(
+                        _non_negative_int(usage.get(key))
+                        for key in ("input", "output", "reasoning")
+                    )
+                tokens += step_tokens
+                step_cost = part.get("cost")
+                if (
+                    isinstance(step_cost, (int, float))
+                    and not isinstance(step_cost, bool)
+                    and step_cost >= 0
+                ):
+                    cost += float(step_cost)
+                    cost_observed = True
+            elif event_type == "error":
+                self._event_error(
+                    self.capabilities.executor_id, event.get("error", event)
+                )
+        if final_text is None:
+            raise AgentProtocolError("OpenCode event stream has no final text result")
+        return AgentResult(
+            self.capabilities.executor_id,
+            validate_agent_outputs(_json_object(final_text), request.output_keys),
+            final_text,
+            tokens,
+            cost if cost_observed else None,
+            session_id,
+        )
+
+
 def _codex_is_usable(command: str) -> bool:
     try:
         completed = subprocess.run(
             (command, "exec", "--help"),
+            capture_output=True,
+            text=True,
+            timeout=_DISCOVERY_PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0
+
+
+def _opencode_is_usable(command: str) -> bool:
+    try:
+        completed = subprocess.run(
+            (command, "run", "--help"),
             capture_output=True,
             text=True,
             timeout=_DISCOVERY_PROBE_TIMEOUT_SECONDS,
@@ -387,4 +560,7 @@ def discover_local_executors(
     codex = shutil.which("codex")
     if codex and _codex_is_usable(codex):
         registry.register(CodexExecutor((codex,)))
+    opencode = shutil.which("opencode")
+    if opencode and _opencode_is_usable(opencode):
+        registry.register(OpenCodeExecutor((opencode,)))
     return registry

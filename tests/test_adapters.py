@@ -1,3 +1,4 @@
+import json
 import subprocess
 import sys
 import tempfile
@@ -11,9 +12,14 @@ from grapheng import (
     AgentRateLimitError,
     AgentRequest,
     AgentTimeoutError,
+    CliAgentAdapter,
     ClaudeCodeExecutor,
     CodexExecutor,
+    ContractViolation,
+    ExecutorRegistry,
+    OpenCodeExecutor,
     PiAgentExecutor,
+    PolicyRouter,
     discover_local_executors,
 )
 
@@ -72,6 +78,32 @@ class AdapterTests(unittest.TestCase):
             [capabilities.executor_id for capabilities in registry.capabilities()],
         )
 
+    def test_discovery_registers_opencode_only_after_safe_run_probe(self):
+        def which(command):
+            return "/fake/opencode" if command == "opencode" else None
+
+        for returncode, expected in ((0, ["opencode"]), (1, [])):
+            with self.subTest(returncode=returncode), patch(
+                "grapheng.adapters.shutil.which", side_effect=which
+            ), patch(
+                "grapheng.adapters.subprocess.run",
+                return_value=subprocess.CompletedProcess(
+                    ("/fake/opencode", "run", "--help"),
+                    returncode,
+                    stdout="--format --model",
+                    stderr="",
+                ),
+            ) as run:
+                registry = discover_local_executors()
+
+            self.assertEqual(
+                expected,
+                [item.executor_id for item in registry.capabilities()],
+            )
+            self.assertEqual(
+                ("/fake/opencode", "run", "--help"), run.call_args.args[0]
+            )
+
     def test_claude_adapter_normalizes_result_and_usage(self):
         with tempfile.TemporaryDirectory() as directory:
             executor = ClaudeCodeExecutor((sys.executable, str(FIXTURE), "claude"))
@@ -99,6 +131,125 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(8, result.tokens_used)
         self.assertEqual("codex-session", result.session_id)
 
+    def test_opencode_adapter_normalizes_jsonl_result_usage_and_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            executor = OpenCodeExecutor((sys.executable, str(FIXTURE), "opencode"))
+            result = executor.execute(request(Path(directory)))
+
+        self.assertIsInstance(executor, CliAgentAdapter)
+        self.assertEqual({"answer": "opencode"}, result.outputs)
+        self.assertEqual(11, result.tokens_used)
+        self.assertAlmostEqual(0.03, result.cost_usd)
+        self.assertEqual("opencode-session", result.session_id)
+
+    def test_opencode_adapter_translates_tools_to_deny_by_default_permissions(self):
+        stdout = "\n".join(
+            (
+                json.dumps(
+                    {
+                        "type": "text",
+                        "sessionID": "session",
+                        "part": {"text": '{"answer":"ok"}'},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "step_finish",
+                        "sessionID": "session",
+                        "part": {"cost": 0, "tokens": {"total": 1}},
+                    }
+                ),
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "grapheng.adapters.subprocess.run",
+            return_value=subprocess.CompletedProcess(("opencode",), 0, stdout, ""),
+        ) as run:
+            value = request(Path(directory))
+            value = AgentRequest(
+                task_id=value.task_id,
+                prompt=value.prompt,
+                inputs=value.inputs,
+                output_keys=value.output_keys,
+                workspace=value.workspace,
+                model="provider/model",
+                tools=("read", "shell", "write"),
+                timeout_seconds=value.timeout_seconds,
+            )
+            OpenCodeExecutor(("opencode",)).execute(value)
+
+        arguments = run.call_args.args[0]
+        environment = run.call_args.kwargs["env"]
+        permissions = json.loads(environment["OPENCODE_PERMISSION"])
+        self.assertEqual(
+            [
+                "opencode",
+                "run",
+                "--format",
+                "json",
+                "--pure",
+                "--model",
+                "provider/model",
+            ],
+            arguments[:-1],
+        )
+        self.assertEqual("deny", permissions["*"])
+        self.assertEqual("allow", permissions["read"])
+        self.assertEqual("allow", permissions["glob"])
+        self.assertEqual("allow", permissions["bash"])
+        self.assertEqual("allow", permissions["edit"])
+        self.assertEqual("deny", permissions["question"])
+        self.assertEqual("true", environment["OPENCODE_DISABLE_PROJECT_CONFIG"])
+
+    def test_opencode_cost_is_observed_by_rsi_but_not_claimed_as_a_hard_budget(self):
+        observations = []
+        router = PolicyRouter(observer=observations.append)
+        registry = ExecutorRegistry(router)
+        registry.register(
+            OpenCodeExecutor((sys.executable, str(FIXTURE), "opencode"))
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            result = registry.execute(request(workspace), executor_id="opencode")
+            budgeted = request(workspace)
+            budgeted = AgentRequest(
+                task_id=budgeted.task_id,
+                prompt=budgeted.prompt,
+                inputs=budgeted.inputs,
+                output_keys=budgeted.output_keys,
+                workspace=budgeted.workspace,
+                tools=budgeted.tools,
+                timeout_seconds=budgeted.timeout_seconds,
+                max_cost_usd=1.0,
+            )
+            with self.assertRaisesRegex(ContractViolation, "no agent executor satisfies"):
+                registry.execute(budgeted, executor_id="opencode")
+
+        self.assertAlmostEqual(0.03, result.cost_usd)
+        self.assertEqual(1, len(observations))
+        self.assertEqual("opencode", observations[0].executor_id)
+        self.assertTrue(observations[0].success)
+        self.assertAlmostEqual(0.03, observations[0].cost_usd)
+
+    def test_opencode_adapter_rejects_unknown_tools_before_process_start(self):
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "grapheng.adapters.subprocess.run"
+        ) as run:
+            value = request(Path(directory))
+            value = AgentRequest(
+                task_id=value.task_id,
+                prompt=value.prompt,
+                inputs=value.inputs,
+                output_keys=value.output_keys,
+                workspace=value.workspace,
+                tools=("browser",),
+                timeout_seconds=value.timeout_seconds,
+            )
+            with self.assertRaisesRegex(ContractViolation, "does not map tool browser"):
+                OpenCodeExecutor(("opencode",)).execute(value)
+
+        run.assert_not_called()
+
     def test_adapter_rejects_output_contract_mismatch(self):
         with tempfile.TemporaryDirectory() as directory:
             executor = ClaudeCodeExecutor((sys.executable, str(FIXTURE), "claude"))
@@ -111,6 +262,14 @@ class AdapterTests(unittest.TestCase):
             (ClaudeCodeExecutor, "claude", "crash", AgentExecutionError),
             (PiAgentExecutor, "pi", "corrupt", AgentProtocolError),
             (CodexExecutor, "codex", "rate-limit", AgentRateLimitError),
+            (OpenCodeExecutor, "opencode", "corrupt", AgentProtocolError),
+            (OpenCodeExecutor, "opencode", "event-error", AgentExecutionError),
+            (
+                OpenCodeExecutor,
+                "opencode",
+                "event-rate-limit",
+                AgentRateLimitError,
+            ),
         )
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
@@ -124,22 +283,27 @@ class AdapterTests(unittest.TestCase):
 
     def test_cli_timeout_is_retryable_and_bounded(self):
         with tempfile.TemporaryDirectory() as directory:
-            executor = CodexExecutor(
-                (sys.executable, str(FIXTURE), "codex", "timeout")
-            )
-            value = request(Path(directory))
-            value = AgentRequest(
-                task_id=value.task_id,
-                prompt=value.prompt,
-                inputs=value.inputs,
-                output_keys=value.output_keys,
-                workspace=value.workspace,
-                tools=value.tools,
-                timeout_seconds=1,
-            )
+            for executor_type, mode in (
+                (CodexExecutor, "codex"),
+                (OpenCodeExecutor, "opencode"),
+            ):
+                with self.subTest(mode=mode):
+                    executor = executor_type(
+                        (sys.executable, str(FIXTURE), mode, "timeout")
+                    )
+                    value = request(Path(directory))
+                    value = AgentRequest(
+                        task_id=value.task_id,
+                        prompt=value.prompt,
+                        inputs=value.inputs,
+                        output_keys=value.output_keys,
+                        workspace=value.workspace,
+                        tools=value.tools,
+                        timeout_seconds=1,
+                    )
 
-            with self.assertRaises(AgentTimeoutError):
-                executor.execute(value)
+                    with self.assertRaises(AgentTimeoutError):
+                        executor.execute(value)
 
 
 if __name__ == "__main__":

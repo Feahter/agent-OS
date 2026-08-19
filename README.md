@@ -52,7 +52,7 @@ Every transition produces structured evidence. A changed workspace, policy or pl
 | Area | What it does |
 | --- | --- |
 | Graph runtime | Validates DAGs, artifact contracts, concurrency, retries, gates, budgets and terminal Reality Anchors. |
-| Agent adapters | Normalizes Codex, Claude Code and Pi capabilities, tools, usage, cost and structured outputs. |
+| Agent adapters | Normalizes Codex, Claude Code, Pi and OpenCode capabilities, tools, usage, cost and structured outputs. |
 | Policy routing | Selects an executor by capability, data class, quality, cost, latency, rate limit and circuit state. |
 | Engineering workflow | Runs exploration, planning, approval, implementation, checks, independent review and bounded repair. |
 | Orca coordination | Compiles graphs into Run/Task/Dispatch contracts and coordinates isolated workers and controlled merges. |
@@ -75,8 +75,8 @@ agent-os demo examples/minimal_graph.json --work-dir /tmp/agent-os-demo
 ```
 
 `setup` initializes the local portable state, inspects Python, filesystem semantics,
-Codex, Claude Code, Pi and optional Orca, then discovers other installed Agent tools
-including OpenCode, OpenClaw and Hermes Agent. It prints prioritized repair steps,
+Codex, Claude Code, Pi, OpenCode and optional Orca, then discovers other installed
+Agent tools including OpenClaw and Hermes Agent. It prints prioritized repair steps,
 uses only help/version probes and makes zero model calls. Add `--json` for the
 versioned diagnostic contract or `--home /path/to/state` to choose another local
 state directory.
@@ -232,15 +232,17 @@ A node can read only declared artifacts and must produce exactly its declared ou
 | Codex | `0.148.0-alpha.9` | `exec-jsonl-v1` | Local CLI adapter |
 | Claude Code | `2.1.234` | `json-envelope-v1` | Local CLI adapter |
 | Pi | `0.84.1` | `message-end-jsonl-v1` | Local CLI adapter |
+| [OpenCode](https://opencode.ai/) | `1.18.18` | `run-jsonl-v1` | Local CLI adapter |
 | Orca | `1.4.180` | `orca-json-command-v1` | Graph compiler, backend and coordinator |
 
-Adapters translate the common `read / shell / edit / write` tool contract into each product's protocol. The versions above were verified on Darwin arm64 on 2026-08-18. Evidence is version-controlled and travels with release bundles. Certification is platform-scoped: the same version on another OS or architecture is reported as `unverified_platform` and is not included in `ready_executors`.
+Adapters translate the common `read / shell / edit / write` tool contract into each product's protocol. The original tool set was verified on Darwin arm64 on 2026-08-18; OpenCode was verified from its official Darwin arm64 release binary on 2026-08-19. Evidence is version-controlled and travels with release bundles. Certification is platform-scoped: the same version on another OS or architecture is reported as `unverified_platform` and is not included in `ready_executors`.
+
+`CliAgentAdapter` is the public kit for new local CLI integrations. It centralizes bounded process execution, environment isolation, timeout and process-fault classification, while the existing `AgentExecutor` protocol remains the single runtime seam. OpenCode uses non-interactive JSONL, `--pure`, project-config isolation and deny-by-default permissions; it reports observed token and cost data but does not claim an unsupported hard cost limit. OpenCode owns its session persistence, so its product session data is not copied into Agent OS portable bundles.
 
 Setup also recognizes the following tools without treating them as executable Adapters:
 
 | Discovered tool | Safe command probe | Agent OS status |
 | --- | --- | --- |
-| [OpenCode](https://opencode.ai/) | `opencode` | Discovery only; Adapter pending |
 | [OpenClaw](https://openclaw.ai/) | `openclaw` | Discovery only; Adapter pending |
 | [Hermes Agent](https://github.com/NousResearch/hermes-agent) | `hermes` | Discovery only; Adapter pending |
 | [Aider](https://aider.chat/) | `aider` | Discovery only; Adapter pending |
@@ -251,7 +253,7 @@ Discovery reports installation, path, version-probe state and integration state 
 `discovered_agents`. A tool remains outside `ready_executors` until its real Adapter,
 protocol conformance tests and version/platform compatibility evidence are complete.
 
-Codex discovery runs a safe startup probe, while diagnostics run help and version probes; neither calls a model, and Orca's version is read from its application bundle. Codex discovery executes `codex exec --help` before registration because an executable npm launcher does not prove that its architecture-specific native binary is present. Codex `0.148.0-alpha.9` is not certified for Darwin x86_64. An exact version and platform evidence match is verified, a compatible unknown version or platform is warned but not certified as ready, and missing executables or protocol features fail closed.
+Codex and OpenCode discovery run safe startup probes, while diagnostics run help and version probes; neither calls a model, and Orca's version is read from its application bundle. Codex discovery executes `codex exec --help` because an executable npm launcher does not prove that its architecture-specific native binary is present; OpenCode executes `opencode run --help` before registration. Codex `0.148.0-alpha.9` is not certified for Darwin x86_64. An exact version and platform evidence match is verified, a compatible unknown version or platform is warned but not certified as ready, and missing executables or protocol features fail closed.
 
 The offline fault baseline covers rate limits, timeouts, process crashes, damaged output and protocol drift. Rate limits and timeouts are classified as retryable while remaining governed by graph retry, budget and provider policies. A crashed process or unknown protocol can never be reported as a successful result.
 

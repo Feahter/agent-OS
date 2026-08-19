@@ -70,7 +70,8 @@ class DistributionTests(unittest.TestCase):
         self.assertTrue(report["ready_for_agent_execution"])
         self.assertEqual([], report["discovered_agents"])
         self.assertEqual(
-            ["claude-code", "codex", "pi-agent"], report["ready_executors"]
+            ["claude-code", "codex", "pi-agent", "opencode"],
+            report["ready_executors"],
         )
         self.assertTrue(report["ready_for_orca"])
         self.assertEqual("pass", statuses["state:agent-os"])
@@ -78,6 +79,7 @@ class DistributionTests(unittest.TestCase):
         self.assertEqual("pass", statuses["adapter:claude-code"])
         self.assertEqual("pass", statuses["adapter:codex"])
         self.assertEqual("pass", statuses["adapter:pi-agent"])
+        self.assertEqual("pass", statuses["adapter:opencode"])
         self.assertEqual("pass", statuses["orchestration:orca"])
         codex = next(
             item for item in report["checks"] if item["check_id"] == "adapter:codex"
@@ -85,6 +87,16 @@ class DistributionTests(unittest.TestCase):
         self.assertEqual("verified", codex["details"]["support_status"])
         self.assertEqual(
             "2026-08-18T08:58:53Z", codex["details"]["last_verified_at"]
+        )
+        opencode = next(
+            item
+            for item in report["checks"]
+            if item["check_id"] == "adapter:opencode"
+        )
+        self.assertEqual("verified", opencode["details"]["support_status"])
+        self.assertEqual("run-jsonl-v1", opencode["details"]["protocol"])
+        self.assertEqual(
+            "2026-08-19T08:22:08Z", opencode["details"]["last_verified_at"]
         )
         self.assertTrue(
             all("--help" in command or command[-1] == "--version" for command in calls)
@@ -225,13 +237,13 @@ class DistributionTests(unittest.TestCase):
         calls = []
 
         def which(command):
-            return "/fake/opencode" if command == "opencode" else None
+            return "/fake/openclaw" if command == "openclaw" else None
 
         def runner(command, timeout_seconds):
             calls.append(tuple(command))
             if command[-1] == "--version":
                 return subprocess.CompletedProcess(
-                    command, 0, stdout="opencode 1.2.3", stderr=""
+                    command, 0, stdout="openclaw 1.2.3", stderr=""
                 )
             return subprocess.CompletedProcess(command, 0, stdout="usage", stderr="")
 
@@ -246,20 +258,20 @@ class DistributionTests(unittest.TestCase):
         self.assertEqual("needs_agent", report["readiness"])
         self.assertEqual(1, len(report["discovered_agents"]))
         discovered = report["discovered_agents"][0]
-        self.assertEqual("opencode", discovered["agent_id"])
+        self.assertEqual("openclaw", discovered["agent_id"])
         self.assertEqual("installed_unverified", discovered["discovery_status"])
         self.assertEqual("adapter_not_available", discovered["integration_status"])
         self.assertEqual(
             [
-                ("/fake/opencode", "--help"),
-                ("/fake/opencode", "--version"),
+                ("/fake/openclaw", "--help"),
+                ("/fake/openclaw", "--version"),
             ],
             calls,
         )
         action = next(
             item
             for item in report["next_actions"]
-            if item["check_id"] == "discovery:opencode"
+            if item["check_id"] == "discovery:openclaw"
         )
         self.assertEqual("integrate_discovered_agent", action["action_id"])
         self.assertEqual("optional", action["priority"])
@@ -317,8 +329,8 @@ class DistributionTests(unittest.TestCase):
             "ready_executors": ["codex"],
             "discovered_agents": [
                 {
-                    "agent_id": "opencode",
-                    "display_name": "OpenCode",
+                    "agent_id": "openclaw",
+                    "display_name": "OpenClaw",
                     "discovery_status": "installed_unverified",
                 }
             ],
@@ -366,7 +378,7 @@ class DistributionTests(unittest.TestCase):
 
         self.assertIn("ready with warnings", human.getvalue())
         self.assertIn("0 model calls", human.getvalue())
-        self.assertIn("Discovered but not integrated: OpenCode", human.getvalue())
+        self.assertIn("Discovered but not integrated: OpenClaw", human.getvalue())
         self.assertIn("[optional] Install orca", human.getvalue())
         self.assertEqual(report, json.loads(machine.getvalue()))
 
@@ -434,7 +446,6 @@ class DistributionTests(unittest.TestCase):
         self.assertEqual(3, matrix["matrix_schema_version"])
         self.assertEqual(
             {
-                "opencode",
                 "openclaw",
                 "hermes",
                 "aider",

@@ -65,7 +65,7 @@ The combined P1.4/P5.3 pilot is the only near-term package that intentionally sp
 
 ### 0.0.x: trusted foundation — current release line
 
-Prove that heterogeneous agents can share governed execution semantics. The current base includes the graph runtime, artifact contracts, Codex/Claude Code/Pi adapters, Orca coordination, approvals, budgets, recovery, controlled merge, verified reuse, Reality Anchors, governed RSI and portable state. It also contains preview implementations from later milestones; those capabilities are not considered mature until their user-outcome gates pass.
+Prove that heterogeneous agents can share governed execution semantics. The current base includes the graph runtime, artifact contracts, Codex/Claude Code/Pi/OpenCode adapters, Orca coordination, approvals, budgets, recovery, controlled merge, verified reuse, Reality Anchors, governed RSI and portable state. It also contains preview implementations from later milestones; those capabilities are not considered mature until their user-outcome gates pass.
 
 Exit gates:
 
@@ -85,9 +85,9 @@ Key outcomes:
 - Templates for fixes, tests, refactors, research and release preparation.
 - Safe defaults and questions only when critical context is missing.
 - Human-readable progress, errors and results rather than internal JSON noise.
-- Real end-to-end compatibility tests for Codex, Claude Code, Pi and Orca.
+- Real end-to-end compatibility tests for Codex, Claude Code, Pi, OpenCode and Orca.
 
-Preview status: the unified task actions, intent compiler, five initial templates, resident execution and a human-readable `agent-os setup` journey are implemented. Setup safely initializes local state, classifies readiness and emits structured remediation without model calls. It now recognizes OpenCode, OpenClaw, Hermes Agent, Aider, Gemini CLI and GitHub Copilot CLI without promoting unverified tools into execution. The remaining gates are clean-machine rehearsal, certified Adapters for prioritized discovered tools and authorized real-project pilots.
+Preview status: the unified task actions, intent compiler, five initial templates, resident execution and a human-readable `agent-os setup` journey are implemented. Setup safely initializes local state, classifies readiness and emits structured remediation without model calls. OpenCode is now a certified Adapter on Darwin arm64; OpenClaw, Hermes Agent, Aider, Gemini CLI and GitHub Copilot CLI remain discovery-only. The remaining gates are clean-machine rehearsal, certification of the next prioritized Adapter and authorized real-project pilots.
 
 Exit gates: a new user starts a first task within five minutes; common single-repository tasks reach verified results; interrupted tasks resume with one command.
 
@@ -104,7 +104,7 @@ Key outcomes:
 - Discoverable project configuration with inheritable personal, team and project policy.
 - A stable Agent Adapter kit and protocol conformance tests.
 
-Preview status: the resident queue, unified lifecycle, task center, notifications and recovery paths are implemented. The remaining work is long-running soak evidence, discoverable configuration and a public Adapter kit whose interface can be supported across releases.
+Preview status: the resident queue, unified lifecycle, task center, notifications and recovery paths are implemented. The public `CliAgentAdapter` kit now powers four certified executors without adding a second runtime seam. The remaining work is long-running soak evidence, discoverable configuration and external conformance evidence before freezing the kit for compatibility.
 
 Exit gates: long work survives terminal exit; common failures are self-recoverable; users no longer open each agent tool to discover task truth.
 
@@ -207,7 +207,7 @@ Every RSI optimization has hard constraints: no safety regression, quality at or
 2. **Complete clean-install evidence.** The zero-model `setup` flow now initializes state, reports supported/unverified/broken states and provides actionable remediation. Next, rehearse it on clean environments and add evidence for each supported version/platform combination.
 3. **Define the 0.1 compatibility line.** Mark which task, artifact, event, policy and state interfaces are public; add migration fixtures and upgrade rehearsals before promising stability.
 4. **Start P6 personal RSI from the frozen baseline.** Add inspect/correct/forget/export controls for memory, then optimize agent, model, context and verification choices behind quality and budget gates.
-5. **Extract the Agent Adapter kit.** Turn the proven Codex, Claude Code, Pi and Orca seam into documented capability negotiation and conformance tests so future agents integrate without core-runtime changes.
+5. **Harden the Agent Adapter kit and select the next Adapter.** Exercise the public kit outside built-in executors, freeze its minimal compatibility surface, then assess OpenClaw and Hermes by user value, non-interactive protocol stability, permission control and maintenance cost before implementing one.
 
 ## Explicit non-goals
 

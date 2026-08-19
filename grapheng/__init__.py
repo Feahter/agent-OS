@@ -1,4 +1,11 @@
-from .adapters import CodexExecutor, ClaudeCodeExecutor, PiAgentExecutor, discover_local_executors
+from .adapters import (
+    CliAgentAdapter,
+    CodexExecutor,
+    ClaudeCodeExecutor,
+    OpenCodeExecutor,
+    PiAgentExecutor,
+    discover_local_executors,
+)
 from .agent_nodes import AgentNodeHandler
 from .agents import (
     AgentExecution,
@@ -190,6 +197,7 @@ __all__ = [
     "ArtifactVersion",
     "BUNDLE_SCHEMA_VERSION",
     "BundleMigrationRegistry",
+    "CliAgentAdapter",
     "ClaudeCodeExecutor",
     "ChangeSetArtifact",
     "CancellationToken",
@@ -255,6 +263,7 @@ __all__ = [
     "OrcaGraphCompiler",
     "OrcaMaterializedRun",
     "OrcaPlan",
+    "OpenCodeExecutor",
     "PiAgentExecutor",
     "PolicyRouter",
     "ProjectPolicy",

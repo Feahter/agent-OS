@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "graph-engineering-agent-os"
 version = "0.0.1"
-description = "Local-first Agent OS for orchestrating Codex, Claude Code, Pi and Orca with verification, cost controls and governed RSI."
+description = "Local-first Agent OS for orchestrating Codex, Claude Code, Pi, OpenCode and Orca with verification, cost controls and governed RSI."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
@@ -27,6 +27,7 @@ keywords = [
   "codex",
   "claude-code",
   "pi-agent",
+  "opencode",
   "orca",
   "dag",
 ]

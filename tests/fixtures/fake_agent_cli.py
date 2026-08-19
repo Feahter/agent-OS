@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import time
 
@@ -16,6 +17,28 @@ elif fault == "rate-limit":
     raise SystemExit(29)
 elif fault == "corrupt":
     print("{not-json")
+    raise SystemExit(0)
+elif fault == "event-error":
+    print(
+        json.dumps(
+            {
+                "type": "error",
+                "sessionID": "opencode-session",
+                "error": {"name": "ProviderError", "message": "provider failed"},
+            }
+        )
+    )
+    raise SystemExit(0)
+elif fault == "event-rate-limit":
+    print(
+        json.dumps(
+            {
+                "type": "error",
+                "sessionID": "opencode-session",
+                "error": {"status": 429, "message": "too many requests"},
+            }
+        )
+    )
     raise SystemExit(0)
 
 if mode == "claude":
@@ -68,6 +91,75 @@ elif mode == "codex":
             {
                 "type": "turn.completed",
                 "usage": {"input_tokens": 5, "cached_input_tokens": 3, "output_tokens": 3},
+            }
+        )
+    )
+elif mode == "opencode":
+    arguments = sys.argv[2:]
+    if arguments[:4] != ["run", "--format", "json", "--pure"]:
+        print("missing OpenCode JSON run protocol", file=sys.stderr)
+        raise SystemExit(31)
+    if os.environ.get("OPENCODE_DISABLE_PROJECT_CONFIG") != "true":
+        print("project config was not disabled", file=sys.stderr)
+        raise SystemExit(32)
+    permissions = json.loads(os.environ.get("OPENCODE_PERMISSION", "{}"))
+    expected = {
+        "*": "deny",
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "bash": "deny",
+        "edit": "deny",
+        "question": "deny",
+        "plan_enter": "deny",
+        "plan_exit": "deny",
+        "webfetch": "deny",
+    }
+    if permissions != expected:
+        print("unexpected OpenCode permissions", file=sys.stderr)
+        raise SystemExit(33)
+    print(
+        json.dumps(
+            {
+                "type": "text",
+                "sessionID": "opencode-session",
+                "part": {"type": "text", "text": '{"draft":"ignored"}'},
+            }
+        )
+    )
+    print(
+        json.dumps(
+            {
+                "type": "step_finish",
+                "sessionID": "opencode-session",
+                "part": {
+                    "type": "step-finish",
+                    "cost": 0.01,
+                    "tokens": {"total": 4, "input": 2, "output": 2, "reasoning": 0},
+                },
+            }
+        )
+    )
+    print(
+        json.dumps(
+            {
+                "type": "text",
+                "sessionID": "opencode-session",
+                "part": {"type": "text", "text": '{"answer":"opencode"}'},
+            }
+        )
+    )
+    print(
+        json.dumps(
+            {
+                "type": "step_finish",
+                "sessionID": "opencode-session",
+                "part": {
+                    "type": "step-finish",
+                    "cost": 0.02,
+                    "tokens": {"total": 7, "input": 4, "output": 3, "reasoning": 0},
+                },
             }
         )
     )

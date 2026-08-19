@@ -22,6 +22,17 @@
         "version_source": "codex --version"
       }
     ],
+    "opencode": [
+      {
+        "artifact_sha256": "7d668bf26496fec8686d4e51ebb1ac2bd2e393f0c1620aa696c4c242a9e5806a",
+        "artifact_source": "https://github.com/anomalyco/opencode/releases/download/v1.18.18/opencode-darwin-arm64.zip",
+        "inspection": "official release binary --version and run --help only; no model call",
+        "protocol": "run-jsonl-v1",
+        "validated_at": "2026-08-19T08:22:08Z",
+        "version": "1.18.18",
+        "version_source": "official opencode-darwin-arm64 v1.18.18 release binary"
+      }
+    ],
     "orca": [
       {
         "protocol": "orca-json-command-v1",

@@ -236,3 +236,14 @@
 - 只执行 `--help / --version`，记录安装路径、版本状态和接入状态；未安装不降低健康度。
 - 版本未知、help 失败或探测异常均保持未认证，并给出可机器读取的可选接入建议。
 - 下一阶段按用户价值、协议稳定性和维护成本排序，实现首个新增真实 Adapter 与公开一致性套件。
+
+### F3：公共 Adapter Kit 与 OpenCode 执行器
+[deps: F2, E2] [status: completed]
+
+- 将既有私有 CLI 基类深化为公共 `CliAgentAdapter`，集中提供参数数组执行、环境隔离、超时、进程故障和工具映射，不建立第二套 `AgentExecutor` 接口。
+- OpenCode 使用官方 `opencode run --format json --pure` 非交互协议，最后一个文本事件形成结构化结果，逐步事件聚合 Token 与费用，会话 ID 归一化但产品会话不进入迁移包。
+- 工具权限通过 `OPENCODE_PERMISSION` 默认拒绝后按 `read / shell / edit / write` 最小放行；禁用项目配置、外部插件和交互提问，不使用危险的 `--auto`。
+- OpenCode 不宣称 CLI 未提供的硬费用上限；实际费用、延迟、成功与故障仍通过既有 Registry → PolicyRouter seam 进入脱敏 RSI 观测。
+- 以官方 v1.18.18 Darwin arm64 发布二进制完成 `--version` 与 `run --help` 只读验收，并将版本、平台、协议与制品摘要写入兼容证据。
+- 将 OpenCode 从 discovery-only 提升到认证 Adapter；OpenClaw、Hermes、Aider、Gemini CLI 与 GitHub Copilot CLI 继续保持仅发现和失败关闭。
+- 下一阶段先在内置执行器之外验证公共 Kit 的兼容面，再按用户价值、协议稳定性、权限控制与维护成本选择 OpenClaw 或 Hermes 作为下一项 Adapter。

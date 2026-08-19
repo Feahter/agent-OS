@@ -4,6 +4,7 @@
 
 ## Unreleased
 
+- 提供公共 `CliAgentAdapter` 开发包，并新增经过版本/平台认证的 OpenCode JSONL 执行器、默认拒绝权限、故障注入和 RSI 费用观测。
 - 修复 Intel macOS 上 Codex 启动脚本存在但架构原生程序缺失时仍被注册的问题，并将平台纳入兼容认证。
 - 增加目标意图编译、五类高频任务模板、显式约束与可审阅计划摘要。
 - 自动识别 Python、Node、Rust、Go 和 Make 项目验证命令；关键上下文缺失时在 Agent 调用前停止。
