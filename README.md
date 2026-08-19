@@ -75,7 +75,8 @@ agent-os demo examples/minimal_graph.json --work-dir /tmp/agent-os-demo
 ```
 
 `setup` initializes the local portable state, inspects Python, filesystem semantics,
-Codex, Claude Code, Pi and optional Orca, then prints prioritized repair steps. It
+Codex, Claude Code, Pi and optional Orca, then discovers other installed Agent tools
+including OpenCode, OpenClaw and Hermes Agent. It prints prioritized repair steps,
 uses only help/version probes and makes zero model calls. Add `--json` for the
 versioned diagnostic contract or `--home /path/to/state` to choose another local
 state directory.
@@ -234,6 +235,21 @@ A node can read only declared artifacts and must produce exactly its declared ou
 | Orca | `1.4.180` | `orca-json-command-v1` | Graph compiler, backend and coordinator |
 
 Adapters translate the common `read / shell / edit / write` tool contract into each product's protocol. The versions above were verified on Darwin arm64 on 2026-08-18. Evidence is version-controlled and travels with release bundles. Certification is platform-scoped: the same version on another OS or architecture is reported as `unverified_platform` and is not included in `ready_executors`.
+
+Setup also recognizes the following tools without treating them as executable Adapters:
+
+| Discovered tool | Safe command probe | Agent OS status |
+| --- | --- | --- |
+| [OpenCode](https://opencode.ai/) | `opencode` | Discovery only; Adapter pending |
+| [OpenClaw](https://openclaw.ai/) | `openclaw` | Discovery only; Adapter pending |
+| [Hermes Agent](https://github.com/NousResearch/hermes-agent) | `hermes` | Discovery only; Adapter pending |
+| [Aider](https://aider.chat/) | `aider` | Discovery only; Adapter pending |
+| [Gemini CLI](https://github.com/google-gemini/gemini-cli) | `gemini` | Discovery only; Adapter pending |
+| [GitHub Copilot CLI](https://github.com/github/copilot-cli) | `copilot` | Discovery only; Adapter pending |
+
+Discovery reports installation, path, version-probe state and integration state in
+`discovered_agents`. A tool remains outside `ready_executors` until its real Adapter,
+protocol conformance tests and version/platform compatibility evidence are complete.
 
 Codex discovery runs a safe startup probe, while diagnostics run help and version probes; neither calls a model, and Orca's version is read from its application bundle. Codex discovery executes `codex exec --help` before registration because an executable npm launcher does not prove that its architecture-specific native binary is present. Codex `0.148.0-alpha.9` is not certified for Darwin x86_64. An exact version and platform evidence match is verified, a compatible unknown version or platform is warned but not certified as ready, and missing executables or protocol features fail closed.
 

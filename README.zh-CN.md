@@ -75,8 +75,9 @@ agent-os demo examples/minimal_graph.json --work-dir /tmp/agent-os-demo
 ```
 
 `setup` 会初始化本地可迁移状态，检查 Python、文件系统语义、Codex、Claude
-Code、Pi 和可选 Orca，并按优先级给出修复步骤。它只执行 help/version 探测，
-不会调用模型。需要版本化诊断数据时使用 `--json`，需要更换本地状态目录时使用
+Code、Pi 和可选 Orca，并发现 OpenCode、OpenClaw、Hermes Agent 等已安装的
+Agent 工具，再按优先级给出修复步骤。它只执行 help/version 探测，不会调用模型。
+需要版本化诊断数据时使用 `--json`，需要更换本地状态目录时使用
 `--home /path/to/state`。
 
 ### 日常任务入口
@@ -233,6 +234,21 @@ resident.start_background()
 | Orca | `1.4.180` | `orca-json-command-v1` | 图编译器、后端与协调器 |
 
 Adapter 会把统一的 `read / shell / edit / write` 工具契约翻译成各产品协议。上述版本于 2026-08-18 在 Darwin arm64 上完成只读协议验收，证据保存在版本库并随发行包迁移。认证范围包含平台：同一版本出现在其他操作系统或架构时会标记为 `unverified_platform`，且不会进入 `ready_executors`。
+
+Setup 还会识别下列工具，但不会把它们误当成可执行 Adapter：
+
+| 已发现工具 | 安全命令探测 | Agent OS 状态 |
+| --- | --- | --- |
+| [OpenCode](https://opencode.ai/) | `opencode` | 仅发现；Adapter 待实现 |
+| [OpenClaw](https://openclaw.ai/) | `openclaw` | 仅发现；Adapter 待实现 |
+| [Hermes Agent](https://github.com/NousResearch/hermes-agent) | `hermes` | 仅发现；Adapter 待实现 |
+| [Aider](https://aider.chat/) | `aider` | 仅发现；Adapter 待实现 |
+| [Gemini CLI](https://github.com/google-gemini/gemini-cli) | `gemini` | 仅发现；Adapter 待实现 |
+| [GitHub Copilot CLI](https://github.com/github/copilot-cli) | `copilot` | 仅发现；Adapter 待实现 |
+
+发现结果会在 `discovered_agents` 中报告安装路径、版本探测状态和接入状态。只有
+真实 Adapter、协议一致性测试和版本/平台兼容证据全部完成后，工具才会进入
+`ready_executors`。
 
 Codex 执行器发现会运行安全启动探测，诊断则运行帮助和版本探测；两者都不会调用模型，Orca 版本从应用包读取。Codex 在注册前会运行 `codex exec --help`，因为 npm 启动脚本可执行并不能证明对应架构的原生程序实际存在。Codex `0.148.0-alpha.9` 尚未在 Darwin x86_64 上通过认证。版本和平台与证据完全匹配时才标记为已验证；协议匹配但版本或平台未知时只警告且不认证为可执行；程序缺失或协议缺项则失败关闭。
 

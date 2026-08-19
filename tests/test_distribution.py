@@ -25,10 +25,11 @@ def fake_probe_environment(distribution):
         item["command"]: item["support"]["verified_versions"][0]["version"]
         for item in matrix["adapters"]
     }
+    supported_commands = set(flags)
     calls = []
 
     def which(command):
-        return f"/fake/{command}"
+        return f"/fake/{command}" if command in supported_commands else None
 
     def runner(command, timeout_seconds):
         calls.append(tuple(command))
@@ -62,11 +63,12 @@ class DistributionTests(unittest.TestCase):
             item["check_id"]: item["status"] for item in report["checks"]
         }
         self.assertTrue(report["healthy"])
-        self.assertEqual(3, report["diagnostic_schema_version"])
+        self.assertEqual(4, report["diagnostic_schema_version"])
         self.assertEqual("ready", report["readiness"])
         self.assertEqual([], report["blocking_checks"])
         self.assertEqual([], report["next_actions"])
         self.assertTrue(report["ready_for_agent_execution"])
+        self.assertEqual([], report["discovered_agents"])
         self.assertEqual(
             ["claude-code", "codex", "pi-agent"], report["ready_executors"]
         )
@@ -219,6 +221,71 @@ class DistributionTests(unittest.TestCase):
             ),
         )
 
+    def test_setup_discovers_unintegrated_agents_without_marking_them_ready(self):
+        calls = []
+
+        def which(command):
+            return "/fake/opencode" if command == "opencode" else None
+
+        def runner(command, timeout_seconds):
+            calls.append(tuple(command))
+            if command[-1] == "--version":
+                return subprocess.CompletedProcess(
+                    command, 0, stdout="opencode 1.2.3", stderr=""
+                )
+            return subprocess.CompletedProcess(command, 0, stdout="usage", stderr="")
+
+        distribution = AgentOSDistribution(
+            PROJECT_ROOT, which=which, runner=runner
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            report = distribution.setup(Path(directory) / "agent-os")
+
+        self.assertEqual([], report["ready_executors"])
+        self.assertFalse(report["ready_for_agent_execution"])
+        self.assertEqual("needs_agent", report["readiness"])
+        self.assertEqual(1, len(report["discovered_agents"]))
+        discovered = report["discovered_agents"][0]
+        self.assertEqual("opencode", discovered["agent_id"])
+        self.assertEqual("installed_unverified", discovered["discovery_status"])
+        self.assertEqual("adapter_not_available", discovered["integration_status"])
+        self.assertEqual(
+            [
+                ("/fake/opencode", "--help"),
+                ("/fake/opencode", "--version"),
+            ],
+            calls,
+        )
+        action = next(
+            item
+            for item in report["next_actions"]
+            if item["check_id"] == "discovery:opencode"
+        )
+        self.assertEqual("integrate_discovered_agent", action["action_id"])
+        self.assertEqual("optional", action["priority"])
+
+    def test_discovery_version_failure_never_promotes_agent(self):
+        def which(command):
+            return "/fake/hermes" if command == "hermes" else None
+
+        def runner(command, timeout_seconds):
+            if command[-1] == "--version":
+                return subprocess.CompletedProcess(command, 2, stdout="", stderr="bad")
+            return subprocess.CompletedProcess(command, 0, stdout="usage", stderr="")
+
+        distribution = AgentOSDistribution(
+            PROJECT_ROOT, which=which, runner=runner
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            agent_os = AgentOS(Path(directory) / "agent-os")
+            report = distribution.doctor(agent_os.root)
+
+        self.assertEqual([], report["ready_executors"])
+        self.assertEqual(
+            "version_unknown",
+            report["discovered_agents"][0]["discovery_status"],
+        )
+
     def test_setup_does_not_initialize_an_existing_nonempty_directory(self):
         distribution = AgentOSDistribution(PROJECT_ROOT, which=lambda command: None)
         with tempfile.TemporaryDirectory() as directory:
@@ -248,6 +315,13 @@ class DistributionTests(unittest.TestCase):
             "root": "/tmp/agent-os",
             "readiness": "ready_with_warnings",
             "ready_executors": ["codex"],
+            "discovered_agents": [
+                {
+                    "agent_id": "opencode",
+                    "display_name": "OpenCode",
+                    "discovery_status": "installed_unverified",
+                }
+            ],
             "ready_for_agent_execution": True,
             "ready_for_orca": False,
             "blocking_checks": [],
@@ -292,6 +366,7 @@ class DistributionTests(unittest.TestCase):
 
         self.assertIn("ready with warnings", human.getvalue())
         self.assertIn("0 model calls", human.getvalue())
+        self.assertIn("Discovered but not integrated: OpenCode", human.getvalue())
         self.assertIn("[optional] Install orca", human.getvalue())
         self.assertEqual(report, json.loads(machine.getvalue()))
 
@@ -356,7 +431,18 @@ class DistributionTests(unittest.TestCase):
 
         self.assertEqual([1, 2], matrix["state"]["importable_bundle_schema_versions"])
         self.assertEqual([], matrix["runtime"]["third_party_runtime_dependencies"])
-        self.assertEqual(2, matrix["matrix_schema_version"])
+        self.assertEqual(3, matrix["matrix_schema_version"])
+        self.assertEqual(
+            {
+                "opencode",
+                "openclaw",
+                "hermes",
+                "aider",
+                "gemini-cli",
+                "github-copilot-cli",
+            },
+            {item["agent_id"] for item in matrix["discoverable_agents"]},
+        )
         self.assertEqual(
             "help/version protocol inspection only; no model calls or Orca object creation",
             matrix["evidence"]["verification_scope"],

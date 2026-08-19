@@ -24,8 +24,8 @@ from .os import AGENT_OS_SCHEMA_VERSION, AgentOS
 
 
 RELEASE_SCHEMA_VERSION = 1
-DIAGNOSTIC_SCHEMA_VERSION = 3
-COMPATIBILITY_MATRIX_VERSION = 2
+DIAGNOSTIC_SCHEMA_VERSION = 4
+COMPATIBILITY_MATRIX_VERSION = 3
 _RELEASE_KIND = "grapheng-agent-os-release"
 _MINIMUM_PYTHON = (3, 9)
 _SOURCE_FILES = (
@@ -82,6 +82,16 @@ class _CommandProbe:
     role: str = "agent"
 
 
+@dataclass(frozen=True)
+class _DiscoveryProbe:
+    agent_id: str
+    display_name: str
+    commands: Tuple[str, ...]
+    homepage: str
+    help_arguments: Tuple[str, ...] = ("--help",)
+    version_arguments: Tuple[str, ...] = ("--version",)
+
+
 _COMMAND_PROBES = (
     _CommandProbe(
         "claude-code",
@@ -136,6 +146,45 @@ _COMMAND_PROBES = (
             "question_reply",
         ),
         role="orchestration",
+    ),
+)
+
+_DISCOVERY_PROBES = (
+    _DiscoveryProbe(
+        "opencode",
+        "OpenCode",
+        ("opencode",),
+        "https://opencode.ai/",
+    ),
+    _DiscoveryProbe(
+        "openclaw",
+        "OpenClaw",
+        ("openclaw",),
+        "https://openclaw.ai/",
+    ),
+    _DiscoveryProbe(
+        "hermes",
+        "Hermes Agent",
+        ("hermes",),
+        "https://github.com/NousResearch/hermes-agent",
+    ),
+    _DiscoveryProbe(
+        "aider",
+        "Aider",
+        ("aider",),
+        "https://aider.chat/",
+    ),
+    _DiscoveryProbe(
+        "gemini-cli",
+        "Gemini CLI",
+        ("gemini",),
+        "https://github.com/google-gemini/gemini-cli",
+    ),
+    _DiscoveryProbe(
+        "github-copilot-cli",
+        "GitHub Copilot CLI",
+        ("copilot",),
+        "https://github.com/github/copilot-cli",
     ),
 )
 
@@ -209,6 +258,17 @@ class AgentOSDistribution:
                 }
                 for probe in _COMMAND_PROBES
             ],
+            "discoverable_agents": [
+                {
+                    "agent_id": probe.agent_id,
+                    "display_name": probe.display_name,
+                    "commands": list(probe.commands),
+                    "homepage": probe.homepage,
+                    "integration_status": "discovery_only",
+                    "diagnostic_side_effect": "help/version only; no model calls",
+                }
+                for probe in _DISCOVERY_PROBES
+            ],
             "evidence": {
                 "schema_version": evidence["schema_version"],
                 "verification_scope": evidence["verification_scope"],
@@ -242,6 +302,10 @@ class AgentOSDistribution:
         checks.append(self._filesystem_check(agent_os_root))
         checks.append(self._state_check(agent_os_root))
         checks.extend(self._command_check(probe) for probe in _COMMAND_PROBES)
+        discovery_checks = [
+            self._discovery_check(probe) for probe in _DISCOVERY_PROBES
+        ]
+        checks.extend(discovery_checks)
         statuses = {item.check_id: item.status for item in checks}
         ready_executors = [
             probe.probe_id
@@ -272,6 +336,11 @@ class AgentOSDistribution:
             "blocking_checks": blocking_checks,
             "ready_for_agent_execution": bool(ready_executors),
             "ready_executors": ready_executors,
+            "discovered_agents": [
+                dict(item.details)
+                for item in discovery_checks
+                if item.details["discovery_status"] != "not_installed"
+            ],
             "ready_for_orca": statuses.get("orchestration:orca") == "pass",
             "checks": [item.to_dict() for item in checks],
             "next_actions": self._next_actions(
@@ -638,6 +707,78 @@ class AgentOSDistribution:
             },
         )
 
+    def _discovery_check(self, probe: _DiscoveryProbe) -> DiagnosticCheck:
+        resolved = next(
+            (
+                (command, path)
+                for command in probe.commands
+                if (path := self._which(command)) is not None
+            ),
+            None,
+        )
+        base_details = {
+            "agent_id": probe.agent_id,
+            "display_name": probe.display_name,
+            "command_candidates": list(probe.commands),
+            "homepage": probe.homepage,
+            "integration_status": "adapter_not_available",
+        }
+        if resolved is None:
+            return DiagnosticCheck(
+                f"discovery:{probe.agent_id}",
+                "pass",
+                f"{probe.display_name} is not installed",
+                {**base_details, "discovery_status": "not_installed"},
+            )
+        command, path = resolved
+        installed_details = {**base_details, "command": command, "path": path}
+        try:
+            help_result = self._runner((path, *probe.help_arguments), 10)
+            version_result = self._runner((path, *probe.version_arguments), 10)
+        except (OSError, subprocess.SubprocessError) as error:
+            return DiagnosticCheck(
+                f"discovery:{probe.agent_id}",
+                "warn",
+                f"{probe.display_name} was found but could not be safely inspected",
+                {
+                    **installed_details,
+                    "discovery_status": "inspection_failed",
+                    "version": None,
+                    "error": str(error),
+                },
+            )
+        version_text = "\n".join(
+            (
+                version_result.stdout or "",
+                version_result.stderr or "",
+            )
+        )
+        match = _VERSION_PATTERN.search(version_text)
+        version = match.group(1) if match is not None else None
+        if help_result.returncode != 0:
+            discovery_status = "help_probe_failed"
+            summary = f"{probe.display_name} was found but its help probe failed"
+        elif version_result.returncode != 0 or version is None:
+            discovery_status = "version_unknown"
+            summary = f"{probe.display_name} was found but its version is unknown"
+        else:
+            discovery_status = "installed_unverified"
+            summary = (
+                f"{probe.display_name} was found, but no certified Agent OS Adapter exists"
+            )
+        return DiagnosticCheck(
+            f"discovery:{probe.agent_id}",
+            "warn",
+            summary,
+            {
+                **installed_details,
+                "discovery_status": discovery_status,
+                "version": version,
+                "help_exit_code": help_result.returncode,
+                "version_exit_code": version_result.returncode,
+            },
+        )
+
     def _next_actions(
         self,
         agent_os_root: Path,
@@ -726,6 +867,17 @@ class AgentOSDistribution:
                 "priority": "required",
                 "summary": "Initialize or restore the Agent OS state directory.",
                 "command": list(rerun),
+            }
+        if check_id.startswith("discovery:"):
+            target = check.details["display_name"]
+            return {
+                "action_id": "integrate_discovered_agent",
+                "check_id": check_id,
+                "priority": "optional",
+                "summary": (
+                    f"{target} is installed but not yet available to Agent OS; "
+                    "add and certify an Adapter before enabling it for execution."
+                ),
             }
         if not check_id.startswith(("adapter:", "orchestration:")):
             return None

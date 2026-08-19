@@ -226,3 +226,13 @@
 - 默认输出面向人的摘要，`--json` 保留版本化机器契约；两种输出共享同一诊断事实。
 - Setup 只执行本地文件系统与 help/version 探测，明确记录 0 次模型调用，不创建 Orca 对象。
 - 全新机器安装演练和真实 Agent/Orca 灰度仍作为外部证据门槛，不由离线测试替代。
+
+### F2：扩展本地 Agent 发现
+[deps: F1] [status: completed]
+
+- Setup 增加 OpenCode、OpenClaw、Hermes Agent、Aider、Gemini CLI 与 GitHub Copilot CLI 的零模型发现。
+- 复用 `AgentOSDistribution` 诊断 seam，不建立第二套发现控制面。
+- 严格分离 discovery-only inventory 与已认证 Adapter；仅发现的工具不得进入 `ready_executors`。
+- 只执行 `--help / --version`，记录安装路径、版本状态和接入状态；未安装不降低健康度。
+- 版本未知、help 失败或探测异常均保持未认证，并给出可机器读取的可选接入建议。
+- 下一阶段按用户价值、协议稳定性和维护成本排序，实现首个新增真实 Adapter 与公开一致性套件。

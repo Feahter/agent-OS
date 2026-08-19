@@ -80,13 +80,14 @@ Let a new user complete a real task in minutes without writing a graph or comple
 Key outcomes:
 
 - One-command installation, environment diagnosis and agent discovery.
+- Discovery-only inventory for additional local Agents, kept separate from certified execution.
 - A natural-language `agent-os do` entry point and an intent-to-graph compiler.
 - Templates for fixes, tests, refactors, research and release preparation.
 - Safe defaults and questions only when critical context is missing.
 - Human-readable progress, errors and results rather than internal JSON noise.
 - Real end-to-end compatibility tests for Codex, Claude Code, Pi and Orca.
 
-Preview status: the unified task actions, intent compiler, five initial templates, resident execution and a human-readable `agent-os setup` journey are implemented. Setup safely initializes local state, classifies readiness and emits structured remediation without model calls. The remaining gate is clean-machine rehearsal backed by the authorized real-project pilots.
+Preview status: the unified task actions, intent compiler, five initial templates, resident execution and a human-readable `agent-os setup` journey are implemented. Setup safely initializes local state, classifies readiness and emits structured remediation without model calls. It now recognizes OpenCode, OpenClaw, Hermes Agent, Aider, Gemini CLI and GitHub Copilot CLI without promoting unverified tools into execution. The remaining gates are clean-machine rehearsal, certified Adapters for prioritized discovered tools and authorized real-project pilots.
 
 Exit gates: a new user starts a first task within five minutes; common single-repository tasks reach verified results; interrupted tasks resume with one command.
 

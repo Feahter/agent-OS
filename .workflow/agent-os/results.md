@@ -201,3 +201,25 @@ Adapter 与 Orca 集成测试使用本地假 CLI，覆盖真实参数调用和�
 - 实时操作台是单机 loopback 前台进程，不是远程多用户管理面。
 - 受控合并已具备临时仓库端到端验证，尚未在真实用户项目与真实 Orca worker 上执行验收。
 - `release-manifest.json` 是完整性与发行身份清单，不是带私钥信任根的密码学签名。
+
+## 扩展本地 Agent 发现（2026-08-19）
+
+- `agent-os setup` 新增 OpenCode、OpenClaw、Hermes Agent、Aider、Gemini CLI 与 GitHub Copilot CLI 发现。
+- 已安装但未接入的工具进入 `discovered_agents`，并显示为 `discovered but not integrated`；不会进入 `ready_executors`。
+- 未安装状态不产生噪声或降低健康度；help/version 异常保持未认证并给出稳定诊断状态。
+- Compatibility matrix 公开 discovery-only inventory，后续真实 Adapter 必须另行补齐协议测试与版本/平台证据。
+- 全部探测仅调用 help/version，本阶段没有执行 Agent 任务或触发模型调用。
+
+```text
+PYTHONPATH=. python3 -m unittest discover -s tests -v
+Ran 218 tests — OK
+
+PYTHONPYCACHEPREFIX=/tmp/agent-os-discovery-pycache python3 -m compileall -q grapheng tests
+通过
+
+uv build --offline
+sdist 与 wheel 构建成功
+
+agent-os setup --home /tmp/agent-os-discovery-smoke-20260819 --source-root .
+本机初始化成功，显示 0 次模型调用；新增候选均未安装，未产生误发现或误认证
+```

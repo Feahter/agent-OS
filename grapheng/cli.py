@@ -406,6 +406,11 @@ def _print_setup(value, json_output: bool) -> None:
     print(f"State: {state} · {value['root']}")
     executors = ", ".join(value["ready_executors"]) or "none"
     print(f"Ready coding Agents: {executors}")
+    discovered = ", ".join(
+        item["display_name"] for item in value.get("discovered_agents", [])
+    )
+    if discovered:
+        print(f"Discovered but not integrated: {discovered}")
     print(f"Orca: {'ready' if value['ready_for_orca'] else 'not ready'}")
     print("Safety: environment inspection only · 0 model calls")
     notable = [item for item in value["checks"] if item["status"] != "pass"]
