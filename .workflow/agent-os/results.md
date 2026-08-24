@@ -247,3 +247,25 @@ sdist 与 wheel 构建成功
 官方 opencode-darwin-arm64 v1.18.18 --version / run --help
 版本与 --format、--model、--pure 协议验收通过；未安装、未调用模型
 ```
+
+## 运行时兼容认证硬闸门与本地入口（2026-08-24）
+
+- `AgentOSDistribution.certified_adapter_commands()` 成为 setup 与运行时发现共用的认证事实源；原先 Codex/OpenCode 独立 help 探测旁路已移除。
+- 协议匹配但版本或平台未认证的 Agent 不再进入 `ExecutorRegistry`，在模型调用前失败关闭；新增回归用例固定该行为。
+- 本机 Codex `0.149.0-alpha.4.1` 与 Claude Code `2.1.241` 已通过 Darwin arm64 的 `--version / --help` 零模型验收并写入兼容证据。
+- `agent-os` 已作为独立 uv tool 安装到 `~/.local/bin`；正式命令入口报告 Claude Code、Codex、Pi 可执行，Orca 就绪，OpenCode 为可选缺失项。
+- 本阶段没有调用模型、创建 Orca Run/Task/Dispatch 或修改外部项目；真实灰度仍等待明确项目、预算、停止条件和人工介入记录。
+
+```text
+PYTHONPATH=. python3 -m unittest discover -s tests -v
+Ran 229 tests — OK
+
+PYTHONPYCACHEPREFIX=/tmp/agent-os-certification-pycache python3 -m compileall -q grapheng tests
+通过
+
+uv build --offline --cache-dir /tmp/agent-os-uv-cache
+sdist 与 wheel 构建成功
+
+agent-os setup --home /tmp/agent-os-installed-cli-relative-20260824 --source-root .
+ready with warnings；Claude Code、Codex、Pi 已认证，Orca ready，0 次模型调用
+```

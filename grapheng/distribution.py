@@ -304,6 +304,17 @@ class AgentOSDistribution:
             },
         }
 
+    def certified_adapter_commands(self) -> Mapping[str, str]:
+        commands = {}
+        for probe in _COMMAND_PROBES:
+            if probe.role != "agent":
+                continue
+            check = self._command_check(probe)
+            path = check.details.get("path")
+            if check.status == "pass" and isinstance(path, str):
+                commands[probe.probe_id] = path
+        return commands
+
     def doctor(self, agent_os_root: Path) -> Mapping[str, Any]:
         checks = [self._python_check(), self._source_check()]
         checks.append(self._filesystem_check(agent_os_root))

@@ -47,7 +47,7 @@ These actions should sit at deep module seams: the public interface stays small 
 
 ## Current delivery snapshot
 
-As of 2026-08-19, the repository is published as the `0.0.1` preview, while implementation has already reached into several 0.1 and 0.2 capabilities. The milestone numbers below describe maturity and user evidence, not whether the first implementation exists.
+As of 2026-08-24, the repository is published as the `0.0.1` preview, while implementation has already reached into several 0.1 and 0.2 capabilities. The milestone numbers below describe maturity and user evidence, not whether the first implementation exists.
 
 | Work package | Status | Evidence and remaining gate |
 | --- | --- | --- |
@@ -56,7 +56,7 @@ As of 2026-08-19, the repository is published as the `0.0.1` preview, while impl
 | P2: unified task interface | Complete in preview | `do / status / approve / control / result` share one task state and preserve GraphSpec as the advanced interface. |
 | P3: intent compilation | Complete in preview | Fix, test, refactor, research and release-preparation goals compile into reviewable plans with safe defaults. |
 | P4: resident coordination | Complete in preview | Background queues, priority, pause/resume/cancel, crash recovery, task summaries, notifications and the Orca lifecycle share one control plane. |
-| P5: compatibility and faults | P5.1–P5.2 complete; P5.3 pending | Versioned, platform-scoped protocol evidence, offline fault injection and a zero-model first-use setup with actionable remediation exist. Current certification is Darwin arm64; clean-machine and real model-output/Orca lifecycle pilots remain pending. |
+| P5: compatibility and faults | P5.1–P5.2 complete; P5.3 pending | Versioned, platform-scoped protocol evidence, runtime certification enforcement, offline fault injection and a zero-model first-use setup with actionable remediation exist. Current certification is Darwin arm64; clean-machine and real model-output/Orca lifecycle pilots remain pending. |
 | P6: personal RSI and cost | Pending | Starts after the real-project baseline. User-controlled memory and policy gains must remain inspectable, reversible and bounded by frozen quality gates. |
 
 The combined P1.4/P5.3 pilot is the only near-term package that intentionally spends model tokens or modifies external projects. It must remain opt-in with named projects, budgets, stop conditions and recorded intervention.

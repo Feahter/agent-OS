@@ -4,6 +4,7 @@
 
 ## Unreleased
 
+- 将协议、版本和平台兼容证据提升为运行时硬闸门；`setup` 未认证的 Agent 不再被真实任务发现，并补充本机 Codex `0.149.0-alpha.4.1` 与 Claude Code `2.1.241` 的 Darwin arm64 零模型证据。
 - 修复 Claude Code `--safe-mode` 在版本间漂移导致的启动失败；按本机协议自适应参数，同时始终保持安全模式环境隔离。
 - 将 Agent 节点 `max_tokens` 提升为执行器硬能力契约；无硬 Token 上限的执行器和 Orca worker 会在调用前失败关闭，复用键与并发预留同步纳入该边界。
 - 提供公共 `CliAgentAdapter` 开发包，并新增经过版本/平台认证的 OpenCode JSONL 执行器、默认拒绝权限、故障注入和 RSI 费用观测。

@@ -247,3 +247,11 @@
 - 以官方 v1.18.18 Darwin arm64 发布二进制完成 `--version` 与 `run --help` 只读验收，并将版本、平台、协议与制品摘要写入兼容证据。
 - 将 OpenCode 从 discovery-only 提升到认证 Adapter；OpenClaw、Hermes、Aider、Gemini CLI 与 GitHub Copilot CLI 继续保持仅发现和失败关闭。
 - 下一阶段先在内置执行器之外验证公共 Kit 的兼容面，再按用户价值、协议稳定性、权限控制与维护成本选择 OpenClaw 或 Hermes 作为下一项 Adapter。
+
+### F4：运行时兼容认证硬闸门
+[deps: F1, F3] [status: completed]
+
+- `AgentOSDistribution` 继续作为协议、版本、平台和证据的单一事实源，并只向运行时返回已认证命令。
+- 本地执行器发现不再通过独立 help 探测绕过 setup 认证；未认证版本、平台与协议漂移均在模型调用前失败关闭。
+- 以零模型 `--version / --help` 探测补充 Codex `0.149.0-alpha.4.1` 与 Claude Code `2.1.241` 的 Darwin arm64 证据。
+- 真实项目与 Orca 灰度继续要求明确项目、预算、停止条件和人工介入记录，不由兼容探测替代。

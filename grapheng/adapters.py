@@ -545,20 +545,6 @@ class OpenCodeExecutor(CliAgentAdapter):
         )
 
 
-def _codex_is_usable(command: str) -> bool:
-    try:
-        completed = subprocess.run(
-            (command, "exec", "--help"),
-            capture_output=True,
-            text=True,
-            timeout=_DISCOVERY_PROBE_TIMEOUT_SECONDS,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return completed.returncode == 0
-
-
 def _claude_safe_mode_flag(command: Sequence[str]) -> Optional[bool]:
     try:
         completed = subprocess.run(
@@ -578,18 +564,25 @@ def _claude_safe_mode_flag(command: Sequence[str]) -> Optional[bool]:
     return "--safe-mode" in help_text
 
 
-def _opencode_is_usable(command: str) -> bool:
-    try:
-        completed = subprocess.run(
-            (command, "run", "--help"),
-            capture_output=True,
-            text=True,
-            timeout=_DISCOVERY_PROBE_TIMEOUT_SECONDS,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return completed.returncode == 0
+def _compatibility_probe(
+    command: Sequence[str], timeout_seconds: int
+) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        list(command),
+        capture_output=True,
+        text=True,
+        timeout=timeout_seconds,
+        check=False,
+    )
+
+
+def _certified_adapter_commands() -> Mapping[str, str]:
+    from .distribution import AgentOSDistribution
+
+    return AgentOSDistribution(
+        which=shutil.which,
+        runner=_compatibility_probe,
+    ).certified_adapter_commands()
 
 
 def discover_local_executors(
@@ -597,20 +590,21 @@ def discover_local_executors(
     reuse_store: Optional[VerifiedArtifactCache] = None,
 ) -> ExecutorRegistry:
     registry = ExecutorRegistry(router, reuse_store)
-    claude = shutil.which("claude")
+    certified = _certified_adapter_commands()
+    claude = certified.get("claude-code")
     if claude:
         safe_mode_flag = _claude_safe_mode_flag((claude,))
         if safe_mode_flag is not None:
             registry.register(
                 ClaudeCodeExecutor((claude,), safe_mode_flag=safe_mode_flag)
             )
-    pi = shutil.which("pi")
+    pi = certified.get("pi-agent")
     if pi:
         registry.register(PiAgentExecutor((pi,)))
-    codex = shutil.which("codex")
-    if codex and _codex_is_usable(codex):
+    codex = certified.get("codex")
+    if codex:
         registry.register(CodexExecutor((codex,)))
-    opencode = shutil.which("opencode")
-    if opencode and _opencode_is_usable(opencode):
+    opencode = certified.get("opencode")
+    if opencode:
         registry.register(OpenCodeExecutor((opencode,)))
     return registry

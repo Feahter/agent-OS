@@ -12,6 +12,13 @@
         "validated_at": "2026-08-18T08:58:53Z",
         "version": "2.1.234",
         "version_source": "claude --version"
+      },
+      {
+        "inspection": "installed Darwin arm64 CLI --version and --help only; no model call",
+        "protocol": "json-envelope-v1",
+        "validated_at": "2026-08-24T11:23:10Z",
+        "version": "2.1.241",
+        "version_source": "installed claude --version"
       }
     ],
     "codex": [
@@ -20,6 +27,13 @@
         "validated_at": "2026-08-18T08:58:53Z",
         "version": "0.148.0-alpha.9",
         "version_source": "codex --version"
+      },
+      {
+        "inspection": "installed Darwin arm64 CLI --version and exec --help only; no model call",
+        "protocol": "exec-jsonl-v1",
+        "validated_at": "2026-08-24T11:23:10Z",
+        "version": "0.149.0-alpha.4.1",
+        "version_source": "installed codex --version"
       }
     ],
     "opencode": [

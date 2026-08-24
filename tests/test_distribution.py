@@ -86,7 +86,7 @@ class DistributionTests(unittest.TestCase):
         )
         self.assertEqual("verified", codex["details"]["support_status"])
         self.assertEqual(
-            "2026-08-18T08:58:53Z", codex["details"]["last_verified_at"]
+            "2026-08-24T11:23:10Z", codex["details"]["last_verified_at"]
         )
         opencode = next(
             item

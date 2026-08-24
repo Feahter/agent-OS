@@ -231,13 +231,13 @@ A node can read only declared artifacts and must produce exactly its declared ou
 
 | Tool | Verified version (Darwin arm64) | Protocol | Integration |
 | --- | --- | --- | --- |
-| Codex | `0.148.0-alpha.9` | `exec-jsonl-v1` | Local CLI adapter |
-| Claude Code | `2.1.234` | `json-envelope-v1` | Local CLI adapter |
+| Codex | `0.148.0-alpha.9`, `0.149.0-alpha.4.1` | `exec-jsonl-v1` | Local CLI adapter |
+| Claude Code | `2.1.234`, `2.1.241` | `json-envelope-v1` | Local CLI adapter |
 | Pi | `0.84.1` | `message-end-jsonl-v1` | Local CLI adapter |
 | [OpenCode](https://opencode.ai/) | `1.18.18` | `run-jsonl-v1` | Local CLI adapter |
 | Orca | `1.4.180` | `orca-json-command-v1` | Graph compiler, backend and coordinator |
 
-Adapters translate the common `read / shell / edit / write` tool contract into each product's protocol. Claude Code discovery also adapts to versions that temporarily omit the `--safe-mode` flag: isolation remains enabled through `CLAUDE_CODE_SAFE_MODE=1`, while versions that expose the flag receive both forms. This is separate from `--permission-mode dontAsk`, which governs tool authorization rather than configuration isolation. The original tool set was verified on Darwin arm64 on 2026-08-18; OpenCode was verified from its official Darwin arm64 release binary on 2026-08-19. Evidence is version-controlled and travels with release bundles. Certification is platform-scoped: the same version on another OS or architecture is reported as `unverified_platform` and is not included in `ready_executors`.
+Adapters translate the common `read / shell / edit / write` tool contract into each product's protocol. Claude Code discovery also adapts to versions that temporarily omit the `--safe-mode` flag: isolation remains enabled through `CLAUDE_CODE_SAFE_MODE=1`, while versions that expose the flag receive both forms. This is separate from `--permission-mode dontAsk`, which governs tool authorization rather than configuration isolation. The original tool set was verified on Darwin arm64 on 2026-08-18; OpenCode was verified from its official Darwin arm64 release binary on 2026-08-19, and the installed Codex and Claude Code updates were verified on 2026-08-24. Evidence is version-controlled and travels with release bundles. Certification is platform-scoped and enforced during runtime discovery: a protocol-compatible but unverified version or platform remains visible in diagnostics but cannot execute a task.
 
 `CliAgentAdapter` is the public kit for new local CLI integrations. It centralizes bounded process execution, environment isolation, timeout and process-fault classification, while the existing `AgentExecutor` protocol remains the single runtime seam. OpenCode uses non-interactive JSONL, `--pure`, project-config isolation and deny-by-default permissions; it reports observed token and cost data but does not claim an unsupported hard cost limit. OpenCode owns its session persistence, so its product session data is not copied into Agent OS portable bundles.
 
@@ -255,7 +255,7 @@ Discovery reports installation, path, version-probe state and integration state 
 `discovered_agents`. A tool remains outside `ready_executors` until its real Adapter,
 protocol conformance tests and version/platform compatibility evidence are complete.
 
-Codex and OpenCode discovery run safe startup probes, while diagnostics run help and version probes; neither calls a model, and Orca's version is read from its application bundle. Codex discovery executes `codex exec --help` because an executable npm launcher does not prove that its architecture-specific native binary is present; OpenCode executes `opencode run --help` before registration. Codex `0.148.0-alpha.9` is not certified for Darwin x86_64. An exact version and platform evidence match is verified, a compatible unknown version or platform is warned but not certified as ready, and missing executables or protocol features fail closed.
+Runtime discovery and setup use the same help/version compatibility authority and neither calls a model; Orca's version can also be read from its application bundle. Codex executes `codex exec --help` because an executable launcher does not prove that its architecture-specific native binary is present; OpenCode executes `opencode run --help`. Codex is not certified for Darwin x86_64. Only an exact protocol, version and platform evidence match can enter the executor registry; unknown versions, platforms, missing executables and protocol drift fail closed before a model call.
 
 The offline fault baseline covers rate limits, timeouts, process crashes, damaged output and protocol drift. Rate limits and timeouts are classified as retryable while remaining governed by graph retry, budget and provider policies. A crashed process or unknown protocol can never be reported as a successful result.
 

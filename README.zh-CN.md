@@ -230,13 +230,13 @@ resident.start_background()
 
 | 工具 | 已验证版本（Darwin arm64） | 协议 | 接入方式 |
 | --- | --- | --- | --- |
-| Codex | `0.148.0-alpha.9` | `exec-jsonl-v1` | 本地 CLI Adapter |
-| Claude Code | `2.1.234` | `json-envelope-v1` | 本地 CLI Adapter |
+| Codex | `0.148.0-alpha.9`、`0.149.0-alpha.4.1` | `exec-jsonl-v1` | 本地 CLI Adapter |
+| Claude Code | `2.1.234`、`2.1.241` | `json-envelope-v1` | 本地 CLI Adapter |
 | Pi | `0.84.1` | `message-end-jsonl-v1` | 本地 CLI Adapter |
 | [OpenCode](https://opencode.ai/) | `1.18.18` | `run-jsonl-v1` | 本地 CLI Adapter |
 | Orca | `1.4.180` | `orca-json-command-v1` | 图编译器、后端与协调器 |
 
-Adapter 会把统一的 `read / shell / edit / write` 工具契约翻译成各产品协议。Claude Code 发现还会适配暂时没有 `--safe-mode` 参数的版本：隔离仍由 `CLAUDE_CODE_SAFE_MODE=1` 开启；参数存在时则同时使用两种入口。它与 `--permission-mode dontAsk` 并不等价，后者只管理工具授权，不负责隔离本地配置。原有工具于 2026-08-18 在 Darwin arm64 上完成只读协议验收，OpenCode 则于 2026-08-19 使用官方 Darwin arm64 发布二进制完成验收。证据保存在版本库并随发行包迁移。认证范围包含平台：同一版本出现在其他操作系统或架构时会标记为 `unverified_platform`，且不会进入 `ready_executors`。
+Adapter 会把统一的 `read / shell / edit / write` 工具契约翻译成各产品协议。Claude Code 发现还会适配暂时没有 `--safe-mode` 参数的版本：隔离仍由 `CLAUDE_CODE_SAFE_MODE=1` 开启；参数存在时则同时使用两种入口。它与 `--permission-mode dontAsk` 并不等价，后者只管理工具授权，不负责隔离本地配置。原有工具于 2026-08-18 在 Darwin arm64 上完成只读协议验收，OpenCode 于 2026-08-19 使用官方发布二进制完成验收，本机更新后的 Codex 与 Claude Code 于 2026-08-24 完成验收。证据保存在版本库并随发行包迁移。运行时会执行平台限定的认证硬闸门：协议兼容但版本或平台未认证时仍会出现在诊断中，但不能执行任务。
 
 `CliAgentAdapter` 是新增本地 CLI 集成的公共开发包。它统一有限进程执行、环境隔离、超时和进程故障分类，运行时仍只保留现有 `AgentExecutor` 这一条接缝。OpenCode 使用非交互 JSONL、`--pure`、项目配置隔离和默认拒绝权限；它会上报实际 Token 与费用供 RSI 学习，但不会伪装成支持硬费用上限。OpenCode 会话仍由产品自身持久化，其会话数据不会复制进 Agent OS 可迁移包。
 
@@ -254,7 +254,7 @@ Setup 还会识别下列工具，但不会把它们误当成可执行 Adapter：
 真实 Adapter、协议一致性测试和版本/平台兼容证据全部完成后，工具才会进入
 `ready_executors`。
 
-Codex 与 OpenCode 执行器发现会运行安全启动探测，诊断则运行帮助和版本探测；两者都不会调用模型，Orca 版本从应用包读取。Codex 在注册前运行 `codex exec --help`，因为 npm 启动脚本可执行并不能证明对应架构的原生程序实际存在；OpenCode 则先运行 `opencode run --help`。Codex `0.148.0-alpha.9` 尚未在 Darwin x86_64 上通过认证。版本和平台与证据完全匹配时才标记为已验证；协议匹配但版本或平台未知时只警告且不认证为可执行；程序缺失或协议缺项则失败关闭。
+运行时发现与 setup 共用同一个 help/version 兼容认证源，且都不会调用模型；Orca 版本还可从应用包读取。Codex 会运行 `codex exec --help`，因为启动脚本可执行并不能证明对应架构的原生程序实际存在；OpenCode 会运行 `opencode run --help`。Codex 尚未在 Darwin x86_64 上通过认证。只有协议、版本、平台与证据完全匹配的 Agent 才能进入执行器注册表；未知版本、未知平台、程序缺失或协议漂移都会在模型调用前失败关闭。
 
 离线故障基线覆盖限流、超时、进程崩溃、损坏输出和协议漂移。限流与超时被归类为可重试故障，但仍受图重试、预算和供应商治理约束；进程崩溃和未知协议不会被伪装成成功结果。
 

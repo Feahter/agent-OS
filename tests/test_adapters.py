@@ -62,14 +62,24 @@ class AdapterTests(unittest.TestCase):
         def which(command):
             return "/fake/codex" if command == "codex" else None
 
-        with patch("grapheng.adapters.shutil.which", side_effect=which), patch(
-            "grapheng.adapters.subprocess.run",
-            return_value=subprocess.CompletedProcess(
-                ("/fake/codex", "exec", "--help"),
+        def runner(command, **kwargs):
+            if command[-1] == "--version":
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout="codex-cli 0.149.0-alpha.4.1",
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(
+                command,
                 0,
                 stdout="--json --ephemeral --sandbox --output-schema",
                 stderr="",
-            ),
+            )
+
+        with patch("grapheng.adapters.shutil.which", side_effect=which), patch(
+            "grapheng.adapters.subprocess.run",
+            side_effect=runner,
         ):
             registry = discover_local_executors()
 
@@ -83,16 +93,23 @@ class AdapterTests(unittest.TestCase):
             return "/fake/opencode" if command == "opencode" else None
 
         for returncode, expected in ((0, ["opencode"]), (1, [])):
+            def runner(command, **kwargs):
+                if command[-1] == "--version":
+                    return subprocess.CompletedProcess(
+                        command, 0, stdout="opencode 1.18.18", stderr=""
+                    )
+                return subprocess.CompletedProcess(
+                    command,
+                    returncode,
+                    stdout="--format --model --pure",
+                    stderr="",
+                )
+
             with self.subTest(returncode=returncode), patch(
                 "grapheng.adapters.shutil.which", side_effect=which
             ), patch(
                 "grapheng.adapters.subprocess.run",
-                return_value=subprocess.CompletedProcess(
-                    ("/fake/opencode", "run", "--help"),
-                    returncode,
-                    stdout="--format --model",
-                    stderr="",
-                ),
+                side_effect=runner,
             ) as run:
                 registry = discover_local_executors()
 
@@ -100,9 +117,33 @@ class AdapterTests(unittest.TestCase):
                 expected,
                 [item.executor_id for item in registry.capabilities()],
             )
-            self.assertEqual(
-                ("/fake/opencode", "run", "--help"), run.call_args.args[0]
+            self.assertIn(
+                ["/fake/opencode", "run", "--help"],
+                [call.args[0] for call in run.call_args_list],
             )
+
+    def test_discovery_rejects_protocol_compatible_unverified_version(self):
+        def which(command):
+            return "/fake/codex" if command == "codex" else None
+
+        def runner(command, **kwargs):
+            if command[-1] == "--version":
+                return subprocess.CompletedProcess(
+                    command, 0, stdout="codex-cli 9.9.9", stderr=""
+                )
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout="--json --ephemeral --sandbox --output-schema",
+                stderr="",
+            )
+
+        with patch("grapheng.adapters.shutil.which", side_effect=which), patch(
+            "grapheng.adapters.subprocess.run", side_effect=runner
+        ):
+            registry = discover_local_executors()
+
+        self.assertEqual((), registry.capabilities())
 
     def test_claude_adapter_normalizes_result_and_usage(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -121,6 +162,10 @@ class AdapterTests(unittest.TestCase):
 
         def runner(command, **kwargs):
             calls.append((tuple(command), kwargs.get("env")))
+            if command[-1] == "--version":
+                return subprocess.CompletedProcess(
+                    command, 0, stdout="2.1.241 (Claude Code)", stderr=""
+                )
             if command[-1] == "--help":
                 return subprocess.CompletedProcess(
                     command,
