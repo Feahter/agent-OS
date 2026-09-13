@@ -3,19 +3,17 @@
 import hashlib
 import json
 import math
-import os
 import re
 import statistics
-import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple
 
+from ._store import exclusive_json_write, read_json_object
 from .engineering import ENGINEERING_REPORT_SCHEMA_VERSION
 from .errors import ContractViolation
 from .routing import DATA_CLASSIFICATIONS
-
 
 EVALUATION_CASE_SCHEMA_VERSION = 1
 EVALUATION_RECORD_SCHEMA_VERSION = 1
@@ -61,40 +59,6 @@ def _unit_interval(value: Any, field: str) -> float:
     if number > 1:
         raise ContractViolation(f"{field} must be between zero and one")
     return number
-
-
-def _exclusive_json_write(path: Path, value: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handle = tempfile.NamedTemporaryFile(
-        mode="w", encoding="utf-8", dir=str(path.parent), delete=False
-    )
-    try:
-        with handle:
-            json.dump(
-                value,
-                handle,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.link(handle.name, path)
-    finally:
-        if os.path.exists(handle.name):
-            os.unlink(handle.name)
-
-
-def _read_json(path: Path, field: str) -> Mapping[str, Any]:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError as error:
-        raise ContractViolation(f"{field} does not exist: {path}") from error
-    except (OSError, json.JSONDecodeError) as error:
-        raise ContractViolation(f"cannot read {field}: {error}") from error
-    if not isinstance(value, dict):
-        raise ContractViolation(f"{field} must be a JSON object")
-    return value
 
 
 def _failure_category(value: Any) -> Optional[str]:
@@ -182,7 +146,7 @@ class EvaluationCase:
 
     @classmethod
     def load(cls, path: Path) -> "EvaluationCase":
-        return cls.from_dict(_read_json(path, "evaluation case"))
+        return cls.from_dict(read_json_object(path, label="evaluation case"))
 
 
 @dataclass(frozen=True)
@@ -390,7 +354,7 @@ class EvaluationLab:
                 f"evaluation run already recorded: {record.run_id}"
             )
         try:
-            _exclusive_json_write(target, record.to_dict())
+            exclusive_json_write(target, record.to_dict())
         except FileExistsError as error:
             raise ContractViolation(
                 f"evaluation run already recorded: {record.run_id}"
@@ -410,7 +374,7 @@ class EvaluationLab:
         record = EvaluationRecord.from_engineering_report(
             case,
             run_id,
-            _read_json(report_path, "engineering report"),
+            read_json_object(report_path, label="engineering report"),
             user_inputs,
             human_decisions,
             recovery_attempted,
@@ -425,7 +389,7 @@ class EvaluationLab:
             if path.is_symlink():
                 raise ContractViolation("evaluation records cannot contain symlinks")
             records.append(
-                EvaluationRecord.from_dict(_read_json(path, "evaluation record"))
+                EvaluationRecord.from_dict(read_json_object(path, label="evaluation record"))
             )
         return tuple(records)
 
@@ -522,7 +486,7 @@ class EvaluationLab:
             "summary": summary,
         }
         try:
-            _exclusive_json_write(target, value)
+            exclusive_json_write(target, value)
         except FileExistsError as error:
             raise ContractViolation(
                 f"evaluation baseline already exists: {name}"

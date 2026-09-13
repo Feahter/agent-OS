@@ -3,7 +3,7 @@ import json
 import threading
 from copy import deepcopy
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from .errors import ContractViolation
 
@@ -43,7 +43,7 @@ class ArtifactRecord:
 class ArtifactStore:
     def __init__(self, records: Iterable[ArtifactRecord] = ()):
         self._lock = threading.Lock()
-        self._records = {}
+        self._records: Dict[str, List[ArtifactRecord]] = {}
         for record in sorted(records, key=lambda item: (item.key, item.version)):
             normalized, checksum = _normalize(record.value)
             if checksum != record.checksum:

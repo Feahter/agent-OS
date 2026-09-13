@@ -59,4 +59,49 @@ grapheng = ["compatibility-evidence.json"]
 dev = [
   "pytest>=8",
   "pytest-asyncio>=0.24",
+  "ruff>=0.6",
+  "mypy>=1.11",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+  "E",
+  "F",
+  "I",
+  "UP",
+  "B",
+  "C4",
+  "SIM",
+  "RUF",
+]
+ignore = [
+  "E501",
+  "UP006",
+  "UP007",
+  "UP035",
+  "UP045",
+  "B008",
+  "SIM108",
+  "SIM117",
+  "RUF001",
+  "RUF002",
+  "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402"]
+
+[tool.mypy]
+files = ["grapheng"]
+ignore_missing_imports = true
+warn_unused_ignores = true
+no_implicit_optional = true
+check_untyped_defs = true
+disallow_untyped_defs = false

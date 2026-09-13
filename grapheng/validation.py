@@ -4,12 +4,11 @@ from typing import Dict, List, Mapping, Set, Tuple
 from .errors import GraphValidationError
 from .model import GraphSpec, NodeSpec
 
-
 CANONICAL_AGENT_TOOLS = {"edit", "read", "shell", "write"}
 
 
 def _topological_order(nodes: Mapping[str, NodeSpec]) -> Tuple[List[str], List[str]]:
-    indegree = {node_id: 0 for node_id in nodes}
+    indegree = dict.fromkeys(nodes, 0)
     children = defaultdict(list)
     issues = []
     for node in nodes.values():
@@ -36,7 +35,7 @@ def _topological_order(nodes: Mapping[str, NodeSpec]) -> Tuple[List[str], List[s
 
 
 def _ancestors(order: List[str], nodes: Mapping[str, NodeSpec]) -> Dict[str, Set[str]]:
-    result = {node_id: set() for node_id in nodes}
+    result: Dict[str, Set[str]] = {node_id: set() for node_id in nodes}
     for node_id in order:
         for dep in nodes[node_id].deps:
             result[node_id].add(dep)

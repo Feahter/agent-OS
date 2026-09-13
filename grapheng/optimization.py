@@ -1,9 +1,7 @@
 import hashlib
 import json
 import math
-import os
 import re
-import tempfile
 import threading
 import time
 import uuid
@@ -11,10 +9,14 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
+from ._store import (
+    append_jsonl,
+    atomic_json_write,
+    read_json,
+)
 from .errors import ContractViolation
 from .model import GraphSpec
 from .validation import validate_graph
-
 
 IDENTIFIER = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
 OPTIMIZATION_KINDS = ("prompt_template", "graph_topology")
@@ -112,7 +114,7 @@ class FailurePattern:
 
     def __post_init__(self) -> None:
         _identifier(self.task_type, "failure pattern task_type")
-        allowed = tuple(PROMPT_FAILURE_GUIDANCE) + ("race_condition",)
+        allowed = (*tuple(PROMPT_FAILURE_GUIDANCE), "race_condition")
         if self.failure_code not in allowed:
             raise ContractViolation(
                 "failure_code must be missing_evidence, format_mismatch, "
@@ -295,13 +297,13 @@ class RSIOptimizationLab:
         )
         path = self.root / "suites" / f"{suite.suite_id}.json"
         with self._lock:
-            existing = self._read_json(path, None)
+            existing = read_json(path, None)
             if existing is not None:
                 restored = RegressionSuite.from_dict(existing)
                 if restored.digest != digest:
                     raise ContractViolation("frozen regression suite digest mismatch")
                 return restored
-            _atomic_json_write(path, suite.to_dict())
+            atomic_json_write(path, suite.to_dict())
         return suite
 
     def propose(
@@ -546,16 +548,16 @@ class RSIOptimizationLab:
                 raise ContractViolation(
                     f"optimization candidate {candidate_id} changed after evaluation"
                 )
-            active = self._read_json(self.root / "active.json", {})
-            history = self._read_json(self.root / "history.json", {})
+            active = read_json(self.root / "active.json", {})
+            history = read_json(self.root / "history.json", {})
             previous_id = active.get(candidate.kind)
             if previous_id is not None:
                 history.setdefault(candidate.kind, []).append(previous_id)
                 previous = self._read_candidate(str(previous_id))
                 self._write_candidate(replace(previous, status="superseded"))
             active[candidate.kind] = candidate.candidate_id
-            _atomic_json_write(self.root / "active.json", active)
-            _atomic_json_write(self.root / "history.json", history)
+            atomic_json_write(self.root / "active.json", active)
+            atomic_json_write(self.root / "history.json", history)
             updated = replace(candidate, status="active")
             self._write_candidate(updated)
             return updated
@@ -564,13 +566,13 @@ class RSIOptimizationLab:
         if kind not in OPTIMIZATION_KINDS:
             raise ContractViolation("invalid optimization rollback kind")
         with self._lock:
-            active = self._read_json(self.root / "active.json", {})
+            active = read_json(self.root / "active.json", {})
             candidate_id = active.get(kind)
             if candidate_id is None:
                 raise ContractViolation(f"there is no active {kind} candidate")
             current = self._read_candidate(str(candidate_id))
             self._write_candidate(replace(current, status="rolled_back"))
-            history = self._read_json(self.root / "history.json", {})
+            history = read_json(self.root / "history.json", {})
             values = history.get(kind, [])
             previous_id = values.pop() if values else None
             if previous_id is None:
@@ -578,8 +580,8 @@ class RSIOptimizationLab:
             else:
                 active[kind] = previous_id
             history[kind] = values
-            _atomic_json_write(self.root / "active.json", active)
-            _atomic_json_write(self.root / "history.json", history)
+            atomic_json_write(self.root / "active.json", active)
+            atomic_json_write(self.root / "history.json", history)
             if previous_id is None:
                 return None
             previous = self._read_candidate(str(previous_id))
@@ -588,7 +590,7 @@ class RSIOptimizationLab:
             return restored
 
     def active_candidates(self) -> Mapping[str, OptimizationCandidate]:
-        active = self._read_json(self.root / "active.json", {})
+        active = read_json(self.root / "active.json", {})
         return {
             kind: self._read_candidate(str(candidate_id))
             for kind, candidate_id in active.items()
@@ -649,7 +651,10 @@ class RSIOptimizationLab:
                 "latency_increase_percent": latency_increase,
             }
         )
-        self._append_jsonl(self.root / "canary.jsonl", record)
+        with self._lock:
+            append_jsonl(
+                self.root / "canary.jsonl", record, label="canary observation"
+            )
         if not healthy:
             self.rollback(candidate.kind)
         return healthy
@@ -785,14 +790,14 @@ class RSIOptimizationLab:
     @staticmethod
     def _in_rollout(candidate: OptimizationCandidate, key: str) -> bool:
         digest = hashlib.sha256(
-            f"{candidate.candidate_id}:{key}".encode("utf-8")
+            f"{candidate.candidate_id}:{key}".encode()
         ).digest()
         return int.from_bytes(digest[:4], "big") % 100 < candidate.rollout_percent
 
     def _read_suite(self, suite_id: str) -> RegressionSuite:
         if not suite_id.startswith("suite-") or "/" in suite_id:
             raise ContractViolation("invalid regression suite id")
-        value = self._read_json(
+        value = read_json(
             self.root / "suites" / f"{suite_id}.json", None
         )
         if value is None:
@@ -819,12 +824,12 @@ class RSIOptimizationLab:
         return self.root / "candidates" / f"{candidate_id}.json"
 
     def _write_candidate(self, candidate: OptimizationCandidate) -> None:
-        _atomic_json_write(
+        atomic_json_write(
             self._candidate_path(candidate.candidate_id), candidate.to_dict()
         )
 
     def _read_candidate(self, candidate_id: str) -> OptimizationCandidate:
-        value = self._read_json(self._candidate_path(candidate_id), None)
+        value = read_json(self._candidate_path(candidate_id), None)
         if value is None:
             raise ContractViolation(
                 f"optimization candidate {candidate_id} does not exist"
@@ -848,29 +853,6 @@ class RSIOptimizationLab:
             )
         return candidate
 
-    @staticmethod
-    def _read_json(path: Path, default: Any) -> Any:
-        if not path.exists():
-            return default
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
-            raise ContractViolation(
-                f"invalid optimization state {path.name}: {error}"
-            ) from error
-
-    def _append_jsonl(self, path: Path, value: Mapping[str, Any]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(
-            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        )
-        with self._lock:
-            with path.open("a", encoding="utf-8") as handle:
-                handle.write(line + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-
-
 def _increase_percent(baseline: float, measured: float) -> float:
     if baseline == 0:
         return 0.0 if measured == 0 else 1_000_000_000.0
@@ -889,25 +871,3 @@ def _candidate_change_digest(candidate: OptimizationCandidate) -> str:
         separators=(",", ":"),
     )
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
-
-
-def _atomic_json_write(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        dir=str(path.parent),
-        prefix=f".{path.name}.",
-        delete=False,
-    ) as handle:
-        json.dump(
-            value,
-            handle,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        handle.flush()
-        os.fsync(handle.fileno())
-        temporary = Path(handle.name)
-    temporary.replace(path)

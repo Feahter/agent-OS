@@ -1,59 +1,27 @@
 """Durable job adapters used by the local resident coordinator."""
 
-import json
-import os
-import tempfile
+import contextlib
 import time
 import uuid
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional, Tuple
 
+from ._store import (
+    atomic_json_write,
+    read_json_object,
+)
 from .adapters import discover_local_executors
 from .agent_nodes import AgentNodeHandler
-from .console import ApprovalInbox
 from .control import LocalControlPlane
 from .coordinator import OrcaCoordinator
 from .errors import ContractViolation
 from .model import GraphSpec
 from .orca import OrcaBackend, OrcaClient, OrcaGraphCompiler
-from .os import AgentOS
+from .os import AgentOS, state_root_for_home
 from .runtime import NodeRegistry
 
-
 _TERMINAL_PHASES = {"succeeded", "failed", "cancelled"}
-
-
-def _atomic_json_write(path: Path, value: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handle = tempfile.NamedTemporaryFile(
-        mode="w", encoding="utf-8", dir=str(path.parent), delete=False
-    )
-    try:
-        with handle:
-            json.dump(
-                value,
-                handle,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(handle.name, path)
-    finally:
-        if os.path.exists(handle.name):
-            os.unlink(handle.name)
-
-
-def _read_json(path: Path, field: str) -> Mapping[str, Any]:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise ContractViolation(f"cannot read resident {field}: {error}") from error
-    if not isinstance(value, dict):
-        raise ContractViolation(f"resident {field} must be an object")
-    return value
 
 
 class ResidentJobCatalog:
@@ -89,7 +57,7 @@ class AdvancedGraphJob:
         self.home = home
         self.control_root = home / "runtime" / "graphs"
         self.definition_root = home / "runtime" / "resident" / "definitions" / "graph"
-        self.agent_os = AgentOS(home / "state")
+        self.agent_os = AgentOS(state_root_for_home(home))
         self.inbox = self.agent_os.approval_inbox(self.control_root)
         self._registry_factory = registry_factory or self._default_registry
 
@@ -106,7 +74,7 @@ class AdvancedGraphJob:
             run_id = plane.prepare(graph)
         finally:
             plane.close()
-        _atomic_json_write(
+        atomic_json_write(
             self._definition_path(run_id),
             {"run_id": run_id, "workspace": str(workspace)},
         )
@@ -181,10 +149,8 @@ class AdvancedGraphJob:
                 except TimeoutError:
                     action = control_probe()
                     if action == "cancel":
-                        try:
+                        with contextlib.suppress(ContractViolation):
                             plane.cancel(run_id)
-                        except ContractViolation:
-                            pass
                     elif action == "pause":
                         pause_requested = True
         finally:
@@ -215,11 +181,21 @@ class AdvancedGraphJob:
             reuse_store=self.agent_os.reuse_store(),
         )
 
+    def projection_sources(self, run_id: str) -> Tuple[Path, ...]:
+        """Files whose change invalidates a cached projection for ``run_id``."""
+
+        run_root = self.control_root / "runs" / run_id
+        return (
+            self._definition_path(run_id),
+            run_root / "state.json",
+            run_root / "approvals.json",
+        )
+
     def _definition_path(self, run_id: str) -> Path:
         return self.definition_root / f"{run_id}.json"
 
     def _definition(self, run_id: str) -> Mapping[str, Any]:
-        value = _read_json(self._definition_path(run_id), "Graph definition")
+        value = read_json_object(self._definition_path(run_id), label="resident Graph definition")
         if set(value) != {"run_id", "workspace"} or value.get("run_id") != run_id:
             raise ContractViolation("resident Graph definition has an invalid contract")
         workspace = value.get("workspace")
@@ -240,7 +216,7 @@ class OrcaResidentJob:
     ):
         self.home = home
         self.root = home / "runtime" / "orca"
-        self.agent_os = AgentOS(home / "state")
+        self.agent_os = AgentOS(state_root_for_home(home))
         self._coordinator_factory = coordinator_factory or self._default_coordinator
 
     def prepare(self, graph: GraphSpec, workspace: Path) -> str:
@@ -250,7 +226,7 @@ class OrcaResidentJob:
             raise ContractViolation(f"resident Orca workspace does not exist: {workspace}")
         reference = f"orca-{uuid.uuid4().hex[:16]}"
         job_root = self.root / reference
-        _atomic_json_write(
+        atomic_json_write(
             job_root / "definition.json",
             {
                 "reference": reference,
@@ -355,9 +331,15 @@ class OrcaResidentJob:
             reuse_store=self.agent_os.reuse_store(),
         )
 
+    def projection_sources(self, reference: str) -> Tuple[Path, ...]:
+        """Files whose change invalidates a cached projection for ``reference``."""
+
+        job_root = self.root / reference
+        return (job_root / "definition.json", job_root / "state.json")
+
     def _definition(self, reference: str):
         job_root = self.root / reference
-        value = _read_json(job_root / "definition.json", "Orca definition")
+        value = read_json_object(job_root / "definition.json", label="resident Orca definition")
         if set(value) != {"reference", "workspace", "graph"} or value.get(
             "reference"
         ) != reference:

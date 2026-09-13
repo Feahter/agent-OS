@@ -8,7 +8,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple, Union
 
-from .agents import AgentExecution
+from . import telemetry
+from .agents import AgentExecution, ModelUsage
 from .artifacts import ArtifactRecord, ArtifactStore
 from .checkpoint import Checkpoint, CheckpointStore
 from .errors import ContractViolation, RetryableNodeError
@@ -47,6 +48,7 @@ class NodeOutcome:
     metadata: Mapping[str, Any] = field(default_factory=dict)
     cost_usd: Optional[float] = None
     agent_execution: Optional[AgentExecution] = None
+    usage: Optional[ModelUsage] = None
 
     def __post_init__(self) -> None:
         if (
@@ -62,6 +64,25 @@ class NodeOutcome:
             or self.cost_usd < 0
         ):
             raise ContractViolation("cost_usd must be a finite non-negative number")
+        usage = self.usage
+        if usage is None:
+            if self.agent_execution is not None:
+                usage = self.agent_execution.result.usage
+            elif self.tokens_used == 0 and self.cost_usd is None:
+                usage = ModelUsage.no_call()
+            else:
+                usage = ModelUsage.from_legacy_constructor(
+                    self.tokens_used, self.cost_usd
+                )
+            object.__setattr__(self, "usage", usage)
+        elif not isinstance(usage, ModelUsage):
+            raise ContractViolation("node usage must be ModelUsage")
+        assert usage is not None
+        if self.agent_execution is not None:
+            if usage.total_tokens != self.tokens_used:
+                raise ContractViolation("node usage total_tokens must match tokens_used")
+            if usage.cost_usd != self.cost_usd:
+                raise ContractViolation("node usage cost_usd must match cost_usd")
         try:
             json.dumps(self.metadata, ensure_ascii=False, sort_keys=True)
         except (TypeError, ValueError) as error:
@@ -163,6 +184,7 @@ class RunResult:
     tokens_used: int
     cost_usd: float
     artifacts: Mapping[str, Any]
+    usage: ModelUsage = field(default_factory=ModelUsage.no_call)
 
     @property
     def success(self) -> bool:
@@ -210,6 +232,16 @@ class GraphRuntime:
         self.event_sink.emit(
             GraphEvent.create(event, run_id, self.graph.id, node_id, attempt, payload)
         )
+        # The per-run sink stays the authoritative replay log; telemetry adds a
+        # host-wide trace that survives when a run directory is discarded.
+        telemetry.emit(
+            f"graph.{event}",
+            run_id=run_id,
+            graph_id=self.graph.id,
+            node_id=node_id,
+            attempt=attempt,
+            reason=(payload or {}).get("reason"),
+        )
 
     def _save(
         self,
@@ -219,6 +251,7 @@ class GraphRuntime:
         ledger: BudgetLedger,
         cost_ledger: CostBudgetLedger,
         artifacts: ArtifactStore,
+        usage: ModelUsage,
     ) -> None:
         if self.checkpoints is None:
             return
@@ -231,6 +264,7 @@ class GraphRuntime:
             ledger.used,
             cost_ledger.used,
             artifacts.records(),
+            usage,
         )
         with self._checkpoint_lock:
             self.checkpoints.save(checkpoint)
@@ -249,6 +283,7 @@ class GraphRuntime:
                 CostBudgetLedger(self.graph.max_cost_usd),
                 ArtifactStore(),
                 False,
+                ModelUsage.no_call(),
             )
         if checkpoint.graph_id != self.graph.id:
             raise ContractViolation("checkpoint graph_id does not match GraphSpec")
@@ -271,6 +306,7 @@ class GraphRuntime:
             CostBudgetLedger(self.graph.max_cost_usd, checkpoint.cost_usd),
             ArtifactStore(checkpoint.artifacts),
             True,
+            checkpoint.usage,
         )
 
     @staticmethod
@@ -284,6 +320,28 @@ class GraphRuntime:
         if node.agent is not None and node.agent.max_cost_usd is not None:
             return node.agent.max_cost_usd
         return node.estimated_cost_usd
+
+    def _critical_path_ranks(self) -> Mapping[str, int]:
+        nodes = self.graph.node_map()
+        remaining_children = {node.id: 0 for node in self.graph.nodes}
+        for node in self.graph.nodes:
+            for dependency in node.deps:
+                remaining_children[dependency] += 1
+
+        ranks = {node.id: 1 for node in self.graph.nodes}
+        ready = [
+            node.id
+            for node in self.graph.nodes
+            if remaining_children[node.id] == 0
+        ]
+        while ready:
+            node_id = ready.pop()
+            for dependency in nodes[node_id].deps:
+                ranks[dependency] = max(ranks[dependency], ranks[node_id] + 1)
+                remaining_children[dependency] -= 1
+                if remaining_children[dependency] == 0:
+                    ready.append(dependency)
+        return ranks
 
     @staticmethod
     def _execute(
@@ -372,9 +430,16 @@ class GraphRuntime:
         cancellation: Optional[CancellationToken] = None,
     ) -> RunResult:
         handlers = {node.id: self.registry.resolve(node.kind) for node in self.graph.nodes}
-        run_id, statuses, attempts, ledger, cost_ledger, artifacts, resumed = self._initial_state(
-            resume, run_id
-        )
+        (
+            run_id,
+            statuses,
+            attempts,
+            ledger,
+            cost_ledger,
+            artifacts,
+            resumed,
+            usage,
+        ) = self._initial_state(resume, run_id)
         nodes = self.graph.node_map()
         self._emit("run_resumed" if resumed else "run_started", run_id)
         if self.verified_result_publisher is not None:
@@ -391,6 +456,10 @@ class GraphRuntime:
                 )
         reservations = {}
         futures: Dict[Future, str] = {}
+        critical_path_ranks = self._critical_path_ranks()
+        declaration_order = {
+            node.id: index for index, node in enumerate(self.graph.nodes)
+        }
 
         with ThreadPoolExecutor(max_workers=self.graph.max_concurrency) as executor:
             while True:
@@ -415,11 +484,24 @@ class GraphRuntime:
                         self._emit("node_blocked", run_id, node.id, payload={"reason": "dependency"})
                         changed = True
 
-                for node in self.graph.nodes:
-                    if statuses[node.id] is not NodeStatus.PENDING:
-                        continue
-                    if not all(statuses[dep] is NodeStatus.COMPLETED for dep in node.deps):
-                        continue
+                ready_nodes = sorted(
+                    (
+                        node
+                        for node in self.graph.nodes
+                        if statuses[node.id] is NodeStatus.PENDING
+                        and all(
+                            statuses[dep] is NodeStatus.COMPLETED
+                            for dep in node.deps
+                        )
+                    ),
+                    key=lambda node: (
+                        -critical_path_ranks[node.id],
+                        declaration_order[node.id],
+                    ),
+                )
+                for node in ready_nodes:
+                    if len(futures) >= self.graph.max_concurrency:
+                        break
                     if self.gate_policy.decide(node, artifacts.values()) is GateDecision.DENY:
                         statuses[node.id] = NodeStatus.BLOCKED
                         self._emit("node_blocked", run_id, node.id, payload={"reason": "gate", "gate": node.gate})
@@ -427,18 +509,20 @@ class GraphRuntime:
                         continue
                     token_reservation = self._token_reservation(node)
                     if not ledger.can_reserve(token_reservation):
+                        if futures:
+                            continue
                         statuses[node.id] = NodeStatus.BLOCKED
                         self._emit("node_blocked", run_id, node.id, payload={"reason": "token_budget"})
                         changed = True
                         continue
                     cost_reservation = self._cost_reservation(node)
                     if not cost_ledger.can_reserve(cost_reservation):
+                        if futures:
+                            continue
                         statuses[node.id] = NodeStatus.BLOCKED
                         self._emit("node_blocked", run_id, node.id, payload={"reason": "cost_budget"})
                         changed = True
                         continue
-                    if len(futures) >= self.graph.max_concurrency:
-                        break
                     attempts[node.id] += 1
                     ledger.reserve(token_reservation)
                     cost_ledger.reserve(cost_reservation)
@@ -458,7 +542,15 @@ class GraphRuntime:
                     changed = True
 
                 if changed:
-                    self._save(run_id, statuses, attempts, ledger, cost_ledger, artifacts)
+                    self._save(
+                        run_id,
+                        statuses,
+                        attempts,
+                        ledger,
+                        cost_ledger,
+                        artifacts,
+                        usage,
+                    )
                 if not futures:
                     if all(
                         status
@@ -485,8 +577,26 @@ class GraphRuntime:
                     try:
                         execution = future.result()
                         outcome = execution.outcome
+                        outcome_usage = outcome.usage or ModelUsage.no_call()
                         within_graph_budget = ledger.settle(reserved_tokens, outcome.tokens_used)
                         within_cost_budget = cost_ledger.settle(reserved_cost, outcome.cost_usd)
+                        if not (
+                            outcome.agent_execution is None
+                            and outcome_usage == ModelUsage.no_call()
+                        ):
+                            accounted_cost = (
+                                reserved_cost
+                                if outcome.cost_usd is None
+                                else outcome.cost_usd
+                            )
+                            usage = ModelUsage.combine(
+                                (
+                                    usage,
+                                    outcome_usage.with_accounted_totals(
+                                        outcome.tokens_used, accounted_cost
+                                    ),
+                                )
+                            )
                         within_node_budget = node.max_tokens is None or outcome.tokens_used <= node.max_tokens
                         within_node_cost = (
                             node.agent is None
@@ -513,6 +623,7 @@ class GraphRuntime:
                             {
                                 "tokens_used": outcome.tokens_used,
                                 "cost_usd": outcome.cost_usd,
+                                "usage": outcome_usage.to_dict(),
                                 "artifacts": [record.key for record in records],
                                 "metadata": dict(outcome.metadata),
                             },
@@ -528,6 +639,12 @@ class GraphRuntime:
                     except RetryableNodeError as error:
                         ledger.settle(reserved_tokens, 0)
                         cost_ledger.settle(reserved_cost, None)
+                        usage = ModelUsage.combine(
+                            (
+                                usage,
+                                ModelUsage(total_tokens=0, cost_usd=reserved_cost),
+                            )
+                        )
                         if attempts[node_id] < node.retry.max_attempts:
                             statuses[node_id] = NodeStatus.PENDING
                             self._emit("node_retry", run_id, node_id, attempts[node_id], {"error": str(error)})
@@ -537,6 +654,12 @@ class GraphRuntime:
                     except Exception as error:
                         ledger.settle(reserved_tokens, 0)
                         cost_ledger.settle(reserved_cost, None)
+                        usage = ModelUsage.combine(
+                            (
+                                usage,
+                                ModelUsage(total_tokens=0, cost_usd=reserved_cost),
+                            )
+                        )
                         statuses[node_id] = NodeStatus.FAILED
                         self._emit(
                             "node_failed",
@@ -546,7 +669,15 @@ class GraphRuntime:
                             {"error": f"{type(error).__name__}: {error}"},
                         )
                     finally:
-                        self._save(run_id, statuses, attempts, ledger, cost_ledger, artifacts)
+                        self._save(
+                            run_id,
+                            statuses,
+                            attempts,
+                            ledger,
+                            cost_ledger,
+                            artifacts,
+                            usage,
+                        )
 
         result = RunResult(
             run_id,
@@ -556,6 +687,7 @@ class GraphRuntime:
             ledger.used,
             cost_ledger.used,
             artifacts.values(),
+            usage,
         )
         self._emit(
             "run_completed",
@@ -567,7 +699,16 @@ class GraphRuntime:
                 ),
                 "tokens_used": ledger.used,
                 "cost_usd": cost_ledger.used,
+                "usage": usage.to_dict(),
             },
         )
-        self._save(run_id, statuses, attempts, ledger, cost_ledger, artifacts)
+        self._save(
+            run_id,
+            statuses,
+            attempts,
+            ledger,
+            cost_ledger,
+            artifacts,
+            usage,
+        )
         return result

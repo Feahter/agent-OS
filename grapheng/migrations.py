@@ -1,14 +1,12 @@
 import hashlib
 import json
-import os
-import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Tuple
 
+from ._store import atomic_json_write
 from .errors import ContractViolation
 from .reuse import VerifiedReuseRecord
-
 
 BUNDLE_SCHEMA_VERSION = 2
 _BUNDLE_KIND = "grapheng-agent-os-bundle"
@@ -24,27 +22,6 @@ def _canonical(value: Any) -> Tuple[Any, str]:
             f"bundle migration value must be JSON serializable: {error}"
         ) from error
     return json.loads(encoded), hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-
-
-def _atomic_json_write(path: Path, value: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, raw_path = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
-    temporary = Path(raw_path)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(
-                value,
-                handle,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(str(temporary), str(path))
-    finally:
-        if temporary.exists():
-            temporary.unlink()
 
 
 @dataclass(frozen=True)
@@ -271,7 +248,7 @@ def _bundle_v1_to_v2(
             raise ContractViolation(
                 f"bundle migration reuse entry collision: {target.name}"
             )
-        _atomic_json_write(target, migrated)
+        atomic_json_write(target, migrated)
         if target != path:
             path.unlink()
 

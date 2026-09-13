@@ -2,6 +2,7 @@ import hashlib
 import json
 import subprocess
 import tempfile
+import threading
 import unittest
 from dataclasses import asdict
 from pathlib import Path
@@ -9,8 +10,8 @@ from pathlib import Path
 from grapheng import (
     AllowListGatePolicy,
     ContractViolation,
-    GraphValidationError,
     GraphSpec,
+    GraphValidationError,
     OrcaCoordinator,
     OrcaMaterializedRun,
     VerifiedArtifactCache,
@@ -148,6 +149,18 @@ class FakeBackend:
         )
 
 
+class BlockingWaitBackend(FakeBackend):
+    def __init__(self):
+        super().__init__()
+        self.wait_started = threading.Event()
+        self.release_wait = threading.Event()
+
+    def wait_delivery(self, timeout_ms=900000):
+        self.wait_started.set()
+        self.release_wait.wait(timeout=5)
+        return {"count": 0}
+
+
 def done(node_id, attempt=1, *, outcome="succeeded", outputs=None, tokens=0, **extra):
     message = {
         "id": f"done-{node_id}-{attempt}-{outcome}",
@@ -236,6 +249,35 @@ class OrcaCoordinatorTests(unittest.TestCase):
         self.assertEqual("cancelled", resumed.phase)
         self.assertEqual(["dispatch-work-1"], backend.stops)
         self.assertEqual([("dispatch-work-1", "on_failure", False)], backend.finishes)
+
+    def test_blocking_delivery_wait_does_not_block_cancellation(self):
+        value = graph([node("work")])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = BlockingWaitBackend()
+            coordinator = self.coordinator(root, value, backend)
+            coordinator.start()
+            advanced = []
+            cancelled = []
+            advance_thread = threading.Thread(
+                target=lambda: advanced.append(coordinator.advance(timeout_ms=1000))
+            )
+            advance_thread.start()
+            self.assertTrue(backend.wait_started.wait(timeout=1))
+            cancel_thread = threading.Thread(
+                target=lambda: cancelled.append(coordinator.cancel())
+            )
+            cancel_thread.start()
+            cancel_thread.join(timeout=1)
+            cancellation_was_responsive = not cancel_thread.is_alive()
+            backend.release_wait.set()
+            advance_thread.join(timeout=2)
+            cancel_thread.join(timeout=2)
+
+        self.assertTrue(cancellation_was_responsive)
+        self.assertFalse(advance_thread.is_alive())
+        self.assertEqual("cancelled", cancelled[0].phase)
+        self.assertEqual("cancelled", advanced[0].phase)
 
     def test_v1_state_migrates_fingerprint_and_merge_fields_without_replaying(self):
         value = graph([node("work")])
@@ -357,6 +399,56 @@ class OrcaCoordinatorTests(unittest.TestCase):
         self.assertEqual(["delivery-question"], backend.acks)
         self.assertEqual("running", answered.statuses["work"])
 
+    def test_terminal_node_still_waits_for_an_unanswered_question(self):
+        value = graph([node("work")])
+        question = {
+            "id": "question-before-terminal",
+            "type": "question",
+            "taskId": "task-work",
+            "dispatchId": "dispatch-work-1",
+            "body": "confirm completion",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = FakeBackend()
+            coordinator = self.coordinator(root, value, backend)
+            coordinator.start()
+            backend.enqueue("delivery-mixed", question, done("work"))
+
+            waiting = coordinator.advance(timeout_ms=10)
+            completed = coordinator.answer_question(
+                "question-before-terminal", "confirmed"
+            )
+
+        self.assertEqual("waiting_for_input", waiting.phase)
+        self.assertEqual(("question-before-terminal",), waiting.pending_questions)
+        self.assertEqual("succeeded", completed.phase)
+
+    def test_cancel_resolves_pending_messages_and_acknowledges_delivery(self):
+        value = graph([node("work")])
+        question = {
+            "id": "question-cancelled",
+            "type": "question",
+            "taskId": "task-work",
+            "dispatchId": "dispatch-work-1",
+            "body": "need input",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = FakeBackend()
+            coordinator = self.coordinator(root, value, backend)
+            coordinator.start()
+            backend.enqueue("delivery-question", question)
+            coordinator.advance(timeout_ms=10)
+
+            cancelled = coordinator.cancel()
+
+            with self.assertRaisesRegex(ContractViolation, "is not pending"):
+                coordinator.answer_question("question-cancelled", "too late")
+
+        self.assertEqual("cancelled", cancelled.phase)
+        self.assertEqual(["delivery-question"], backend.acks)
+
     def test_question_without_real_message_id_is_rejected(self):
         value = graph([node("work")])
         with tempfile.TemporaryDirectory() as directory:
@@ -471,10 +563,18 @@ class OrcaCoordinatorTests(unittest.TestCase):
                     self.assertEqual(
                         "dispatch-work-1", backend.starts[-1]["retry_of"]
                     )
+                    self.assertEqual(
+                        [("dispatch-work-1", "on_failure", False)],
+                        backend.finishes,
+                    )
                 else:
                     self.assertEqual("failed", snapshot.statuses["work"])
                     self.assertEqual("failed", snapshot.phase)
                     self.assertEqual(["dispatch-work-1"], backend.stops)
+                    self.assertEqual(
+                        [("dispatch-work-1", "on_failure", False)],
+                        backend.finishes,
+                    )
 
     def test_gate_allow_or_deny_is_single_owner_decision(self):
         value = graph([node("work", gate="ship")])

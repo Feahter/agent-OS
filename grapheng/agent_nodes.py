@@ -59,4 +59,5 @@ class AgentNodeHandler:
                 "verification_id": result.verification_id,
             },
             agent_execution=AgentExecution(request, result),
+            usage=result.usage,
         )

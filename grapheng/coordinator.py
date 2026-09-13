@@ -1,74 +1,36 @@
-import fcntl
 import hashlib
-import json
-import os
-import tempfile
 import time
-import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
-from .agents import AgentExecution, AgentRequest
+from . import orca_protocol
+from ._store import file_lock
 from .artifacts import ArtifactRecord, ArtifactStore
 from .control import EffectJournal, EventPage
 from .errors import ContractViolation, MergeRejectedError
 from .events import GraphEvent, JsonlEventSink
-from .model import GraphSpec, NodeSpec
 from .merge import ControlledGitMerger, MergeCandidate, MergeReceipt
+from .model import GraphSpec, NodeSpec
 from .orca import (
     ORCA_AGENT_IDS,
     OrcaBackend,
     OrcaGraphCompiler,
     OrcaMaterializedRun,
-    OrcaPlan,
     agent_result_from_worker_done,
     change_set_from_worker_done,
     dispatch_id_from_receipt,
 )
+from .orca_publication import OrcaPublicationRecorder
+from .orca_state import OrcaRunStore
 from .policy import DenyNamedGatesPolicy, GateDecision, GatePolicy
-from .publication import PublicationEvent, VerifiedResultPublisher
+from .publication import VerifiedResultPublisher
 from .reuse import VerifiedArtifactCache
 
-
-ORCA_COORDINATOR_SCHEMA_VERSION = 2
 _TERMINAL_NODE_STATES = {"completed", "failed", "blocked", "cancelled"}
 _TERMINAL_PHASES = {"succeeded", "failed", "cancelled"}
 _EXECUTOR_IDS = {value: key for key, value in ORCA_AGENT_IDS.items()}
-
-
-def _legacy_graph_fingerprint(graph: GraphSpec) -> str:
-    value = asdict(graph)
-    for node in value["nodes"]:
-        node.pop("controlled_merge", None)
-    encoded = json.dumps(
-        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    )
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-
-
-def _atomic_json_write(path: Path, value: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        encoded = json.dumps(
-            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        )
-    except (TypeError, ValueError) as error:
-        raise ContractViolation(
-            f"Orca coordinator state must be JSON serializable: {error}"
-        ) from error
-    descriptor, raw_path = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
-    temporary = Path(raw_path)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(encoded)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(str(temporary), str(path))
-    finally:
-        if temporary.exists():
-            temporary.unlink()
 
 
 @dataclass(frozen=True)
@@ -113,9 +75,13 @@ class OrcaCoordinator:
         self.workspace = workspace.resolve()
         self.gate_policy = gate_policy or DenyNamedGatesPolicy()
         self._clock = clock
-        self._state_path = root / "state.json"
+        self._store = OrcaRunStore(
+            root / "state.json", graph, self.workspace, clock=clock
+        )
         self._lock_path = root / "coordinator.lock"
         self._lock_path.touch(exist_ok=True)
+        self._wait_lock_path = root / "delivery-wait.lock"
+        self._wait_lock_path.touch(exist_ok=True)
         self._events = JsonlEventSink(root / "events.jsonl")
         self._effects = EffectJournal(root / "effects")
         self._merger = (
@@ -123,19 +89,22 @@ class OrcaCoordinator:
             if any(node.controlled_merge is not None for node in graph.nodes)
             else None
         )
-        self._publisher = (
+        self._publications = OrcaPublicationRecorder(
+            graph,
             VerifiedResultPublisher(
                 reuse_store, root / "verified-publications.json"
             )
             if reuse_store is not None
-            else None
+            else None,
+            self._workspace_for,
+            self._emit,
         )
 
     def start(self) -> OrcaCoordinatorSnapshot:
         with self._locked():
             state = self._load_or_create_state()
             self._ensure_materialized(state)
-            self._reconcile_publications(state)
+            self._publications.reconcile(state, self._artifacts(state))
             self._schedule(state)
             self._settle_phase(state)
             self._save(state)
@@ -153,7 +122,7 @@ class OrcaCoordinator:
         with self._locked():
             state = self._load_or_create_state()
             self._ensure_materialized(state)
-            self._reconcile_publications(state)
+            self._publications.reconcile(state, self._artifacts(state))
             self._schedule(state)
             self._settle_phase(state)
             self._save(state)
@@ -162,23 +131,38 @@ class OrcaCoordinator:
             if not state["active_dispatches"]:
                 return self._snapshot(state)
 
-            delivery = self._normalize_delivery(
+        # Waiting is an external, potentially long-running operation. Serialize
+        # waiters separately so control operations can still acquire the state
+        # lock to inspect, answer, pause, or cancel the run.
+        with file_lock(self._wait_lock_path):
+            with self._locked():
+                state = self._store.read()
+                if (
+                    state["phase"] in _TERMINAL_PHASES
+                    or not state["active_dispatches"]
+                ):
+                    return self._snapshot(state)
+            delivery = orca_protocol.normalize_delivery(
                 self.backend.wait_delivery(timeout_ms=timeout_ms)
             )
-            if delivery is None:
-                self._emit(
-                    state,
-                    "orca_wait_checkpoint",
-                    payload={"timeout_ms": timeout_ms},
-                )
+            with self._locked():
+                state = self._store.read()
+                if delivery is None:
+                    if state["phase"] not in _TERMINAL_PHASES:
+                        self._emit(
+                            state,
+                            "orca_wait_checkpoint",
+                            payload={"timeout_ms": timeout_ms},
+                        )
+                        self._save(state)
+                    return self._snapshot(state)
+                delivery_id, messages = delivery
+                self._process_delivery(state, delivery_id, messages)
+                if state["phase"] not in _TERMINAL_PHASES:
+                    self._schedule(state)
+                    self._settle_phase(state)
                 self._save(state)
                 return self._snapshot(state)
-            delivery_id, messages = delivery
-            self._process_delivery(state, delivery_id, messages)
-            self._schedule(state)
-            self._settle_phase(state)
-            self._save(state)
-            return self._snapshot(state)
 
     def run(
         self, timeout_ms: int = 900000, max_deliveries: int = 1000
@@ -200,11 +184,11 @@ class OrcaCoordinator:
 
     def inspect(self) -> OrcaCoordinatorSnapshot:
         with self._locked():
-            return self._snapshot(self._read_state())
+            return self._snapshot(self._store.read())
 
     def cancel(self) -> OrcaCoordinatorSnapshot:
         with self._locked():
-            state = self._read_state()
+            state = self._store.read()
             if state["phase"] in _TERMINAL_PHASES:
                 return self._snapshot(state)
             for node_id, dispatch_id in tuple(state["active_dispatches"].items()):
@@ -220,6 +204,15 @@ class OrcaCoordinator:
             for node_id, status in tuple(state["statuses"].items()):
                 if status not in _TERMINAL_NODE_STATES:
                     state["statuses"][node_id] = "cancelled"
+            delivery_ids = set()
+            for message in state["messages"].values():
+                if message.get("status") != "pending":
+                    continue
+                message["status"] = "resolved"
+                message["resolution"] = "run_cancelled"
+                delivery_ids.add(message["delivery_id"])
+            for delivery_id in sorted(delivery_ids):
+                self._ack_if_resolved(state, delivery_id)
             state["phase"] = "cancelled"
             self._emit(state, "run_cancelled", payload={"backend": "orca"})
             self._save(state)
@@ -229,13 +222,13 @@ class OrcaCoordinator:
         if isinstance(after, bool) or not isinstance(after, int) or after < 0:
             raise ContractViolation("event cursor must be a non-negative integer")
         with self._locked():
-            self._read_state()
+            self._store.read()
             records = tuple(self._events.read())
             return EventPage(records[after:], len(records))
 
     def answer_question(self, message_id: str, body: str) -> OrcaCoordinatorSnapshot:
         with self._locked():
-            state = self._read_state()
+            state = self._store.read()
             message = self._pending_message(state, message_id, "question")
             self._effect(
                 "reply",
@@ -268,7 +261,7 @@ class OrcaCoordinator:
                 "Orca escalation action must be continue, retry, or fail"
             )
         with self._locked():
-            state = self._read_state()
+            state = self._store.read()
             message = self._pending_message(state, message_id, "escalation")
             node_id = message["node_id"]
             dispatch_id = message["dispatch_id"]
@@ -292,8 +285,9 @@ class OrcaCoordinator:
                     {"dispatch_id": dispatch_id, "action": action},
                     lambda: self.backend.stop_worker(dispatch_id),
                 )
-                self._deactivate_dispatch(state, node_id, dispatch_id)
                 node = self.graph.node_map()[node_id]
+                self._finish_dispatch(state, node, dispatch_id, False)
+                self._deactivate_dispatch(state, node_id, dispatch_id)
                 if action == "retry" and attempt < node.retry.max_attempts:
                     state["statuses"][node_id] = "pending"
                     state["retry_of"][node_id] = dispatch_id
@@ -323,7 +317,7 @@ class OrcaCoordinator:
 
     def retry(self, node_id: str) -> OrcaCoordinatorSnapshot:
         with self._locked():
-            state = self._read_state()
+            state = self._store.read()
             node = self.graph.node_map().get(node_id)
             if node is None:
                 raise ContractViolation(f"unknown Orca coordinator node: {node_id}")
@@ -334,7 +328,7 @@ class OrcaCoordinator:
                     f"agent node {node_id} exceeds max_attempts={node.retry.max_attempts}"
                 )
             state["statuses"][node_id] = "pending"
-            previous = self._latest_dispatch(state, node_id)
+            previous = orca_protocol.latest_dispatch(state, node_id)
             if previous is not None:
                 state["retry_of"][node_id] = previous
             for descendant in self._descendants(node_id):
@@ -346,77 +340,19 @@ class OrcaCoordinator:
             return self._snapshot(state)
 
     def _load_or_create_state(self) -> Dict[str, Any]:
-        if self._state_path.exists():
-            return self._read_state()
-        run_id = str(uuid.uuid4())
-        state: Dict[str, Any] = {
-            "schema_version": ORCA_COORDINATOR_SCHEMA_VERSION,
-            "run_id": run_id,
-            "graph_id": self.graph.id,
-            "graph_fingerprint": self.graph.fingerprint(),
-            "phase": "queued",
-            "created_at": self._clock(),
-            "materialized": None,
-            "statuses": {node.id: "pending" for node in self.graph.nodes},
-            "attempts": {node.id: 0 for node in self.graph.nodes},
-            "active_dispatches": {},
-            "dispatches": {},
-            "retry_of": {},
-            "reserved_tokens": {},
-            "tokens_used": 0,
-            "cost_usd": 0.0,
-            "artifacts": [],
-            "messages": {},
-            "deliveries": {},
-            "gate_resolutions": {},
-            "merge_candidates": {},
-        }
-        self._save(state)
+        if self._store.exists():
+            return self._store.read()
+        state = self._store.create()
         self._emit(state, "run_started", payload={"backend": "orca"})
         return state
 
-    def _read_state(self) -> Dict[str, Any]:
-        try:
-            value = json.loads(self._state_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
-            raise ContractViolation(f"invalid Orca coordinator state: {error}") from error
-        if not isinstance(value, dict):
-            raise ContractViolation("Orca coordinator state must be an object")
-        schema_version = value.get("schema_version")
-        if schema_version == 1:
-            if any(node.controlled_merge is not None for node in self.graph.nodes):
-                raise ContractViolation(
-                    "legacy Orca coordinator state cannot resume controlled merges"
-                )
-            value["schema_version"] = ORCA_COORDINATOR_SCHEMA_VERSION
-            value.setdefault("gate_resolutions", {})
-            value.setdefault("merge_candidates", {})
-        elif schema_version != ORCA_COORDINATOR_SCHEMA_VERSION:
-            raise ContractViolation("unsupported Orca coordinator schema")
-        current_fingerprint = self.graph.fingerprint()
-        stored_fingerprint = value.get("graph_fingerprint")
-        if schema_version == 1 and stored_fingerprint == _legacy_graph_fingerprint(
-            self.graph
-        ):
-            value["graph_fingerprint"] = current_fingerprint
-            stored_fingerprint = current_fingerprint
-        if (
-            value.get("graph_id") != self.graph.id
-            or stored_fingerprint != current_fingerprint
-        ):
-            raise ContractViolation(
-                "Orca coordinator state does not match GraphSpec fingerprint"
-            )
-        self._validate_merge_state(value)
-        return value
-
     def _save(self, state: Dict[str, Any]) -> None:
-        _atomic_json_write(self._state_path, state)
+        self._store.save(state)
 
     def _ensure_materialized(self, state: Dict[str, Any]) -> None:
         if state["materialized"] is not None:
             materialized = OrcaMaterializedRun.from_dict(state["materialized"])
-            self._validate_materialized(materialized)
+            self._store.validate_materialized(materialized)
             return
         payload = {
             "coordinator_run_id": state["run_id"],
@@ -433,7 +369,7 @@ class OrcaCoordinator:
         if not isinstance(receipt, dict):
             raise ContractViolation("Orca materialization returned no receipt")
         materialized = OrcaMaterializedRun.from_dict(receipt)
-        self._validate_materialized(materialized)
+        self._store.validate_materialized(materialized)
         state["materialized"] = materialized.to_dict()
         state["phase"] = "running"
         self._emit(
@@ -443,16 +379,7 @@ class OrcaCoordinator:
         )
         self._save(state)
 
-    def _validate_materialized(self, materialized: OrcaMaterializedRun) -> None:
-        expected = {node.id for node in self.graph.nodes}
-        if set(materialized.task_ids) != expected:
-            raise ContractViolation("materialized Orca tasks do not match GraphSpec")
-        gated = {node.id for node in self.graph.nodes if node.gate is not None}
-        if set(materialized.gate_ids) != gated:
-            raise ContractViolation("materialized Orca gates do not match GraphSpec")
-
     def _schedule(self, state: Dict[str, Any]) -> None:
-        nodes = self.graph.node_map()
         changed = True
         while changed:
             changed = False
@@ -606,24 +533,24 @@ class OrcaCoordinator:
             delivery_id,
             {
                 "message_ids": [],
-                "message_digest": self._digest(messages),
+                "message_digest": orca_protocol.digest(messages),
                 "acknowledged": False,
             },
         )
-        if delivery.get("message_digest") != self._digest(messages):
+        if delivery.get("message_digest") != orca_protocol.digest(messages):
             raise ContractViolation(
                 f"Orca delivery {delivery_id} was replayed with different messages"
             )
         if delivery["acknowledged"]:
             return
         for message in messages:
-            message_id = self._message_id(
+            message_id = orca_protocol.message_id(
                 message, require_real=message.get("type") != "worker_done"
             )
             if message_id not in delivery["message_ids"]:
                 delivery["message_ids"].append(message_id)
             existing = state["messages"].get(message_id)
-            message_digest = self._digest(message)
+            message_digest = orca_protocol.digest(message)
             if existing is not None:
                 if existing.get("message_digest") != message_digest:
                     raise ContractViolation(
@@ -651,7 +578,7 @@ class OrcaCoordinator:
         message_type = message.get("type")
         if message_type not in ("worker_done", "question", "escalation"):
             raise ContractViolation(f"unsupported Orca delivery type: {message_type}")
-        dispatch_id = self._dispatch_id(message)
+        dispatch_id = orca_protocol.dispatch_id(message)
         dispatch = state["dispatches"].get(dispatch_id)
         if dispatch is None:
             state["messages"][message_id] = {
@@ -699,7 +626,7 @@ class OrcaCoordinator:
             )
             return
         materialized = OrcaMaterializedRun.from_dict(state["materialized"])
-        task_id = self._task_id(message)
+        task_id = orca_protocol.task_id(message)
         if task_id != materialized.task_ids[node_id]:
             raise ContractViolation(
                 f"Orca {message_type} task {task_id} does not match node {node_id}"
@@ -758,7 +685,7 @@ class OrcaCoordinator:
     ) -> None:
         node_id = str(dispatch["node_id"])
         attempt = int(dispatch["attempt"])
-        dispatch_id = self._dispatch_id(message)
+        dispatch_id = orca_protocol.dispatch_id(message)
         node = self.graph.node_map()[node_id]
         succeeded = message.get("outcome") == "succeeded"
         staged_merge = False
@@ -807,7 +734,7 @@ class OrcaCoordinator:
                 state["cost_usd"] = float(state["cost_usd"]) + result.cost_usd
             state["artifacts"] = [record.to_dict() for record in artifacts.records()]
             state["statuses"][node_id] = "completed"
-            self._record_publication(
+            self._publications.record(
                 state,
                 node,
                 attempt,
@@ -872,94 +799,6 @@ class OrcaCoordinator:
         state["messages"][message_id]["resolution"] = (
             "accepted" if succeeded else "failed"
         )
-
-    def _record_publication(
-        self,
-        state: Dict[str, Any],
-        node: NodeSpec,
-        attempt: int,
-        result,
-        input_records: Sequence[ArtifactRecord],
-        output_records: Sequence[ArtifactRecord],
-        artifacts: ArtifactStore,
-        workspace_id: Optional[str],
-    ) -> None:
-        if self._publisher is None or node.agent is None:
-            return
-        try:
-            workspace = self._workspace_for(node, workspace_id)
-            request = AgentRequest(
-                task_id=f"{state['run_id']}:{node.id}:{attempt}",
-                prompt=node.agent.prompt,
-                inputs={record.key: record.value for record in input_records},
-                output_keys=node.writes,
-                workspace=workspace,
-                model=node.agent.model,
-                tools=node.agent.tools,
-                timeout_seconds=node.agent.timeout_seconds,
-                max_tokens=node.max_tokens,
-                max_cost_usd=node.agent.max_cost_usd,
-                data_classification=node.agent.data_classification,
-                task_type=node.agent.task_type,
-                model_family=node.agent.model_family,
-                reuse_scope=node.agent.reuse_scope,
-            )
-            execution = AgentExecution(request, result)
-            self._emit_publication(
-                state,
-                self._publisher.stage(
-                    self.graph,
-                    state["run_id"],
-                    node,
-                    attempt,
-                    execution,
-                    input_records,
-                    output_records,
-                ),
-            )
-            self._emit_publication(
-                state,
-                self._publisher.observe_verifier(
-                    self.graph,
-                    artifacts,
-                    state["run_id"],
-                    node,
-                    attempt,
-                    input_records,
-                    output_records,
-                ),
-            )
-        except Exception as error:
-            self._emit(
-                state,
-                "verified_result_publish_deferred",
-                node.id,
-                attempt,
-                {"reason": f"{type(error).__name__}: {error}"},
-            )
-
-    def _reconcile_publications(self, state: Dict[str, Any]) -> None:
-        if self._publisher is None:
-            return
-        try:
-            for event in self._publisher.reconcile(
-                self.graph, self._artifacts(state), state["run_id"]
-            ):
-                self._emit_publication(state, event)
-        except Exception as error:
-            self._emit(
-                state,
-                "verified_result_publish_deferred",
-                payload={"reason": f"{type(error).__name__}: {error}"},
-            )
-
-    def _emit_publication(
-        self, state: Mapping[str, Any], event: Optional[PublicationEvent]
-    ) -> None:
-        if event is not None:
-            self._emit(
-                state, event.event, event.node_id, event.attempt, event.payload
-            )
 
     def _stage_controlled_merge(
         self,
@@ -1192,12 +1031,6 @@ class OrcaCoordinator:
         return message
 
     def _settle_phase(self, state: Dict[str, Any]) -> None:
-        statuses = tuple(state["statuses"].values())
-        if statuses and all(item in _TERMINAL_NODE_STATES for item in statuses):
-            state["phase"] = (
-                "succeeded" if all(item == "completed" for item in statuses) else "failed"
-            )
-            return
         pending = [
             item
             for item in state["messages"].values()
@@ -1208,7 +1041,15 @@ class OrcaCoordinator:
         elif any(item.get("type") == "escalation" for item in pending):
             state["phase"] = "escalated"
         else:
-            state["phase"] = "running"
+            statuses = tuple(state["statuses"].values())
+            if statuses and all(item in _TERMINAL_NODE_STATES for item in statuses):
+                state["phase"] = (
+                    "succeeded"
+                    if all(item == "completed" for item in statuses)
+                    else "failed"
+                )
+            else:
+                state["phase"] = "running"
 
     def _snapshot(self, state: Mapping[str, Any]) -> OrcaCoordinatorSnapshot:
         artifacts = self._artifacts(state)
@@ -1266,56 +1107,6 @@ class OrcaCoordinator:
                 f"invalid Orca coordinator artifacts: {error}"
             ) from error
 
-    def _validate_merge_state(self, state: Mapping[str, Any]) -> None:
-        gate_resolutions = state.get("gate_resolutions")
-        candidates = state.get("merge_candidates")
-        if not isinstance(gate_resolutions, dict) or not isinstance(candidates, dict):
-            raise ContractViolation("invalid controlled merge coordinator state")
-        gated = {node.id for node in self.graph.nodes if node.gate is not None}
-        if any(
-            node_id not in gated or resolution not in ("approved", "denied")
-            for node_id, resolution in gate_resolutions.items()
-        ):
-            raise ContractViolation("invalid controlled merge gate resolution state")
-        merge_sources = {
-            node.id: node.controlled_merge
-            for node in self.graph.nodes
-            if node.controlled_merge is not None
-        }
-        for candidate_id, item in candidates.items():
-            if not isinstance(item, dict) or not isinstance(item.get("candidate"), dict):
-                raise ContractViolation("invalid controlled merge candidate state")
-            candidate = MergeCandidate.from_dict(item["candidate"])
-            if candidate.candidate_id != candidate_id:
-                raise ContractViolation("controlled merge candidate key mismatch")
-            spec = merge_sources.get(candidate.source_node_id)
-            if spec is None or spec.verifier != candidate.verifier_node_id:
-                raise ContractViolation("controlled merge candidate does not match GraphSpec")
-            if (
-                candidate.run_id != state.get("run_id")
-                or Path(candidate.target_repository).resolve() != self.workspace
-                or spec.target_branch != candidate.target_branch
-            ):
-                raise ContractViolation("controlled merge candidate runtime mismatch")
-            if item.get("status") not in (
-                "awaiting_verification",
-                "merged",
-                "rejected",
-            ):
-                raise ContractViolation("invalid controlled merge candidate status")
-            receipt_value = item.get("receipt")
-            if item.get("status") == "awaiting_verification" and receipt_value is not None:
-                raise ContractViolation("pending controlled merge already has a receipt")
-            if item.get("status") != "awaiting_verification" and receipt_value is None:
-                raise ContractViolation("settled controlled merge has no receipt")
-            if receipt_value is not None:
-                receipt = MergeReceipt.from_dict(receipt_value)
-                if (
-                    receipt.candidate_id != candidate.candidate_id
-                    or receipt.status != item.get("status")
-                ):
-                    raise ContractViolation("controlled merge receipt identity mismatch")
-
     def _workspace_for(self, node: NodeSpec, workspace_id: Optional[str]) -> Path:
         if node.agent is None or node.agent.workspace.mode == "shared":
             return self.workspace
@@ -1333,8 +1124,7 @@ class OrcaCoordinator:
             )
         return workspace.resolve()
 
-    @staticmethod
-    def _executor_id(node: NodeSpec) -> str:
+    def _executor_id(self, node: NodeSpec) -> str:
         if node.agent is None:
             raise ContractViolation(f"Orca node {node.id} has no agent configuration")
         if node.agent.executor is not None:
@@ -1379,105 +1169,6 @@ class OrcaCoordinator:
             )
         )
 
-    @staticmethod
-    def _normalize_delivery(
-        value: Mapping[str, Any]
-    ) -> Optional[Tuple[str, Tuple[Mapping[str, Any], ...]]]:
-        if not isinstance(value, dict):
-            raise ContractViolation("Orca delivery must be an object")
-        if value.get("count") == 0:
-            return None
-        nested = value.get("delivery")
-        delivery = nested if isinstance(nested, dict) else value
-        delivery_id = (
-            delivery.get("id")
-            or delivery.get("deliveryId")
-            or delivery.get("delivery_id")
-            or value.get("deliveryId")
-            or value.get("delivery_id")
-        )
-        messages = delivery.get("messages") or value.get("messages")
-        if messages is None and value.get("type") in (
-            "worker_done",
-            "question",
-            "escalation",
-        ):
-            messages = [value]
-        if not isinstance(delivery_id, str) or not delivery_id:
-            raise ContractViolation("Orca actionable delivery has no id")
-        if not isinstance(messages, list) or not all(
-            isinstance(item, dict) for item in messages
-        ):
-            raise ContractViolation("Orca delivery messages must be an array")
-        return delivery_id, tuple(messages)
-
-    @staticmethod
-    def _message_id(
-        message: Mapping[str, Any], require_real: bool = False
-    ) -> str:
-        identifier = (
-            message.get("id")
-            or message.get("messageId")
-            or message.get("message_id")
-        )
-        if isinstance(identifier, str) and identifier:
-            return identifier
-        if require_real:
-            raise ContractViolation(
-                f"Orca {message.get('type')} message has no replyable id"
-            )
-        encoded = json.dumps(
-            message, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        )
-        return f"digest-{hashlib.sha256(encoded.encode('utf-8')).hexdigest()}"
-
-    @staticmethod
-    def _dispatch_id(message: Mapping[str, Any]) -> str:
-        payload = message.get("payload")
-        identifier = message.get("dispatchId") or message.get("dispatch_id")
-        if identifier is None and isinstance(payload, dict):
-            identifier = payload.get("dispatchId") or payload.get("dispatch_id")
-        if not isinstance(identifier, str) or not identifier:
-            raise ContractViolation("Orca lifecycle message has no dispatch id")
-        return identifier
-
-    @staticmethod
-    def _task_id(message: Mapping[str, Any]) -> str:
-        payload = message.get("payload")
-        identifier = message.get("taskId") or message.get("task_id")
-        if identifier is None and isinstance(payload, dict):
-            identifier = payload.get("taskId") or payload.get("task_id")
-        if not isinstance(identifier, str) or not identifier:
-            raise ContractViolation(
-                f"Orca {message.get('type')} message has no task id"
-            )
-        return identifier
-
-    @staticmethod
-    def _digest(value: Any) -> str:
-        try:
-            encoded = json.dumps(
-                value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-            )
-        except (TypeError, ValueError) as error:
-            raise ContractViolation(
-                f"Orca message payload must be JSON serializable: {error}"
-            ) from error
-        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-
-    @staticmethod
-    def _latest_dispatch(
-        state: Mapping[str, Any], node_id: str
-    ) -> Optional[str]:
-        candidates = [
-            (int(item["attempt"]), dispatch_id)
-            for dispatch_id, item in state["dispatches"].items()
-            if item.get("node_id") == node_id
-        ]
-        if not candidates:
-            return None
-        return max(candidates)[1]
-
     def _descendants(self, node_id: str) -> Tuple[str, ...]:
         descendants = []
         frontier = [node_id]
@@ -1491,9 +1182,5 @@ class OrcaCoordinator:
 
     @contextmanager
     def _locked(self):
-        with self._lock_path.open("a+") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        with file_lock(self._lock_path):
+            yield

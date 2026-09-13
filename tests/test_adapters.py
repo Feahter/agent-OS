@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -8,21 +9,23 @@ from unittest.mock import patch
 
 from grapheng import (
     AgentExecutionError,
+    AgentOutputTooLargeError,
     AgentProtocolError,
     AgentRateLimitError,
     AgentRequest,
+    AgentResult,
     AgentTimeoutError,
-    CliAgentAdapter,
     ClaudeCodeExecutor,
+    CliAgentAdapter,
     CodexExecutor,
     ContractViolation,
     ExecutorRegistry,
+    ModelUsage,
     OpenCodeExecutor,
     PiAgentExecutor,
     PolicyRouter,
     discover_local_executors,
 )
-
 
 FIXTURE = Path(__file__).parent / "fixtures" / "fake_agent_cli.py"
 
@@ -93,14 +96,14 @@ class AdapterTests(unittest.TestCase):
             return "/fake/opencode" if command == "opencode" else None
 
         for returncode, expected in ((0, ["opencode"]), (1, [])):
-            def runner(command, **kwargs):
+            def runner(command, _returncode=returncode, **kwargs):
                 if command[-1] == "--version":
                     return subprocess.CompletedProcess(
                         command, 0, stdout="opencode 1.18.18", stderr=""
                     )
                 return subprocess.CompletedProcess(
                     command,
-                    returncode,
+                    _returncode,
                     stdout="--format --model --pure",
                     stderr="",
                 )
@@ -196,8 +199,13 @@ class AdapterTests(unittest.TestCase):
                 stderr="",
             )
 
+        def execution(command, **kwargs):
+            return runner(list(command), **kwargs)
+
         with patch("grapheng.adapters.shutil.which", side_effect=which), patch(
             "grapheng.adapters.subprocess.run", side_effect=runner
+        ), patch(
+            "grapheng.adapters.run_bounded_process", side_effect=execution
         ), tempfile.TemporaryDirectory() as directory:
             registry = discover_local_executors()
             result = registry.execute(
@@ -217,6 +225,63 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual({"answer": "pi"}, result.outputs)
         self.assertEqual(7, result.tokens_used)
         self.assertEqual(0.02, result.cost_usd)
+        self.assertEqual(2, result.usage.input_tokens)
+        self.assertEqual(1, result.usage.cached_input_tokens)
+        self.assertEqual(3, result.usage.output_tokens)
+        self.assertEqual(7, result.usage.total_tokens)
+        self.assertTrue(result.usage.input_tokens_complete)
+        self.assertTrue(result.usage.cached_input_tokens_complete)
+        self.assertTrue(result.usage.output_tokens_complete)
+        self.assertTrue(result.usage.total_tokens_complete)
+
+    def test_pi_adapter_derives_total_only_when_all_provider_components_exist(self):
+        messages = (
+            (
+                {
+                    "input": 2,
+                    "output": 3,
+                    "cacheRead": 1,
+                    "cacheWrite": 1,
+                    "cost": {"total": 0.02},
+                },
+                7,
+                True,
+            ),
+            ({"input": 2, "output": 3, "cost": {"total": 0.02}}, 0, False),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            for usage, expected_total, total_complete in messages:
+                event = {
+                    "type": "message_end",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": '{"answer":"pi"}'}
+                        ],
+                        "stopReason": "stop",
+                        "usage": usage,
+                    },
+                }
+                completed = subprocess.CompletedProcess(
+                    ("pi",), 0, stdout=json.dumps(event), stderr=""
+                )
+                executor = PiAgentExecutor(("pi",))
+                with self.subTest(usage=usage), patch.object(
+                    executor, "run_cli", return_value=completed
+                ):
+                    result = executor.execute(request(Path(directory)))
+
+                self.assertEqual(expected_total, result.tokens_used)
+                self.assertEqual(total_complete, result.usage.total_tokens_complete)
+                self.assertEqual(2, result.usage.input_tokens)
+                self.assertEqual(3, result.usage.output_tokens)
+                self.assertEqual(
+                    usage.get("cacheRead"), result.usage.cached_input_tokens
+                )
+                self.assertEqual(
+                    "cacheRead" in usage,
+                    result.usage.cached_input_tokens_complete,
+                )
 
     def test_codex_adapter_normalizes_jsonl_result_and_usage(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -226,6 +291,57 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual({"answer": "codex"}, result.outputs)
         self.assertEqual(8, result.tokens_used)
         self.assertEqual("codex-session", result.session_id)
+        self.assertEqual(5, result.usage.input_tokens)
+        self.assertEqual(3, result.usage.cached_input_tokens)
+        self.assertEqual(3, result.usage.output_tokens)
+        self.assertEqual(8, result.usage.total_tokens)
+        self.assertTrue(result.usage.input_tokens_complete)
+        self.assertTrue(result.usage.cached_input_tokens_complete)
+        self.assertTrue(result.usage.output_tokens_complete)
+        self.assertTrue(result.usage.total_tokens_complete)
+        self.assertEqual(
+            result.usage.input_tokens + result.usage.output_tokens,
+            result.tokens_used,
+        )
+
+    def test_agent_result_distinguishes_measured_zero_from_unknown_cost(self):
+        measured = AgentResult("test", {}, "", cost_usd=0.0)
+        unknown = AgentResult("test", {}, "", cost_usd=None)
+
+        self.assertEqual(0.0, measured.usage.cost_usd)
+        self.assertTrue(measured.usage.cost_complete)
+        self.assertIsNone(unknown.usage.cost_usd)
+        self.assertFalse(unknown.usage.cost_complete)
+
+    def test_usage_combination_sums_known_values_without_claiming_completeness(self):
+        combined = ModelUsage.combine(
+            (
+                ModelUsage(
+                    input_tokens=2,
+                    output_tokens=1,
+                    total_tokens=3,
+                    cost_usd=0.0,
+                    input_tokens_complete=True,
+                    output_tokens_complete=True,
+                    total_tokens_complete=True,
+                    cost_complete=True,
+                ),
+                ModelUsage(
+                    input_tokens=4,
+                    total_tokens=4,
+                    input_tokens_complete=True,
+                    output_tokens_complete=False,
+                    total_tokens_complete=True,
+                ),
+            )
+        )
+
+        self.assertEqual(6, combined.input_tokens)
+        self.assertTrue(combined.input_tokens_complete)
+        self.assertEqual(1, combined.output_tokens)
+        self.assertFalse(combined.output_tokens_complete)
+        self.assertEqual(0.0, combined.cost_usd)
+        self.assertFalse(combined.cost_complete)
 
     def test_opencode_adapter_normalizes_jsonl_result_usage_and_session(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -258,7 +374,7 @@ class AdapterTests(unittest.TestCase):
             )
         )
         with tempfile.TemporaryDirectory() as directory, patch(
-            "grapheng.adapters.subprocess.run",
+            "grapheng.adapters.run_bounded_process",
             return_value=subprocess.CompletedProcess(("opencode",), 0, stdout, ""),
         ) as run:
             value = request(Path(directory))
@@ -400,6 +516,60 @@ class AdapterTests(unittest.TestCase):
 
                     with self.assertRaises(AgentTimeoutError):
                         executor.execute(value)
+
+
+    def test_agent_output_ceiling_terminates_the_process(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"AGENT_OS_MAX_AGENT_OUTPUT_BYTES": "4096"}
+        ):
+            executor = PiAgentExecutor(
+                (sys.executable, str(FIXTURE), "pi", "flood")
+            )
+            with self.assertRaises(AgentOutputTooLargeError) as raised:
+                executor.execute(request(Path(directory)))
+
+        self.assertIn("output ceiling", str(raised.exception))
+
+    def test_agent_output_ceiling_rejects_an_unusable_configuration(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"AGENT_OS_MAX_AGENT_OUTPUT_BYTES": "10"}
+        ):
+            executor = PiAgentExecutor((sys.executable, str(FIXTURE), "pi"))
+            with self.assertRaises(ContractViolation):
+                executor.execute(request(Path(directory)))
+
+    def test_declared_exit_codes_outrank_output_heuristics(self):
+        executor = PiAgentExecutor(("pi",))
+        completed = subprocess.CompletedProcess(
+            ("pi",), 127, stdout="", stderr="rate limit exceeded"
+        )
+
+        classification = executor.classify_exit(completed)
+
+        self.assertEqual("execution", classification.kind)
+        self.assertEqual("exit_code", classification.source)
+
+    def test_rate_limit_heuristic_is_recorded_as_a_heuristic(self):
+        executor = PiAgentExecutor(("pi",))
+        completed = subprocess.CompletedProcess(
+            ("pi",), 29, stdout="", stderr="429 too many requests"
+        )
+
+        classification = executor.classify_exit(completed)
+
+        self.assertEqual("rate_limit", classification.kind)
+        self.assertEqual("heuristic", classification.source)
+        with self.assertRaises(AgentRateLimitError):
+            classification.raise_for("pi-agent")
+
+    def test_successful_exit_has_no_classification(self):
+        executor = PiAgentExecutor(("pi",))
+
+        self.assertIsNone(
+            executor.classify_exit(
+                subprocess.CompletedProcess(("pi",), 0, stdout="{}", stderr="")
+            )
+        )
 
 
 if __name__ == "__main__":

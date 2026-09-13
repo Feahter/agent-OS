@@ -1,13 +1,14 @@
+import json
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 
 from grapheng import (
-    AllowListGatePolicy,
     ContractViolation,
     GraphRuntime,
     GraphSpec,
+    ModelUsage,
     NodeOutcome,
     NodeRegistry,
     NodeStatus,
@@ -156,6 +157,133 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertAlmostEqual(0.25, result.cost_usd)
 
+    def test_legacy_node_outcome_usage_reaches_event_result_and_checkpoint(self):
+        graph = spec(
+            [{"id": "work", "kind": "work", "writes": ["value"]}]
+        )
+        registry = NodeRegistry()
+        registry.register(
+            "work",
+            lambda context: NodeOutcome(
+                {"value": 1}, tokens_used=7, cost_usd=0.12
+            ),
+        )
+        expected = ModelUsage.from_legacy_constructor(7, 0.12)
+
+        with tempfile.TemporaryDirectory() as directory:
+            work_dir = Path(directory)
+            result = GraphRuntime(graph, registry, work_dir=work_dir).run()
+            events = [
+                json.loads(line)
+                for line in (work_dir / "events.jsonl").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            checkpoint = json.loads(
+                (work_dir / "checkpoint.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(7, result.tokens_used)
+        self.assertEqual(0.12, result.cost_usd)
+        self.assertEqual(expected, result.usage)
+        completed = next(
+            event for event in events if event["event"] == "node_completed"
+        )
+        self.assertEqual(expected.to_dict(), completed["payload"]["usage"])
+        self.assertEqual(expected.to_dict(), checkpoint["usage"])
+
+    def test_mapping_return_remains_exact_no_call_usage(self):
+        graph = spec(
+            [{"id": "work", "kind": "work", "writes": ["value"]}]
+        )
+        registry = NodeRegistry()
+        registry.register("work", lambda context: {"value": 1})
+        expected = ModelUsage.no_call()
+
+        with tempfile.TemporaryDirectory() as directory:
+            work_dir = Path(directory)
+            result = GraphRuntime(graph, registry, work_dir=work_dir).run()
+            events = [
+                json.loads(line)
+                for line in (work_dir / "events.jsonl").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            checkpoint = json.loads(
+                (work_dir / "checkpoint.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(expected, result.usage)
+        completed = next(
+            event for event in events if event["event"] == "node_completed"
+        )
+        self.assertEqual(expected.to_dict(), completed["payload"]["usage"])
+        self.assertEqual(expected.to_dict(), checkpoint["usage"])
+
+    def test_runtime_usage_preserves_unknown_cost_reservation(self):
+        graph = spec(
+            [
+                {
+                    "id": "work",
+                    "kind": "work",
+                    "writes": ["value"],
+                    "estimated_cost_usd": 0.25,
+                }
+            ],
+            max_cost_usd=1.0,
+        )
+        registry = NodeRegistry()
+        registry.register(
+            "work",
+            lambda context: NodeOutcome(
+                {"value": 1},
+                tokens_used=2,
+                cost_usd=None,
+                usage=ModelUsage(total_tokens=2, total_tokens_complete=True),
+            ),
+        )
+
+        result = GraphRuntime(graph, registry).run()
+
+        self.assertEqual(0.25, result.cost_usd)
+        self.assertEqual(0.25, result.usage.cost_usd)
+        self.assertFalse(result.usage.cost_complete)
+        self.assertEqual(2, result.usage.total_tokens)
+        self.assertTrue(result.usage.total_tokens_complete)
+
+    def test_runtime_usage_preserves_measured_zero_cost(self):
+        graph = spec(
+            [
+                {
+                    "id": "work",
+                    "kind": "work",
+                    "writes": ["value"],
+                    "estimated_cost_usd": 0.25,
+                }
+            ],
+            max_cost_usd=1.0,
+        )
+        registry = NodeRegistry()
+        registry.register(
+            "work",
+            lambda context: NodeOutcome(
+                {"value": 1},
+                cost_usd=0.0,
+                usage=ModelUsage(
+                    total_tokens=0,
+                    cost_usd=0.0,
+                    total_tokens_complete=True,
+                    cost_complete=True,
+                ),
+            ),
+        )
+
+        result = GraphRuntime(graph, registry).run()
+
+        self.assertEqual(0.0, result.cost_usd)
+        self.assertEqual(0.0, result.usage.cost_usd)
+        self.assertTrue(result.usage.cost_complete)
+
     def test_scheduler_does_not_start_more_than_max_concurrency(self):
         graph = spec(
             [
@@ -187,6 +315,107 @@ class RuntimeTests(unittest.TestCase):
         result = GraphRuntime(graph, registry).run()
         self.assertTrue(result.success)
         self.assertEqual(2, peak)
+
+    def test_scheduler_prioritizes_nodes_on_the_longest_remaining_path(self):
+        graph = spec(
+            [
+                {"id": "leaf", "kind": "work", "writes": ["leaf"]},
+                {"id": "root", "kind": "work", "writes": ["root"]},
+                {
+                    "id": "middle",
+                    "kind": "work",
+                    "deps": ["root"],
+                    "writes": ["middle"],
+                },
+                {
+                    "id": "tail",
+                    "kind": "work",
+                    "deps": ["middle"],
+                    "writes": ["tail"],
+                },
+            ],
+            max_concurrency=1,
+        )
+        registry = NodeRegistry()
+        starts = []
+
+        def work(context):
+            starts.append(context.node_id)
+            return {context.node_id: True}
+
+        registry.register("work", work)
+
+        result = GraphRuntime(graph, registry).run()
+
+        self.assertTrue(result.success)
+        self.assertEqual("root", starts[0])
+        self.assertEqual("middle", starts[1])
+
+    def test_budget_reservation_defers_ready_node_until_running_work_settles(self):
+        graph = spec(
+            [
+                {
+                    "id": "first",
+                    "kind": "work",
+                    "writes": ["first"],
+                    "estimated_tokens": 4,
+                },
+                {
+                    "id": "second",
+                    "kind": "work",
+                    "writes": ["second"],
+                    "estimated_tokens": 4,
+                },
+            ],
+            max_concurrency=2,
+            max_tokens=4,
+        )
+        registry = NodeRegistry()
+        starts = []
+
+        def work(context):
+            starts.append(context.node_id)
+            return NodeOutcome({context.node_id: True}, tokens_used=0)
+
+        registry.register("work", work)
+
+        result = GraphRuntime(graph, registry).run()
+
+        self.assertTrue(result.success)
+        self.assertEqual(["first", "second"], starts)
+
+    def test_cost_reservation_defers_ready_node_until_running_work_settles(self):
+        graph = spec(
+            [
+                {
+                    "id": "first",
+                    "kind": "work",
+                    "writes": ["first"],
+                    "estimated_cost_usd": 1.0,
+                },
+                {
+                    "id": "second",
+                    "kind": "work",
+                    "writes": ["second"],
+                    "estimated_cost_usd": 1.0,
+                },
+            ],
+            max_concurrency=2,
+            max_cost_usd=1.0,
+        )
+        registry = NodeRegistry()
+        starts = []
+
+        def work(context):
+            starts.append(context.node_id)
+            return NodeOutcome({context.node_id: True}, cost_usd=0.0)
+
+        registry.register("work", work)
+
+        result = GraphRuntime(graph, registry).run()
+
+        self.assertTrue(result.success)
+        self.assertEqual(["first", "second"], starts)
 
     def test_rejects_non_integer_token_usage(self):
         with self.assertRaises(ContractViolation):

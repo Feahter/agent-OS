@@ -1,15 +1,16 @@
 import hashlib
 import json
 import re
-import tempfile
 import threading
 import time
 import uuid
-from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
+from ._store import atomic_json_write
 from .errors import ContractViolation, EffectIndeterminateError
 from .events import JsonlEventSink
 from .model import GraphSpec
@@ -18,7 +19,6 @@ from .publication import VerifiedResultPublisher
 from .reuse import VerifiedArtifactCache
 from .runtime import CancellationToken, GraphRuntime, NodeRegistry, NodeStatus, RunResult
 from .validation import validate_graph
-
 
 RUN_ID = re.compile(r"^[A-Za-z0-9-]{1,128}$")
 TERMINAL_PHASES = {"succeeded", "failed", "cancelled"}
@@ -201,7 +201,7 @@ class EffectJournal:
 
     @staticmethod
     def _write(path: Path, receipt: EffectReceipt) -> None:
-        _atomic_json_write(path, asdict(receipt))
+        atomic_json_write(path, asdict(receipt))
 
 
 class LocalControlPlane:
@@ -250,7 +250,7 @@ class LocalControlPlane:
         run_id = str(uuid.uuid4())
         run_dir = self._run_dir(run_id)
         run_dir.mkdir(parents=True, exist_ok=False)
-        _atomic_json_write(run_dir / "graph.json", asdict(graph))
+        atomic_json_write(run_dir / "graph.json", asdict(graph))
         now = time.time()
         self._write_state(
             run_id,
@@ -452,20 +452,21 @@ class LocalControlPlane:
             heartbeat.join(timeout=max(1.0, self.lease_seconds))
             self._tokens.pop(run_id, None)
 
+    def _heartbeat_mutation(self, now: float) -> Callable[[Dict[str, Any]], None]:
+        def mutate(state: Dict[str, Any]) -> None:
+            if state.get("owner_id") != self.owner_id:
+                return
+            if state["phase"] not in ("running", "cancelling"):
+                return
+            state["heartbeat_at"] = now
+            state["lease_expires_at"] = now + self.lease_seconds
+
+        return mutate
+
     def _heartbeat_loop(self, run_id: str, stop: threading.Event) -> None:
         interval = max(0.05, min(self.lease_seconds / 3.0, 10.0))
         while not stop.wait(interval):
-            now = time.time()
-
-            def mutate(state: Dict[str, Any]) -> None:
-                if state.get("owner_id") != self.owner_id:
-                    return
-                if state["phase"] not in ("running", "cancelling"):
-                    return
-                state["heartbeat_at"] = now
-                state["lease_expires_at"] = now + self.lease_seconds
-
-            self._mutate_state(run_id, mutate)
+            self._mutate_state(run_id, self._heartbeat_mutation(time.time()))
 
     def _settle_success(
         self, run_id: str, result: RunResult, cancel_requested: bool
@@ -538,7 +539,7 @@ class LocalControlPlane:
         return value
 
     def _write_state(self, run_id: str, state: Mapping[str, Any]) -> None:
-        _atomic_json_write(self._state_path(run_id), state)
+        atomic_json_write(self._state_path(run_id), state)
 
     def _mutate_state(
         self, run_id: str, mutation: Callable[[Dict[str, Any]], None]
@@ -547,21 +548,3 @@ class LocalControlPlane:
             state = self._read_state(run_id)
             mutation(state)
             self._write_state(run_id, state)
-
-
-def _atomic_json_write(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    except (TypeError, ValueError) as error:
-        raise ContractViolation(f"value must be JSON serializable: {error}") from error
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        dir=str(path.parent),
-        prefix=f".{path.name}.",
-        delete=False,
-    ) as handle:
-        handle.write(encoded)
-        temporary = Path(handle.name)
-    temporary.replace(path)

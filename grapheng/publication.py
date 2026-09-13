@@ -1,41 +1,18 @@
 import hashlib
 import json
 import math
-import os
-import tempfile
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
+from ._store import atomic_json_write
 from .agents import AgentExecution, AgentRequest, AgentResult
 from .artifacts import ArtifactRecord, ArtifactStore
 from .errors import ContractViolation
 from .model import GraphSpec, NodeSpec
 from .reuse import VerifiedArtifactCache
 
-
 PUBLICATION_SCHEMA_VERSION = 1
-
-
-def _atomic_json_write(path: Path, value: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, raw_path = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
-    temporary = Path(raw_path)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(
-                value,
-                handle,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(str(temporary), str(path))
-    finally:
-        if temporary.exists():
-            temporary.unlink()
 
 
 def _publication_id(value: Mapping[str, Any]) -> str:
@@ -501,7 +478,7 @@ class VerifiedResultPublisher:
         self._save()
 
     def _save(self) -> None:
-        _atomic_json_write(
+        atomic_json_write(
             self._state_path,
             {
                 "schema_version": PUBLICATION_SCHEMA_VERSION,

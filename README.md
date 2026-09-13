@@ -78,8 +78,9 @@ agent-os demo examples/minimal_graph.json --work-dir /tmp/agent-os-demo
 Codex, Claude Code, Pi, OpenCode and optional Orca, then discovers other installed
 Agent tools including OpenClaw and Hermes Agent. It prints prioritized repair steps,
 uses only help/version probes and makes zero model calls. Add `--json` for the
-versioned diagnostic contract or `--home /path/to/state` to choose another local
-state directory.
+versioned diagnostic contract or `--home /path/to/agent-os-home` to choose another
+home. Operational state stays directly under that home; portable state is initialized
+under `<home>/state`.
 
 ### Daily task interface
 
@@ -128,7 +129,7 @@ These commands can call real local agents and incur model cost. GraphSpec and th
 Run the test suite:
 
 ```bash
-PYTHONPATH=. python3 -m unittest discover -s tests -v
+python3 -m pytest -q
 ```
 
 ### Baseline user outcomes
@@ -232,10 +233,10 @@ A node can read only declared artifacts and must produce exactly its declared ou
 | Tool | Verified version (Darwin arm64) | Protocol | Integration |
 | --- | --- | --- | --- |
 | Codex | `0.148.0-alpha.9`, `0.149.0-alpha.4.1` | `exec-jsonl-v1` | Local CLI adapter |
-| Claude Code | `2.1.234`, `2.1.241` | `json-envelope-v1` | Local CLI adapter |
-| Pi | `0.84.1` | `message-end-jsonl-v1` | Local CLI adapter |
+| Claude Code | `2.1.234`, `2.1.241`, `2.1.266` | `json-envelope-v1` | Local CLI adapter |
+| Pi | `0.84.1`, `0.85.1` | `message-end-jsonl-v1` | Local CLI adapter |
 | [OpenCode](https://opencode.ai/) | `1.18.18` | `run-jsonl-v1` | Local CLI adapter |
-| Orca | `1.4.180` | `orca-json-command-v1` | Graph compiler, backend and coordinator |
+| Orca | `1.4.180`, `1.4.192` | `orca-json-command-v1` | Graph compiler, backend and coordinator |
 
 Adapters translate the common `read / shell / edit / write` tool contract into each product's protocol. Claude Code discovery also adapts to versions that temporarily omit the `--safe-mode` flag: isolation remains enabled through `CLAUDE_CODE_SAFE_MODE=1`, while versions that expose the flag receive both forms. This is separate from `--permission-mode dontAsk`, which governs tool authorization rather than configuration isolation. The original tool set was verified on Darwin arm64 on 2026-08-18; OpenCode was verified from its official Darwin arm64 release binary on 2026-08-19, and the installed Codex and Claude Code updates were verified on 2026-08-24. Evidence is version-controlled and travels with release bundles. Certification is platform-scoped and enforced during runtime discovery: a protocol-compatible but unverified version or platform remains visible in diagnostics but cannot execute a task.
 
@@ -286,7 +287,7 @@ The project fails closed when state is damaged, a future schema is encountered o
 
 ## State portability
 
-The stable Agent OS root contains learning, optimization, reuse, approvals and routing state. Exported bundles use a strict file allowlist, per-file SHA-256 checksums and staged schema migration.
+The portable state root contains learning, optimization, reuse, approvals and routing state. For the default home this root is `~/.agent-os/state`; low-level `agent-os agent-os ... --root` commands take that portable root directly. Exported bundles use a strict file allowlist, per-file SHA-256 checksums and staged schema migration.
 
 ```bash
 agent-os agent-os status --root /path/to/agent-os-state

@@ -13,7 +13,7 @@ from grapheng import (
     DesktopNotificationSink,
     ResidentCoordinator,
 )
-from grapheng.cli import main
+from grapheng.cli import _print_task_center, main
 
 
 class DiscoverableTasks:
@@ -138,15 +138,12 @@ class TaskCenterTests(unittest.TestCase):
             },
             value["counts"],
         )
-        self.assertEqual(
-            {
-                "tokens_used": 46,
-                "cost_usd": 0.1,
-                "jobs_reported": 2,
-                "complete": False,
-            },
-            value["usage"],
-        )
+        self.assertEqual(46, value["usage"]["tokens_used"])
+        self.assertEqual(0.1, value["usage"]["cost_usd"])
+        self.assertEqual(2, value["usage"]["jobs_reported"])
+        self.assertFalse(value["usage"]["complete"])
+        self.assertFalse(value["usage"]["total_tokens_complete"])
+        self.assertFalse(value["usage"]["cost_complete"])
         self.assertEqual(
             {"engineering", "graph"},
             {item["kind"] for item in value["jobs"][:2]},
@@ -159,6 +156,53 @@ class TaskCenterTests(unittest.TestCase):
         self.assertEqual("awaiting_approval", engineering["state"])
         self.assertEqual(12, engineering["usage"]["tokens_used"])
         self.assertEqual(34, orca["usage"]["tokens_used"])
+
+    def test_component_usage_sums_known_subtotals_and_marks_partial_fields(self):
+        self.graph.details["one"] = {
+            "usage": {
+                "tokens_used": 3,
+                "cost_usd": 0.0,
+                "input_tokens": 2,
+                "cached_input_tokens": 0,
+                "output_tokens": 1,
+                "total_tokens": 3,
+                "input_tokens_complete": True,
+                "cached_input_tokens_complete": True,
+                "output_tokens_complete": True,
+                "total_tokens_complete": True,
+                "cost_complete": True,
+            }
+        }
+        self.orca.details["two"] = {
+            "usage": {
+                "tokens_used": 2,
+                "cost_usd": 0.0,
+                "input_tokens": 2,
+                "cached_input_tokens": None,
+                "output_tokens": None,
+                "total_tokens": 2,
+                "input_tokens_complete": True,
+                "cached_input_tokens_complete": False,
+                "output_tokens_complete": False,
+                "total_tokens_complete": True,
+                "cost_complete": False,
+            }
+        }
+        coordinator = self.coordinator()
+        coordinator.schedule("graph", "one")
+        coordinator.schedule("orca", "two")
+
+        usage = coordinator.task_center()["usage"]
+
+        self.assertEqual(4, usage["input_tokens"])
+        self.assertTrue(usage["input_tokens_complete"])
+        self.assertEqual(1, usage["output_tokens"])
+        self.assertFalse(usage["output_tokens_complete"])
+        self.assertEqual(5, usage["total_tokens"])
+        self.assertTrue(usage["total_tokens_complete"])
+        self.assertEqual(0.0, usage["cost_usd"])
+        self.assertFalse(usage["cost_complete"])
+        self.assertFalse(usage["complete"])
 
     def test_limit_only_bounds_details_and_invalid_limits_fail_closed(self):
         for index in range(3):
@@ -255,6 +299,45 @@ class TaskCenterTests(unittest.TestCase):
             stderr=subprocess.DEVNULL,
         )
 
+    def test_task_center_cost_rendering_requires_explicit_cost_completeness(self):
+        base = {
+            "resident_running": True,
+            "desktop_notifications": True,
+            "counts": {"active": 0, "needs_attention": 0},
+            "jobs": [],
+        }
+        cases = (
+            (
+                {"tokens_used": 0, "cost_usd": 0.0, "complete": True},
+                "cost unknown",
+                "$0.0000",
+            ),
+            (
+                {"tokens_used": 2, "cost_usd": 0.04, "complete": True},
+                "$0.0400 (partial)",
+                None,
+            ),
+            (
+                {
+                    "tokens_used": 0,
+                    "cost_usd": 0.0,
+                    "complete": True,
+                    "cost_complete": True,
+                },
+                "$0.0000",
+                "cost unknown",
+            ),
+        )
+
+        for usage, expected, excluded in cases:
+            with self.subTest(usage=usage):
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    _print_task_center({**base, "usage": usage}, False)
+                self.assertIn(expected, output.getvalue())
+                if excluded is not None:
+                    self.assertNotIn(excluded, output.getvalue())
+
     def test_cli_center_has_human_and_json_outputs(self):
         value = {
             "schema_version": 1,
@@ -312,9 +395,10 @@ class TaskCenterTests(unittest.TestCase):
 
         self.assertIn("1 active", human.getvalue())
         self.assertIn("25 tokens", human.getvalue())
-        self.assertIn("$0.0400 · complete", human.getvalue())
+        self.assertIn("$0.0400 (partial) · complete", human.getvalue())
         self.assertIn("Graph needs approval for release", human.getvalue())
         self.assertEqual(value, json.loads(machine.getvalue()))
+        self.assertEqual(2, coordinator.ensure_running.call_count)
         self.assertEqual(
             [call(7), call(20)], coordinator.task_center.call_args_list
         )

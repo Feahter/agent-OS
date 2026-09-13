@@ -1,9 +1,6 @@
-import fcntl
 import hashlib
 import json
 import math
-import os
-import tempfile
 import threading
 import time
 import uuid
@@ -12,8 +9,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, Mapping, Optional, Tuple
 
+from ._store import (
+    atomic_json_write,
+    file_lock,
+)
 from .errors import ContractViolation
-
 
 PROVIDER_GOVERNANCE_SCHEMA_VERSION = 1
 
@@ -28,27 +28,6 @@ def _canonical(value: Any) -> Tuple[Any, str]:
             f"provider governance state must be JSON serializable: {error}"
         ) from error
     return json.loads(encoded), hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-
-
-def _atomic_json_write(path: Path, value: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, raw_path = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
-    temporary = Path(raw_path)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(
-                value,
-                handle,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(str(temporary), str(path))
-    finally:
-        if temporary.exists():
-            temporary.unlink()
 
 
 def _finite_number(name: str, value: Any, minimum: float = 0.0) -> float:
@@ -120,8 +99,8 @@ class ProviderGovernanceStore:
             if root.is_symlink():
                 raise ContractViolation("provider governance root cannot be a symlink")
             root.mkdir(parents=True, exist_ok=True)
-            self.state_path = root / "state.json"
-            self.lock_path = root / "state.lock"
+            self.state_path: Optional[Path] = root / "state.json"
+            self.lock_path: Optional[Path] = root / "state.lock"
         else:
             self.state_path = None
             self.lock_path = None
@@ -219,9 +198,12 @@ class ProviderGovernanceStore:
             providers = dict(state["providers"])
             current = self._provider_state(providers.get(provider))
             probe = current["probe"]
-            if probe is not None and probe["expires_at"] > now:
-                if reservation_token != probe["token"]:
-                    return
+            if (
+                probe is not None
+                and probe["expires_at"] > now
+                and reservation_token != probe["token"]
+            ):
+                return
             providers[provider] = {
                 **current,
                 "consecutive_failures": 0,
@@ -297,12 +279,8 @@ class ProviderGovernanceStore:
             if self.lock_path is None:
                 yield
                 return
-            with self.lock_path.open("a+b") as handle:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-                try:
-                    yield
-                finally:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            with file_lock(self.lock_path):
+                yield
 
     def _read_state(self) -> Mapping[str, Any]:
         if self.state_path is None:
@@ -336,7 +314,7 @@ class ProviderGovernanceStore:
         if self.state_path is None:
             self._memory_state = value
         else:
-            _atomic_json_write(self.state_path, value)
+            atomic_json_write(self.state_path, value)
 
     def _effective_now(self, state: Mapping[str, Any]) -> float:
         now = _finite_number("clock", self._clock())

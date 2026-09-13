@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "verification_scope": "help/version protocol inspection only; no model calls or Orca object creation",
+  "verification_scope": "exact-version help/protocol inspection for every record; bounded real-model canary only where the record explicitly includes runtime_canary; no Orca object creation",
   "platform": {
     "architecture": "arm64",
     "operating_system": "Darwin"
@@ -18,6 +18,26 @@
         "protocol": "json-envelope-v1",
         "validated_at": "2026-08-24T11:23:10Z",
         "version": "2.1.241",
+        "version_source": "installed claude --version"
+      },
+      {
+        "inspection": "installed Darwin arm64 CLI --version and --help only; all required non-interactive flags present; no model call",
+        "protocol": "json-envelope-v1",
+        "runtime_canary": {
+          "cost_usd": 0.02937175,
+          "max_cost_usd": 0.25,
+          "model_call": true,
+          "prompt_or_response_persisted": false,
+          "structured_output": true,
+          "success": true,
+          "tokens_used": 7250,
+          "tools": [
+            "read"
+          ],
+          "validated_at": "2026-09-09T11:57:15Z"
+        },
+        "validated_at": "2026-09-09T11:43:46Z",
+        "version": "2.1.266",
         "version_source": "installed claude --version"
       }
     ],
@@ -53,6 +73,13 @@
         "validated_at": "2026-08-18T08:58:53Z",
         "version": "1.4.180",
         "version_source": "macOS application bundle"
+      },
+      {
+        "inspection": "installed Darwin arm64 application version and orchestration --help only; run/task/worker commands present; no Orca object creation",
+        "protocol": "orca-json-command-v1",
+        "validated_at": "2026-09-09T11:43:46Z",
+        "version": "1.4.192",
+        "version_source": "installed macOS application bundle"
       }
     ],
     "pi-agent": [
@@ -61,6 +88,13 @@
         "validated_at": "2026-08-18T08:58:53Z",
         "version": "0.84.1",
         "version_source": "pi --version"
+      },
+      {
+        "inspection": "installed Darwin arm64 CLI --version and --help only; all required non-interactive flags present; no model call",
+        "protocol": "message-end-jsonl-v1",
+        "validated_at": "2026-09-09T11:43:46Z",
+        "version": "0.85.1",
+        "version_source": "installed pi --version"
       }
     ]
   }

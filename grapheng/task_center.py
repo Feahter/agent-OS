@@ -1,19 +1,18 @@
 """Task-center notification support for the local resident lifecycle."""
 
-import fcntl
 import hashlib
 import json
-import os
 import platform
 import shutil
 import subprocess
-import tempfile
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Protocol
 
+from ._store import (
+    atomic_json_write,
+    file_lock,
+)
 from .errors import ContractViolation
-
 
 TASK_CENTER_SCHEMA_VERSION = 1
 RESIDENT_NOTIFICATION_SCHEMA_VERSION = 1
@@ -92,7 +91,7 @@ class ResidentNotificationJournal:
             if path.is_symlink():
                 raise ContractViolation("resident notification files cannot be symlinks")
         if not self.path.exists():
-            with _file_lock(self.lock_path):
+            with file_lock(self.lock_path):
                 if not self.path.exists():
                     self._write(self._empty())
 
@@ -114,7 +113,7 @@ class ResidentNotificationJournal:
         )
         event_id = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
         attempted_at = self.clock()
-        with _file_lock(self.lock_path):
+        with file_lock(self.lock_path):
             journal = self._read()
             if event_id in journal["entries"]:
                 return False
@@ -144,7 +143,7 @@ class ResidentNotificationJournal:
             self.sink.send(title, body)
         except Exception:
             status = "failed"
-        with _file_lock(self.lock_path):
+        with file_lock(self.lock_path):
             journal = self._read()
             entry = journal["entries"].get(event_id)
             if isinstance(entry, dict):
@@ -153,7 +152,7 @@ class ResidentNotificationJournal:
         return status == "delivered"
 
     def status(self) -> Mapping[str, int]:
-        with _file_lock(self.lock_path):
+        with file_lock(self.lock_path):
             entries = tuple(self._read()["entries"].values())
         return {
             "delivered": sum(item["status"] == "delivered" for item in entries),
@@ -195,7 +194,7 @@ class ResidentNotificationJournal:
         return value
 
     def _write(self, value: Mapping[str, Any]) -> None:
-        _atomic_json_write(self.path, value)
+        atomic_json_write(self.path, value)
 
     def _trim(self, journal: Dict[str, Any]) -> None:
         entries = journal["entries"]
@@ -220,36 +219,3 @@ def _bounded_text(value: str, maximum: int) -> str:
 
 def _apple_script_text(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
-
-
-def _atomic_json_write(path: Path, value: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handle = tempfile.NamedTemporaryFile(
-        mode="w", encoding="utf-8", dir=str(path.parent), delete=False
-    )
-    try:
-        with handle:
-            json.dump(
-                value,
-                handle,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(handle.name, path)
-    finally:
-        if os.path.exists(handle.name):
-            os.unlink(handle.name)
-
-
-@contextmanager
-def _file_lock(path: Path):
-    descriptor = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o600)
-    try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
-        yield descriptor
-    finally:
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
-        os.close(descriptor)

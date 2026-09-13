@@ -8,7 +8,6 @@ from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 from .errors import ContractViolation
 from .governance import ProviderGovernanceStore, ProviderPolicy
 
-
 DATA_CLASSIFICATIONS = ("public", "internal", "confidential", "restricted")
 
 
@@ -32,7 +31,7 @@ class ExecutorProfile:
     def __post_init__(self) -> None:
         if not isinstance(self.provider, str) or not self.provider.strip():
             raise ContractViolation("executor provider cannot be empty")
-        for field, value in (
+        for name, value in (
             ("estimated_cost_usd", self.estimated_cost_usd),
             ("estimated_latency_seconds", self.estimated_latency_seconds),
         ):
@@ -42,7 +41,7 @@ class ExecutorProfile:
                 or not math.isfinite(value)
                 or value < 0
             ):
-                raise ContractViolation(f"{field} must be a finite non-negative number")
+                raise ContractViolation(f"{name} must be a finite non-negative number")
         invalid = sorted(set(self.data_classifications) - set(DATA_CLASSIFICATIONS))
         if invalid or not self.data_classifications:
             raise ContractViolation(
@@ -78,7 +77,7 @@ class LearnedExecutorEstimate:
             or not 0 <= self.success_rate <= 1
         ):
             raise ContractViolation("learned success_rate must be between zero and one")
-        for field, value in (
+        for name, value in (
             ("average_cost_usd", self.average_cost_usd),
             ("average_latency_seconds", self.average_latency_seconds),
         ):
@@ -88,7 +87,7 @@ class LearnedExecutorEstimate:
                 or not math.isfinite(value)
                 or value < 0
             ):
-                raise ContractViolation(f"learned {field} must be non-negative")
+                raise ContractViolation(f"learned {name} must be non-negative")
         if self.average_quality is not None and (
             isinstance(self.average_quality, bool)
             or not isinstance(self.average_quality, (int, float))
@@ -473,7 +472,7 @@ class PolicyRouter:
     @staticmethod
     def _in_rollout(policy: LearnedRoutingPolicy, task_id: str) -> bool:
         digest = hashlib.sha256(
-            f"{policy.version}:{task_id}".encode("utf-8")
+            f"{policy.version}:{task_id}".encode()
         ).digest()
         bucket = int.from_bytes(digest[:4], "big") % 100
         return bucket < policy.rollout_percent

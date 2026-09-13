@@ -6,27 +6,34 @@ its own execution state and remains responsible for safe recovery.
 
 from __future__ import annotations
 
-import fcntl
+import contextlib
+import functools
 import json
+import logging
 import os
 import re
 import subprocess
 import sys
-import tempfile
 import threading
 import time
-from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping, Optional, Protocol, Union
+from typing import Any, Callable, Dict, Mapping, Optional, Protocol, Tuple, Union
 
+from . import telemetry
+from ._store import (
+    atomic_json_write,
+    file_lock,
+)
+from .agents import ModelUsage
 from .errors import ContractViolation
+from .index import ProjectionIndex, index_sources
 from .model import GraphSpec
+from .os import state_root_for_home
 from .task_center import (
     TASK_CENTER_SCHEMA_VERSION,
     NotificationSink,
     ResidentNotificationJournal,
 )
-
 
 RESIDENT_QUEUE_SCHEMA_VERSION = 2
 _ACTIVE_STATES = {
@@ -38,9 +45,12 @@ _ACTIVE_STATES = {
     "cancel_requested",
 }
 _TERMINAL_STATES = {"succeeded", "failed", "cancelled"}
+_RECOVERABLE_BACKGROUND_STATES = _ACTIVE_STATES - {"paused"}
 _TASK_ID = re.compile(r"^task-[0-9a-f]{16}$")
 _REFERENCE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _JOB_KINDS = {"engineering", "graph", "orca"}
+_PRIORITY_AGING_SECONDS = 60.0
+_MAX_PRIORITY = 100
 
 
 class ResidentJobHandler(Protocol):
@@ -54,44 +64,6 @@ class ResidentJobHandler(Protocol):
 
     def record_failure(self, reference: str, failure: str) -> None:
         ...
-
-
-def _atomic_json_write(path: Path, value: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handle = tempfile.NamedTemporaryFile(
-        mode="w", encoding="utf-8", dir=str(path.parent), delete=False
-    )
-    try:
-        with handle:
-            json.dump(
-                value,
-                handle,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(handle.name, path)
-    finally:
-        if os.path.exists(handle.name):
-            os.unlink(handle.name)
-
-
-@contextmanager
-def _file_lock(path: Path, blocking: bool = True):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o600)
-    try:
-        operation = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
-        try:
-            fcntl.flock(descriptor, operation)
-        except BlockingIOError as error:
-            raise ContractViolation("the resident coordinator is already running") from error
-        yield descriptor
-    finally:
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
-        os.close(descriptor)
 
 
 class ResidentCoordinator:
@@ -108,10 +80,15 @@ class ResidentCoordinator:
         notification_sink: Optional[NotificationSink] = None,
     ):
         self.home = home.expanduser().absolute()
+        self.state_root = state_root_for_home(self.home)
         self.root = self.home / "runtime" / "resident"
         if self.root.is_symlink():
             raise ContractViolation("resident runtime root cannot be a symlink")
         self.root.mkdir(parents=True, exist_ok=True)
+        telemetry.configure(self.home)
+        # Cache for the per-reference projections that `center` would otherwise
+        # recompute for every task on every call.
+        self.projections = ProjectionIndex(self.root / "projections.sqlite3")
         self.queue_path = self.root / "queue.json"
         self.queue_lock_path = self.root / "queue.lock"
         self.instance_lock_path = self.root / "instance.lock"
@@ -132,7 +109,8 @@ class ResidentCoordinator:
         if task_module_factory is None:
             from .tasks import UserTaskModule
 
-            task_module_factory = lambda: UserTaskModule(self.home)
+            def task_module_factory() -> Any:
+                return UserTaskModule(self.home)
         self._task_module_factory = task_module_factory
         from .resident_jobs import ResidentJobCatalog
 
@@ -151,7 +129,7 @@ class ResidentCoordinator:
         )
         self._stop = threading.Event()
         if not self.queue_path.exists():
-            with _file_lock(self.queue_lock_path):
+            with file_lock(self.queue_lock_path):
                 if not self.queue_path.exists():
                     self._write_queue(self._empty_queue())
 
@@ -168,7 +146,7 @@ class ResidentCoordinator:
         priority = self._priority(priority)
         now = self._clock()
         job_id = self._job_id(kind, reference)
-        with _file_lock(self.queue_lock_path):
+        with file_lock(self.queue_lock_path):
             queue = self._read_queue()
             items = queue["items"]
             existing = items.get(job_id)
@@ -191,6 +169,14 @@ class ResidentCoordinator:
             }
             queue["updated_at"] = now
             self._write_queue(queue)
+            telemetry.emit(
+                "resident.job_scheduled",
+                job_id=job_id,
+                job_kind=kind,
+                reference=reference,
+                priority=priority,
+                sequence=sequence,
+            )
             return dict(items[job_id])
 
     def schedule_graph(
@@ -212,7 +198,7 @@ class ResidentCoordinator:
     def inspect_job(self, kind: str, reference: str) -> Optional[Mapping[str, Any]]:
         self._validate_job(kind, reference)
         job_id = self._job_id(kind, reference)
-        with _file_lock(self.queue_lock_path):
+        with file_lock(self.queue_lock_path):
             item = self._read_queue()["items"].get(job_id)
             return dict(item) if isinstance(item, dict) else None
 
@@ -223,7 +209,7 @@ class ResidentCoordinator:
             or not 1 <= limit <= 200
         ):
             raise ContractViolation("task center limit must be between 1 and 200")
-        with _file_lock(self.queue_lock_path):
+        with file_lock(self.queue_lock_path):
             queued = {
                 job_id: dict(item)
                 for job_id, item in self._read_queue()["items"].items()
@@ -241,7 +227,14 @@ class ResidentCoordinator:
             for reference in references:
                 try:
                     self._validate_job(kind, reference)
-                    phase = str(handler.inspect(reference))
+                    phase = str(
+                        self.projections.resolve(
+                            f"inspect:{kind}",
+                            reference,
+                            index_sources(handler, reference),
+                            functools.partial(self._inspect_phase, handler, reference),
+                        )
+                    )
                 except Exception:
                     continue
                 job_id = self._job_id(kind, reference)
@@ -282,11 +275,27 @@ class ResidentCoordinator:
             "cancelled": sum(item["state"] == "cancelled" for item in jobs),
         }
         reported_usage = [item["usage"] for item in jobs if item["usage"] is not None]
+        model_usages = [
+            ModelUsage.from_persisted(
+                item,
+                int(item["tokens_used"]),
+                float(item["cost_usd"]),
+                item.get("cost_complete")
+                if isinstance(item.get("cost_complete"), bool)
+                else None,
+            )
+            for item in reported_usage
+        ]
+        model_usages.extend(
+            ModelUsage.unknown() for _ in range(len(jobs) - len(reported_usage))
+        )
+        aggregate = ModelUsage.combine(model_usages)
         usage = {
+            **aggregate.to_dict(),
             "tokens_used": sum(item["tokens_used"] for item in reported_usage),
             "cost_usd": sum(item["cost_usd"] for item in reported_usage),
             "jobs_reported": len(reported_usage),
-            "complete": len(reported_usage) == len(jobs),
+            "complete": len(reported_usage) == len(jobs) and aggregate.complete,
         }
         return {
             "schema_version": TASK_CENTER_SCHEMA_VERSION,
@@ -297,6 +306,27 @@ class ResidentCoordinator:
             "usage": usage,
             "jobs": jobs[:limit],
         }
+
+    def ensure_running(self) -> bool:
+        """Start the resident when durable work still needs coordination.
+
+        The new process performs interrupted-job recovery while holding the
+        singleton instance lock. Terminal and intentionally paused queues do
+        not cause a background process to be spawned.
+        """
+
+        if self.is_running():
+            return True
+        with file_lock(self.queue_lock_path):
+            has_work = any(
+                isinstance(item, dict)
+                and item.get("state") in _RECOVERABLE_BACKGROUND_STATES
+                for item in self._read_queue()["items"].values()
+            )
+        if not has_work:
+            return False
+        self.start_background()
+        return True
 
     def request(
         self,
@@ -319,7 +349,7 @@ class ResidentCoordinator:
         self._validate_job(kind, reference)
         job_id = self._job_id(kind, reference)
         now = self._clock()
-        with _file_lock(self.queue_lock_path):
+        with file_lock(self.queue_lock_path):
             queue = self._read_queue()
             item = queue["items"].get(job_id)
             if not isinstance(item, dict):
@@ -336,7 +366,10 @@ class ResidentCoordinator:
                     raise ContractViolation(f"resident job {job_id} cannot pause from {state}")
                 item["requested_action"] = "pause"
             elif action == "resume":
-                if state not in ("queued", "paused", "pause_requested"):
+                resumable = state in ("queued", "paused", "pause_requested")
+                if state == "running" and not self._instance_process_alive():
+                    resumable = True
+                if not resumable:
                     raise ContractViolation(f"resident job {job_id} cannot resume from {state}")
                 item["state"] = "queued"
                 item["requested_action"] = None
@@ -419,12 +452,27 @@ class ResidentCoordinator:
             failure = f"{type(error).__name__}: {error}"
             try:
                 handler.record_failure(reference, failure)
-            finally:
-                self._settle(job_id, "failed", failure)
+            except Exception as recording_error:
+                recording_failure = (
+                    f"{type(recording_error).__name__}: {recording_error}"
+                )
+                telemetry.emit(
+                    "resident.failure_recording_failed",
+                    level=logging.ERROR,
+                    job_id=job_id,
+                    job_kind=kind,
+                    error=recording_failure,
+                )
+                failure = f"{failure}; failure recording failed: {recording_failure}"
+            self._settle(job_id, "failed", failure)
         return True
 
     def serve_forever(self) -> None:
-        with _file_lock(self.instance_lock_path, blocking=False):
+        with file_lock(
+            self.instance_lock_path,
+            blocking=False,
+            busy_message="the resident coordinator is already running",
+        ):
             self._recover_interrupted()
             heartbeat = threading.Thread(target=self._heartbeat_loop, daemon=True)
             heartbeat.start()
@@ -479,6 +527,22 @@ class ResidentCoordinator:
             or self._clock() - float(heartbeat_at) > self._heartbeat_seconds * 4
         ):
             return False
+        return self._pid_exists(pid)
+
+    def _instance_process_alive(self) -> bool:
+        try:
+            value = json.loads(self.instance_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return False
+        pid = value.get("pid")
+        return (
+            isinstance(pid, int)
+            and not isinstance(pid, bool)
+            and self._pid_exists(pid)
+        )
+
+    @staticmethod
+    def _pid_exists(pid: int) -> bool:
         try:
             os.kill(pid, 0)
         except (OSError, ProcessLookupError):
@@ -486,7 +550,7 @@ class ResidentCoordinator:
         return True
 
     def _claim_next(self) -> Optional[Mapping[str, Any]]:
-        with _file_lock(self.queue_lock_path):
+        with file_lock(self.queue_lock_path):
             queue = self._read_queue()
             candidates = [
                 item
@@ -496,21 +560,48 @@ class ResidentCoordinator:
             ]
             if not candidates:
                 return None
+            now = self._clock()
             item = min(
                 candidates,
-                key=lambda value: (-int(value["priority"]), int(value["sequence"])),
+                key=lambda value: self._claim_key(value, now),
             )
-            now = self._clock()
+            queue_wait_seconds = max(0.0, now - float(item["updated_at"]))
+            effective_priority = self._effective_priority(item, now)
             item["state"] = "running"
             item["updated_at"] = now
             item["attempts"] = int(item["attempts"]) + 1
             queue["updated_at"] = now
             self._write_queue(queue)
+            telemetry.emit(
+                "resident.job_claimed",
+                job_id=item["job_id"],
+                job_kind=item["kind"],
+                attempts=item["attempts"],
+                effective_priority=effective_priority,
+                queue_wait_seconds=queue_wait_seconds,
+            )
             return dict(item)
+
+    @staticmethod
+    def _effective_priority(item: Mapping[str, Any], now: float) -> int:
+        queue_wait_seconds = max(0.0, now - float(item["updated_at"]))
+        age_boost = int(queue_wait_seconds // _PRIORITY_AGING_SECONDS)
+        return min(_MAX_PRIORITY, int(item["priority"]) + age_boost)
+
+    @classmethod
+    def _claim_key(
+        cls, item: Mapping[str, Any], now: float
+    ) -> Tuple[int, int, int]:
+        control_rank = 0 if item.get("state") == "cancel_requested" else 1
+        return (
+            control_rank,
+            -cls._effective_priority(item, now),
+            int(item["sequence"]),
+        )
 
     def _settle(self, job_id: str, phase: str, error: Optional[str]) -> None:
         settled = None
-        with _file_lock(self.queue_lock_path):
+        with file_lock(self.queue_lock_path):
             queue = self._read_queue()
             item = queue["items"].get(job_id)
             if not isinstance(item, dict):
@@ -526,14 +617,20 @@ class ResidentCoordinator:
             queue["updated_at"] = item["updated_at"]
             self._write_queue(queue)
             settled = dict(item)
+            telemetry.emit(
+                "resident.job_settled",
+                level=logging.WARNING if error else logging.INFO,
+                job_id=job_id,
+                job_kind=item["kind"],
+                state=item["state"],
+                error=error,
+            )
         if settled is not None and self._notifications is not None:
-            try:
+            with contextlib.suppress(Exception):
                 self._notifications.dispatch(settled, self._project_item(settled))
-            except Exception:
-                pass
 
     def _recover_interrupted(self) -> None:
-        with _file_lock(self.queue_lock_path):
+        with file_lock(self.queue_lock_path):
             queue = self._read_queue()
             changed = False
             now = self._clock()
@@ -552,23 +649,34 @@ class ResidentCoordinator:
             if changed:
                 queue["updated_at"] = now
                 self._write_queue(queue)
+                telemetry.emit("resident.interrupted_jobs_recovered")
 
     def _refresh_waiting(self) -> None:
-        with _file_lock(self.queue_lock_path):
+        with file_lock(self.queue_lock_path):
             waiting = [
                 (str(item["job_id"]), str(item["kind"]), str(item["reference"]))
                 for item in self._read_queue()["items"].values()
                 if isinstance(item, dict) and item.get("state") == "waiting"
             ]
         for job_id, kind, reference in waiting:
-            phase = str(self._job_handlers[kind].inspect(reference))
+            try:
+                phase = str(self._job_handlers[kind].inspect(reference))
+            except Exception as error:
+                telemetry.emit(
+                    "resident.waiting_probe_failed",
+                    level=logging.WARNING,
+                    job_id=job_id,
+                    job_kind=kind,
+                    error=f"{type(error).__name__}: {error}",
+                )
+                continue
             if phase in _TERMINAL_STATES:
                 self._settle(job_id, phase, None)
             elif phase != "waiting":
                 self._requeue_waiting(job_id)
 
     def _requeue_waiting(self, job_id: str) -> None:
-        with _file_lock(self.queue_lock_path):
+        with file_lock(self.queue_lock_path):
             queue = self._read_queue()
             item = queue["items"].get(job_id)
             if not isinstance(item, dict) or item.get("state") != "waiting":
@@ -580,7 +688,7 @@ class ResidentCoordinator:
 
     def _heartbeat_loop(self) -> None:
         while not self._stop.is_set():
-            _atomic_json_write(
+            atomic_json_write(
                 self.instance_path,
                 {
                     "pid": os.getpid(),
@@ -590,6 +698,10 @@ class ResidentCoordinator:
                 },
             )
             self._stop.wait(self._heartbeat_seconds)
+
+    @staticmethod
+    def _inspect_phase(handler: Any, reference: str) -> str:
+        return str(handler.inspect(reference))
 
     def _read_queue(self) -> Dict[str, Any]:
         try:
@@ -676,17 +788,23 @@ class ResidentCoordinator:
         return migrated
 
     def _write_queue(self, value: Mapping[str, Any]) -> None:
-        _atomic_json_write(self.queue_path, value)
+        atomic_json_write(self.queue_path, value)
 
     def _project_item(self, item: Mapping[str, Any]) -> Mapping[str, Any]:
         kind = str(item["kind"])
         reference = str(item["reference"])
         state = str(item["state"])
         details: Mapping[str, Any] = {}
-        describe = getattr(self._job_handlers[kind], "describe", None)
+        handler = self._job_handlers[kind]
+        describe = getattr(handler, "describe", None)
         if callable(describe):
             try:
-                candidate = describe(reference)
+                candidate = self.projections.resolve(
+                    f"describe:{kind}",
+                    reference,
+                    index_sources(handler, reference),
+                    lambda: describe(reference),
+                )
                 if isinstance(candidate, Mapping):
                     details = candidate
             except Exception:
@@ -716,13 +834,29 @@ class ResidentCoordinator:
             if (
                 not isinstance(tokens, bool)
                 and isinstance(tokens, int)
+                and tokens >= 0
                 and not isinstance(cost, bool)
                 and isinstance(cost, (int, float))
+                and float(cost) >= 0
             ):
-                projected_usage = {
-                    "tokens_used": tokens,
-                    "cost_usd": float(cost),
-                }
+                try:
+                    model_usage = ModelUsage.from_persisted(
+                        usage,
+                        tokens,
+                        float(cost),
+                        usage.get("cost_complete")
+                        if isinstance(usage.get("cost_complete"), bool)
+                        else None,
+                    )
+                except ContractViolation:
+                    pass
+                else:
+                    projected_usage = {
+                        **dict(usage),
+                        **model_usage.to_dict(),
+                        "tokens_used": tokens,
+                        "cost_usd": float(cost),
+                    }
         return {
             "job_id": str(item["job_id"]),
             "kind": kind,
@@ -824,6 +958,19 @@ class _EngineeringJobHandler:
             if path.is_dir()
             and not path.is_symlink()
             and _TASK_ID.fullmatch(path.name) is not None
+        )
+
+    def projection_sources(self, task_id: str) -> Tuple[Path, ...]:
+        """Files whose change invalidates a cached projection for ``task_id``."""
+
+        root = getattr(self._factory(), "tasks_root", None)
+        if not isinstance(root, Path):
+            return ()
+        task_dir = root / task_id
+        return (
+            task_dir / "task.json",
+            task_dir / "status.json",
+            task_dir / "report.json",
         )
 
     def describe(self, task_id: str) -> Mapping[str, Any]:

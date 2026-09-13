@@ -1,10 +1,11 @@
 import json
 import os
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple
 
+from .agents import ModelUsage
 from .artifacts import ArtifactRecord
 from .errors import ContractViolation
 
@@ -19,6 +20,7 @@ class Checkpoint:
     tokens_used: int
     cost_usd: float
     artifacts: Tuple[ArtifactRecord, ...]
+    usage: ModelUsage = field(default_factory=ModelUsage.no_call)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -29,20 +31,32 @@ class Checkpoint:
             "attempts": dict(self.attempts),
             "tokens_used": self.tokens_used,
             "cost_usd": self.cost_usd,
+            "usage": self.usage.to_dict(),
             "artifacts": [record.to_dict() for record in self.artifacts],
         }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "Checkpoint":
+        tokens_used = int(value["tokens_used"])
+        cost_usd = float(value.get("cost_usd", 0.0))
+        usage = ModelUsage.from_persisted(
+            value.get("usage"),
+            tokens_used,
+            cost_usd,
+            value.get("cost_complete")
+            if isinstance(value.get("cost_complete"), bool)
+            else None,
+        )
         return cls(
             graph_id=str(value["graph_id"]),
             graph_fingerprint=str(value["graph_fingerprint"]),
             run_id=str(value["run_id"]),
             statuses={str(key): str(item) for key, item in value["statuses"].items()},
             attempts={str(key): int(item) for key, item in value["attempts"].items()},
-            tokens_used=int(value["tokens_used"]),
-            cost_usd=float(value.get("cost_usd", 0.0)),
+            tokens_used=tokens_used,
+            cost_usd=cost_usd,
             artifacts=tuple(ArtifactRecord.from_dict(item) for item in value["artifacts"]),
+            usage=usage,
         )
 
 

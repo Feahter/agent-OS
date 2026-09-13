@@ -9,6 +9,8 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from grapheng import (
+    AgentExecutionError,
+    AgentOS,
     AgentResult,
     ContractViolation,
     EngineeringWorkflow,
@@ -18,7 +20,7 @@ from grapheng import (
     ResidentCoordinator,
     UserTaskModule,
 )
-from grapheng.cli import main
+from grapheng.cli import _print_user_task, main
 
 
 class TaskExecutor:
@@ -76,7 +78,7 @@ class UserTaskModuleTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def module(self, task_id="task-0123456789abcdef"):
+    def module(self, task_id="task-0123456789abcdef", resident_factory=None):
         def workflow_factory(workspace, task_dir, policy, agent_os):
             registry = ExecutorRegistry()
             registry.register(TaskExecutor())
@@ -91,6 +93,7 @@ class UserTaskModuleTests(unittest.TestCase):
         return UserTaskModule(
             self.root / "home",
             workflow_factory=workflow_factory,
+            resident_factory=resident_factory,
             clock=lambda: 100.0,
             id_factory=lambda: task_id,
         )
@@ -120,7 +123,49 @@ class UserTaskModuleTests(unittest.TestCase):
         self.assertEqual("approve", result["verification"]["independent_review"]["verdict"])
         self.assertEqual("operator", result["human_intervention"]["approved_by"])
         self.assertEqual(20, result["usage"]["tokens_used"])
+        self.assertEqual(20, result["usage"]["total_tokens"])
+        self.assertTrue(result["usage"]["total_tokens_complete"])
+        self.assertTrue(result["usage"]["cost_complete"])
         self.assertEqual(2, len(result["artifacts"]))
+
+    def test_legacy_usage_defaults_components_and_unmarked_cost_to_unknown(self):
+        marked = UserTaskModule._usage(
+            {"tokens_used": 4, "cost_usd": 0.0, "cost_complete": True}
+        )
+        unmarked = UserTaskModule._usage(
+            {"tokens_used": 4, "cost_usd": 0.0}
+        )
+
+        self.assertTrue(marked["cost_complete"])
+        self.assertFalse(unmarked["cost_complete"])
+        self.assertFalse(unmarked["total_tokens_complete"])
+        self.assertIsNone(unmarked["input_tokens"])
+
+    def test_cli_qualifies_unknown_and_partial_cost(self):
+        base = {"task_id": "task-0123456789abcdef", "phase": "running"}
+        unknown = io.StringIO()
+        partial = io.StringIO()
+        complete_zero = io.StringIO()
+        with contextlib.redirect_stdout(unknown):
+            _print_user_task(
+                {**base, "usage": {"tokens_used": 1, "cost_usd": 0.0, "cost_complete": False}},
+                False,
+            )
+        with contextlib.redirect_stdout(partial):
+            _print_user_task(
+                {**base, "usage": {"tokens_used": 1, "cost_usd": 0.02, "cost_complete": False}},
+                False,
+            )
+        with contextlib.redirect_stdout(complete_zero):
+            _print_user_task(
+                {**base, "usage": {"tokens_used": 1, "cost_usd": 0.0, "cost_complete": True}},
+                False,
+            )
+
+        self.assertIn("cost unknown", unknown.getvalue())
+        self.assertNotIn("$0.0000", unknown.getvalue())
+        self.assertIn("$0.0200 (partial)", partial.getvalue())
+        self.assertIn("$0.0000", complete_zero.getvalue())
 
     def test_control_cancels_only_before_approval(self):
         tasks = self.module()
@@ -219,6 +264,41 @@ class UserTaskModuleTests(unittest.TestCase):
 
         self.assertEqual([], list(tasks.tasks_root.iterdir()))
 
+    def test_legacy_home_is_rejected_before_a_second_state_tree_is_created(self):
+        home = self.root / "legacy-home"
+        AgentOS(home)
+
+        with self.assertRaisesRegex(ContractViolation, "legacy Agent OS state"):
+            UserTaskModule(home)
+
+        self.assertFalse((home / "state").exists())
+        self.assertFalse((home / "tasks").exists())
+
+    def test_planning_failure_removes_the_incomplete_task_directory(self):
+        def failing_workflow(workspace, task_dir, policy, agent_os):
+            raise ContractViolation("no supported local agent executor was discovered")
+
+        tasks = UserTaskModule(
+            self.root / "failed-home",
+            workflow_factory=failing_workflow,
+            id_factory=lambda: "task-1111111111111111",
+        )
+
+        with self.assertRaisesRegex(ContractViolation, "no supported"):
+            tasks.do("Prepare a safe change", self.workspace)
+
+        self.assertEqual([], list(tasks.tasks_root.iterdir()))
+
+    def test_task_metadata_write_failure_removes_the_allocated_directory(self):
+        tasks = self.module("task-3333333333333333")
+
+        with patch(
+            "grapheng.tasks.atomic_json_write", side_effect=OSError("disk full")
+        ), self.assertRaisesRegex(OSError, "disk full"):
+            tasks.do("Prepare a safe change", self.workspace)
+
+        self.assertEqual([], list(tasks.tasks_root.iterdir()))
+
     def test_intent_tampering_invalidates_approval(self):
         tasks = self.module()
         task_id = tasks.do(
@@ -261,6 +341,43 @@ class UserTaskModuleTests(unittest.TestCase):
         self.assertIn("Plan ready and waiting for approval", human.getvalue())
         self.assertEqual(value, json.loads(machine.getvalue()))
 
+    def test_cli_execution_failure_is_reported_without_a_traceback(self):
+        tasks = Mock()
+        tasks.do.side_effect = AgentExecutionError("agent failed safely")
+        stderr = io.StringIO()
+        argv = [
+            "agent-os",
+            "do",
+            "Prepare a safe change",
+            "--workspace",
+            str(self.workspace),
+        ]
+        with patch(
+            "grapheng.cli.UserTaskModule", return_value=tasks
+        ), patch.object(sys, "argv", argv), contextlib.redirect_stderr(stderr):
+            self.assertEqual(1, main())
+
+        self.assertEqual("agent-os: agent failed safely\n", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_cli_invalid_json_input_is_reported_without_a_traceback(self):
+        stderr = io.StringIO()
+        missing = self.root / "missing-cases.json"
+        argv = [
+            "agent-os",
+            "rsi-opt",
+            "freeze-suite",
+            "--optimization-root",
+            str(self.root / "optimization"),
+            "--cases",
+            str(missing),
+        ]
+        with patch.object(sys, "argv", argv), contextlib.redirect_stderr(stderr):
+            self.assertEqual(2, main())
+
+        self.assertIn("JSON input does not exist", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
     def test_cli_background_approval_forwards_priority(self):
         task_id = "task-0123456789abcdef"
         tasks = Mock()
@@ -292,6 +409,23 @@ class UserTaskModuleTests(unittest.TestCase):
             task_id, "operator", background=True, priority=12
         )
         self.assertIn("priority 12", output.getvalue())
+
+    def test_background_start_failure_rolls_back_approval_before_queueing(self):
+        task_id = "task-2222222222222222"
+        resident = Mock()
+        resident.inspect.return_value = None
+        resident.start_background.side_effect = ContractViolation(
+            "resident coordinator did not start"
+        )
+        tasks = self.module(task_id, resident_factory=lambda: resident)
+        tasks.do("Prepare a safe change", self.workspace)
+
+        with self.assertRaisesRegex(ContractViolation, "did not start"):
+            tasks.approve(task_id, "operator", background=True)
+
+        self.assertEqual("awaiting_approval", tasks.status(task_id)["phase"])
+        self.assertFalse((tasks.tasks_root / task_id / "approval.json").exists())
+        resident.submit.assert_not_called()
 
     def test_background_task_pauses_and_resumes_without_repeating_mutation(self):
         task_id = "task-fedcba9876543210"

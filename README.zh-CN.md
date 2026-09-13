@@ -77,8 +77,9 @@ agent-os demo examples/minimal_graph.json --work-dir /tmp/agent-os-demo
 `setup` 会初始化本地可迁移状态，检查 Python、文件系统语义、Codex、Claude
 Code、Pi、OpenCode 和可选 Orca，并发现 OpenClaw、Hermes Agent 等已安装的
 Agent 工具，再按优先级给出修复步骤。它只执行 help/version 探测，不会调用模型。
-需要版本化诊断数据时使用 `--json`，需要更换本地状态目录时使用
-`--home /path/to/state`。
+需要版本化诊断数据时使用 `--json`，需要更换本地主目录时使用
+`--home /path/to/agent-os-home`。运行态直接保存在该目录下，可迁移状态固定保存在
+`<home>/state`。
 
 ### 日常任务入口
 
@@ -127,7 +128,7 @@ agent-os center --json
 运行全部测试：
 
 ```bash
-PYTHONPATH=. python3 -m unittest discover -s tests -v
+python3 -m pytest -q
 ```
 
 ### 建立用户结果基线
@@ -231,10 +232,10 @@ resident.start_background()
 | 工具 | 已验证版本（Darwin arm64） | 协议 | 接入方式 |
 | --- | --- | --- | --- |
 | Codex | `0.148.0-alpha.9`、`0.149.0-alpha.4.1` | `exec-jsonl-v1` | 本地 CLI Adapter |
-| Claude Code | `2.1.234`、`2.1.241` | `json-envelope-v1` | 本地 CLI Adapter |
-| Pi | `0.84.1` | `message-end-jsonl-v1` | 本地 CLI Adapter |
+| Claude Code | `2.1.234`、`2.1.241`、`2.1.266` | `json-envelope-v1` | 本地 CLI Adapter |
+| Pi | `0.84.1`、`0.85.1` | `message-end-jsonl-v1` | 本地 CLI Adapter |
 | [OpenCode](https://opencode.ai/) | `1.18.18` | `run-jsonl-v1` | 本地 CLI Adapter |
-| Orca | `1.4.180` | `orca-json-command-v1` | 图编译器、后端与协调器 |
+| Orca | `1.4.180`、`1.4.192` | `orca-json-command-v1` | 图编译器、后端与协调器 |
 
 Adapter 会把统一的 `read / shell / edit / write` 工具契约翻译成各产品协议。Claude Code 发现还会适配暂时没有 `--safe-mode` 参数的版本：隔离仍由 `CLAUDE_CODE_SAFE_MODE=1` 开启；参数存在时则同时使用两种入口。它与 `--permission-mode dontAsk` 并不等价，后者只管理工具授权，不负责隔离本地配置。原有工具于 2026-08-18 在 Darwin arm64 上完成只读协议验收，OpenCode 于 2026-08-19 使用官方发布二进制完成验收，本机更新后的 Codex 与 Claude Code 于 2026-08-24 完成验收。证据保存在版本库并随发行包迁移。运行时会执行平台限定的认证硬闸门：协议兼容但版本或平台未认证时仍会出现在诊断中，但不能执行任务。
 
@@ -285,7 +286,7 @@ Setup 还会识别下列工具，但不会把它们误当成可执行 Adapter：
 
 ## 状态迁移
 
-稳定的 Agent OS 根目录保存 learning、optimization、reuse、approvals 和 routing 状态。导出包使用严格文件白名单、逐文件 SHA-256 和 staging schema 转换。
+可迁移状态根目录保存 learning、optimization、reuse、approvals 和 routing 状态。默认主目录下的实际状态根是 `~/.agent-os/state`；低级 `agent-os agent-os ... --root` 命令直接接收这个状态根。导出包使用严格文件白名单、逐文件 SHA-256 和 staging schema 转换。
 
 ```bash
 agent-os agent-os status --root /path/to/agent-os-state

@@ -4,17 +4,19 @@ import shlex
 import sys
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any, Mapping, Optional, Sequence
 
+from . import telemetry
 from .adapters import discover_local_executors
 from .agent_nodes import AgentNodeHandler
 from .console import ApprovalInbox, OperationsConsole
 from .console_server import OperationsServer
 from .distribution import AgentOSDistribution
 from .engineering import EngineeringWorkflow, ProjectPolicy, default_project_policy
+from .errors import ContractViolation, GraphEngineeringError
 from .evaluation import EvaluationCase, EvaluationLab
 from .learning import RSILoop
 from .model import GraphSpec
-from .os import AgentOS
 from .optimization import (
     CanaryObservation,
     FailurePattern,
@@ -23,6 +25,7 @@ from .optimization import (
     RSIOptimizationLab,
 )
 from .orca import OrcaGraphCompiler
+from .os import AgentOS
 from .policy import AllowListGatePolicy
 from .publication import VerifiedResultPublisher
 from .resident import ResidentCoordinator
@@ -51,11 +54,19 @@ def _demo_registry() -> NodeRegistry:
 
 
 def _json_file(path: Path):
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as error:
+        raise ContractViolation(f"JSON input does not exist: {path}") from error
+    except OSError as error:
+        raise ContractViolation(f"cannot read JSON input {path}: {error}") from error
+    except json.JSONDecodeError as error:
+        raise ContractViolation(f"invalid JSON input {path}: {error}") from error
 
 
 def _run_optimization_command(args, parser) -> int:
     lab = RSIOptimizationLab(args.optimization_root)
+    value: Mapping[str, Any]
     if args.action == "status":
         value = {
             "active": {
@@ -180,6 +191,7 @@ def _engineering_workflow(args, agent_os) -> EngineeringWorkflow:
 
 
 def _run_engineering_command(args, parser, agent_os) -> int:
+    value: Mapping[str, Any]
     if args.action == "init":
         target = args.policy or args.workspace / ".agent-os" / "engineering.json"
         try:
@@ -225,6 +237,7 @@ def _run_engineering_command(args, parser, agent_os) -> int:
 
 def _run_evaluation_command(args, parser) -> int:
     lab = EvaluationLab(args.root)
+    value: Mapping[str, Any]
     if args.action == "record-engineering":
         if args.case is None or args.report is None or not args.run_id:
             parser.error(
@@ -251,6 +264,15 @@ def _run_evaluation_command(args, parser) -> int:
         value = lab.status()
     print(json.dumps(value, ensure_ascii=False, sort_keys=True))
     return 0
+
+
+def _cost_text(usage: Mapping[str, Any]) -> str:
+    cost = float(usage.get("cost_usd", 0.0))
+    if usage.get("cost_complete") is True:
+        return f"${cost:.4f}"
+    if cost > 0:
+        return f"${cost:.4f} (partial)"
+    return "cost unknown"
 
 
 def _print_user_task(value, json_output: bool) -> None:
@@ -290,7 +312,7 @@ def _print_user_task(value, json_output: bool) -> None:
         print(
             "Usage: "
             f"{usage.get('tokens_used', 0)} tokens, "
-            f"${float(usage.get('cost_usd', 0.0)):.4f}"
+            f"{_cost_text(usage)}"
         )
     scheduling = value.get("scheduling")
     if isinstance(scheduling, dict):
@@ -362,7 +384,7 @@ def _print_task_center(value, json_output: bool) -> None:
     completeness = "complete" if usage["complete"] else "partial"
     print(
         f"Usage: {usage['tokens_used']} tokens · "
-        f"${usage['cost_usd']:.4f} · {completeness}"
+        f"{_cost_text(usage)} · {completeness}"
     )
     jobs = value["jobs"]
     if not jobs:
@@ -430,7 +452,29 @@ def _print_setup(value, json_output: bool) -> None:
             print(f"  Run: {shlex.join(command)}")
 
 
-def main() -> int:
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Run one CLI invocation, reporting contract failures as errors not crashes.
+
+    Every guard in Agent OS raises :class:`ContractViolation` with an
+    actionable message. Letting those reach the terminal as a traceback made a
+    normal, expected outcome - "this task needs clarification" - look like a
+    crash, so they are reported here instead.
+    """
+
+    try:
+        return _dispatch(argv)
+    except ContractViolation as error:
+        print(f"agent-os: {error}", file=sys.stderr)
+        return 2
+    except GraphEngineeringError as error:
+        print(f"agent-os: {error}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("agent-os: interrupted", file=sys.stderr)
+        return 130
+
+
+def _dispatch(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="agent-os")
     subparsers = parser.add_subparsers(dest="command", required=True)
     setup_parser = subparsers.add_parser("setup")
@@ -627,7 +671,7 @@ def main() -> int:
     evaluation_parser.add_argument("--human-decisions", type=int)
     evaluation_parser.add_argument("--recovery-attempted", action="store_true")
     evaluation_parser.add_argument("--recovery-succeeded", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.command == "setup":
         value = AgentOSDistribution(source_root=args.source_root).setup(
@@ -644,9 +688,9 @@ def main() -> int:
         return _run_user_task_command(args)
 
     if args.command == "center":
-        value = ResidentCoordinator(
-            args.home or default_agent_os_home()
-        ).task_center(args.limit)
+        resident = ResidentCoordinator(args.home or default_agent_os_home())
+        resident.ensure_running()
+        value = resident.task_center(args.limit)
         _print_task_center(value, args.json_output)
         return 0
 
@@ -881,6 +925,7 @@ def main() -> int:
         return 0
 
     if args.command == "agent-run":
+        telemetry.configure(args.work_dir)
         learning_root = agent_os.learning_root if agent_os else args.learning_root
         router = (
             agent_os.router()
@@ -914,6 +959,7 @@ def main() -> int:
                     },
                     "tokens_used": result.tokens_used,
                     "cost_usd": result.cost_usd,
+                    "usage": result.usage.to_dict(),
                     "artifacts": result.artifacts,
                 },
                 ensure_ascii=False,
@@ -922,6 +968,9 @@ def main() -> int:
         )
         return 0 if result.success else 1
 
+    # Demo runs have no Agent OS home argument; keep their telemetry beside
+    # their disposable run evidence instead of bootstrapping ~/.agent-os.
+    telemetry.configure(args.work_dir)
     runtime = GraphRuntime(
         graph,
         _demo_registry(),
@@ -936,6 +985,7 @@ def main() -> int:
                 "success": result.success,
                 "tokens_used": result.tokens_used,
                 "cost_usd": result.cost_usd,
+                "usage": result.usage.to_dict(),
                 "artifacts": result.artifacts,
             },
             ensure_ascii=False,

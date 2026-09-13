@@ -1,12 +1,16 @@
-import hashlib
 import json
 import os
 import shutil
 import tempfile
 import time
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Mapping, Optional, Tuple
 
+from ._store import (
+    atomic_json_write,
+    read_json_object,
+    sha256_hex,
+)
 from .console import ApprovalInbox
 from .errors import ContractViolation
 from .governance import ProviderGovernanceStore
@@ -22,7 +26,6 @@ from .optimization import RegressionSuite, RSIOptimizationLab
 from .reuse import VerifiedArtifactCache, VerifiedReuseRecord
 from .routing import PolicyRouter, ProviderPolicy
 
-
 AGENT_OS_SCHEMA_VERSION = 1
 AGENT_OS_DIRECTORIES = (
     "learning",
@@ -33,6 +36,24 @@ AGENT_OS_DIRECTORIES = (
 )
 _ROOT_KIND = "grapheng-agent-os-root"
 _BUNDLE_KIND = "grapheng-agent-os-bundle"
+
+
+def state_root_for_home(home: Path) -> Path:
+    """Return the portable state root for one operational Agent OS home.
+
+    Preview builds briefly initialized portable state directly in ``home``.
+    Refuse that legacy layout instead of silently creating a second state tree;
+    ``agent-os setup`` diagnoses it without modifying either location.
+    """
+
+    home = home.expanduser().absolute()
+    legacy_manifest = home / "manifest.json"
+    if legacy_manifest.exists() or legacy_manifest.is_symlink():
+        raise ContractViolation(
+            "legacy Agent OS state exists directly under the home; "
+            "move or restore it into <home>/state before running tasks"
+        )
+    return home / "state"
 
 
 def _allowed_path(relative: PurePosixPath) -> bool:
@@ -62,32 +83,6 @@ def _allowed_path(relative: PurePosixPath) -> bool:
     )
 
 
-def _sha256(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
-def _atomic_bytes_write(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, raw_path = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
-    temporary = Path(raw_path)
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(str(temporary), str(path))
-    finally:
-        if temporary.exists():
-            temporary.unlink()
-
-
-def _atomic_json_write(path: Path, value: Mapping[str, Any]) -> None:
-    data = json.dumps(
-        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
-    _atomic_bytes_write(path, data)
-
-
 class AgentOS:
     """Owns portable Agent OS state behind one versioned root interface."""
 
@@ -105,14 +100,14 @@ class AgentOS:
         self.root.mkdir(parents=True, exist_ok=True)
         manifest_path = self.root / "manifest.json"
         if manifest_path.exists():
-            manifest = self._read_json(manifest_path)
+            manifest = read_json_object(manifest_path, label="Agent OS state")
             if (
                 manifest.get("kind") != _ROOT_KIND
                 or manifest.get("schema_version") != AGENT_OS_SCHEMA_VERSION
             ):
                 raise ContractViolation("unsupported Agent OS root manifest")
         else:
-            _atomic_json_write(
+            atomic_json_write(
                 manifest_path,
                 {
                     "kind": _ROOT_KIND,
@@ -168,7 +163,7 @@ class AgentOS:
         lab = RSIOptimizationLab(self.optimization_root)
         active_candidates = lab.active_candidates()
         decisions = self._approval_decisions()
-        root_manifest = self._read_json(self.root / "manifest.json")
+        root_manifest = read_json_object(self.root / "manifest.json", label="Agent OS state")
         return {
             "schema_version": AGENT_OS_SCHEMA_VERSION,
             "bundle_schema_version": BUNDLE_SCHEMA_VERSION,
@@ -218,11 +213,11 @@ class AgentOS:
                 records.append(
                     {
                         "path": relative.as_posix(),
-                        "sha256": _sha256(data),
+                        "sha256": sha256_hex(data),
                         "size": len(data),
                     }
                 )
-            _atomic_json_write(
+            atomic_json_write(
                 temporary / "manifest.json",
                 {
                     "kind": _BUNDLE_KIND,
@@ -255,7 +250,7 @@ class AgentOS:
         if not bundle.is_dir() or bundle.is_symlink():
             raise ContractViolation("Agent OS import bundle must be a real directory")
         self._assert_import_target_empty()
-        source_manifest = self._read_json(bundle / "manifest.json")
+        source_manifest = read_json_object(bundle / "manifest.json", label="Agent OS state")
         source_version = self._migrations.source_version(
             source_manifest, BUNDLE_SCHEMA_VERSION
         )
@@ -275,7 +270,7 @@ class AgentOS:
                 if source.is_symlink():
                     raise ContractViolation("Agent OS bundle cannot contain symlinks")
                 data = source.read_bytes()
-                if len(data) != metadata["size"] or _sha256(data) != metadata["sha256"]:
+                if len(data) != metadata["size"] or sha256_hex(data) != metadata["sha256"]:
                     raise ContractViolation(
                         f"Agent OS bundle checksum mismatch: {relative.as_posix()}"
                     )
@@ -293,13 +288,13 @@ class AgentOS:
             self._validate_state(staging)
             imported_files = len(self._declared_files(migrated_manifest))
             audit = self._migration_audit(report, imported_files)
-            current_root_manifest = self._read_json(self.root / "manifest.json")
+            current_root_manifest = read_json_object(self.root / "manifest.json", label="Agent OS state")
             final_root_manifest = dict(current_root_manifest)
             final_root_manifest["last_import"] = {
                 **audit,
                 "imported_at": self._clock(),
             }
-            _atomic_json_write(staging / "manifest.json", final_root_manifest)
+            atomic_json_write(staging / "manifest.json", final_root_manifest)
             for name in AGENT_OS_DIRECTORIES:
                 (staging / name).mkdir(exist_ok=True)
             self._assert_import_target_empty()
@@ -353,7 +348,7 @@ class AgentOS:
             records.append(
                 {
                     "path": relative.as_posix(),
-                    "sha256": _sha256(data),
+                    "sha256": sha256_hex(data),
                     "size": len(data),
                 }
             )
@@ -522,17 +517,7 @@ class AgentOS:
         path = self.approvals_root / "decisions.json"
         if not path.exists():
             return {}
-        value = self._read_json(path)
+        value = read_json_object(path, label="Agent OS state")
         if not isinstance(value, dict):
             raise ContractViolation("Agent OS approval decisions must be an object")
-        return value
-
-    @staticmethod
-    def _read_json(path: Path) -> Mapping[str, Any]:
-        try:
-            value = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
-            raise ContractViolation(f"invalid Agent OS JSON {path.name}: {error}") from error
-        if not isinstance(value, dict):
-            raise ContractViolation(f"Agent OS JSON {path.name} must be an object")
         return value

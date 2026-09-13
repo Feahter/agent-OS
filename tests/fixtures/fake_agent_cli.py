@@ -3,7 +3,6 @@ import os
 import sys
 import time
 
-
 mode = sys.argv[1]
 fault = sys.argv[2] if len(sys.argv) > 2 else None
 
@@ -15,6 +14,14 @@ elif fault == "crash":
 elif fault == "rate-limit":
     print("429 too many requests: rate limit exceeded", file=sys.stderr)
     raise SystemExit(29)
+elif fault == "flood":
+    payload = "x" * 65536
+    while True:
+        try:
+            sys.stdout.write(payload)
+            sys.stdout.flush()
+        except BrokenPipeError:
+            raise SystemExit(0) from None
 elif fault == "corrupt":
     print("{not-json")
     raise SystemExit(0)
@@ -66,7 +73,14 @@ elif mode == "pi":
                     "role": "assistant",
                     "content": [{"type": "text", "text": '{"answer":"pi"}'}],
                     "stopReason": "stop",
-                    "usage": {"totalTokens": 7, "cost": {"total": 0.02}},
+                    "usage": {
+                        "input": 2,
+                        "output": 3,
+                        "cacheRead": 1,
+                        "cacheWrite": 1,
+                        "totalTokens": 7,
+                        "cost": {"total": 0.02},
+                    },
                 },
             }
         )
@@ -90,7 +104,12 @@ elif mode == "codex":
         json.dumps(
             {
                 "type": "turn.completed",
-                "usage": {"input_tokens": 5, "cached_input_tokens": 3, "output_tokens": 3},
+                "usage": {
+                    "input_tokens": 5,
+                    "cached_input_tokens": 3,
+                    "output_tokens": 3,
+                    "total_tokens": 8,
+                },
             }
         )
     )

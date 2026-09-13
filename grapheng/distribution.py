@@ -1,6 +1,6 @@
 import fcntl
-import hashlib
 import json
+import math
 import os
 import platform
 import plistlib
@@ -12,21 +12,24 @@ import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from ._store import (
+    read_json_object,
+    sha256_hex,
+)
 from .adapters import (
     ClaudeCodeExecutor,
     CodexExecutor,
     OpenCodeExecutor,
     PiAgentExecutor,
 )
-from .coordinator import ORCA_COORDINATOR_SCHEMA_VERSION
 from .errors import ContractViolation
 from .governance import PROVIDER_GOVERNANCE_SCHEMA_VERSION
 from .merge import CONTROLLED_MERGE_SCHEMA_VERSION
 from .migrations import BUNDLE_SCHEMA_VERSION, default_bundle_migrations
+from .orca_state import ORCA_COORDINATOR_SCHEMA_VERSION
 from .os import AGENT_OS_SCHEMA_VERSION, AgentOS
-
 
 RELEASE_SCHEMA_VERSION = 1
 DIAGNOSTIC_SCHEMA_VERSION = 4
@@ -55,6 +58,12 @@ _REQUIRED_RELEASE_PATHS = (
     PurePosixPath("state.bundle/manifest.json"),
 )
 _COMPATIBILITY_EVIDENCE_PATH = Path("grapheng/compatibility-evidence.json")
+_INSTALLED_RUNTIME_FILES = (
+    Path("grapheng/__init__.py"),
+    Path("grapheng/cli.py"),
+    Path("grapheng/distribution.py"),
+    _COMPATIBILITY_EVIDENCE_PATH,
+)
 _COMPATIBILITY_EVIDENCE_SCHEMA_VERSION = 1
 _VERSION_PATTERN = re.compile(
     r"(?<![0-9])([0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?)"
@@ -316,6 +325,17 @@ class AgentOSDistribution:
         return commands
 
     def doctor(self, agent_os_root: Path) -> Mapping[str, Any]:
+        """Diagnose one portable state root supplied to the low-level interface."""
+
+        root = agent_os_root.expanduser().absolute()
+        return self._diagnostic_report(
+            root,
+            ("agent-os", "agent-os", "doctor", "--root", str(root)),
+        )
+
+    def _diagnostic_report(
+        self, agent_os_root: Path, rerun: Sequence[str]
+    ) -> Mapping[str, Any]:
         checks = [self._python_check(), self._source_check()]
         checks.append(self._filesystem_check(agent_os_root))
         checks.append(self._state_check(agent_os_root))
@@ -362,25 +382,40 @@ class AgentOSDistribution:
             "ready_for_orca": statuses.get("orchestration:orca") == "pass",
             "checks": [item.to_dict() for item in checks],
             "next_actions": self._next_actions(
-                agent_os_root, checks, bool(ready_executors)
+                agent_os_root, checks, bool(ready_executors), rerun
             ),
             "compatibility": self.compatibility_matrix(),
         }
 
-    def setup(self, agent_os_root: Path) -> Mapping[str, Any]:
-        """Initialize portable state and return a no-model first-use diagnostic."""
+    def setup(self, home: Path) -> Mapping[str, Any]:
+        """Initialize ``<home>/state`` and return a no-model first-use diagnostic.
+
+        Operational data may already exist under ``home/runtime`` or
+        ``home/tasks``. Portable policy and learning state always lives below
+        ``home/state`` so it can be exported without task prompts or logs.
+        """
+
+        home = home.expanduser().absolute()
+        state_root = home / "state"
         initialized = False
-        if not agent_os_root.is_symlink() and (
-            not agent_os_root.exists()
-            or (agent_os_root.is_dir() and not any(agent_os_root.iterdir()))
+        if (
+            not home.is_symlink()
+            and (not home.exists() or home.is_dir())
+            and not (home / "manifest.json").exists()
+            and not (home / "manifest.json").is_symlink()
+            and not state_root.is_symlink()
+            and (
+                not state_root.exists()
+                or (state_root.is_dir() and not any(state_root.iterdir()))
+            )
         ):
-            AgentOS(agent_os_root)
+            AgentOS(state_root)
             initialized = True
-        return {
-            **self.doctor(agent_os_root),
-            "initialized": initialized,
-            "model_calls": 0,
-        }
+        report = self._diagnostic_report(
+            state_root,
+            ("agent-os", "setup", "--home", str(home.resolve())),
+        )
+        return {**report, "initialized": initialized, "model_calls": 0}
 
     def rehearse(
         self, agent_os_root: Path, bundle: Optional[Path] = None
@@ -441,12 +476,18 @@ class AgentOSDistribution:
         source = self._open_existing(agent_os_root)
         if output.exists() or output.is_symlink():
             raise ContractViolation(f"Agent OS release target already exists: {output}")
+        try:
+            release_sources = self._runtime_sources()
+        except ContractViolation as error:
+            raise ContractViolation(
+                "Agent OS release requires a complete source checkout: " + str(error)
+            ) from error
         output.parent.mkdir(parents=True, exist_ok=True)
         staging = Path(
             tempfile.mkdtemp(prefix=f".{output.name}.", dir=str(output.parent))
         )
         try:
-            self._copy_runtime(staging)
+            self._copy_runtime(staging, release_sources)
             self._write_json(
                 staging / "COMPATIBILITY.json", self.compatibility_matrix()
             )
@@ -485,7 +526,7 @@ class AgentOSDistribution:
     def verify_release(self, release: Path) -> Mapping[str, Any]:
         if not release.is_dir() or release.is_symlink():
             raise ContractViolation("Agent OS release must be a real directory")
-        manifest = self._read_json(release / "release-manifest.json")
+        manifest = read_json_object(release / "release-manifest.json", label="release JSON")
         if (
             manifest.get("kind") != _RELEASE_KIND
             or manifest.get("schema_version") != RELEASE_SCHEMA_VERSION
@@ -497,7 +538,7 @@ class AgentOSDistribution:
             raise ContractViolation("Agent OS release files do not match its manifest")
         for relative, metadata in declared.items():
             data = actual[relative].read_bytes()
-            if len(data) != metadata["size"] or self._sha256(data) != metadata["sha256"]:
+            if len(data) != metadata["size"] or sha256_hex(data) != metadata["sha256"]:
                 raise ContractViolation(
                     f"Agent OS release checksum mismatch: {relative.as_posix()}"
                 )
@@ -514,7 +555,7 @@ class AgentOSDistribution:
         )
         if manifest.get("release_id") != expected_release_id:
             raise ContractViolation("Agent OS release identity does not match its files")
-        compatibility = self._read_json(release / "COMPATIBILITY.json")
+        compatibility = read_json_object(release / "COMPATIBILITY.json", label="release JSON")
         state = compatibility.get("state")
         if (
             not isinstance(state, dict)
@@ -560,18 +601,18 @@ class AgentOSDistribution:
 
     def _source_check(self) -> DiagnosticCheck:
         try:
-            sources = self._runtime_sources()
+            sources = self._installed_runtime_sources()
         except ContractViolation as error:
             return DiagnosticCheck(
                 "runtime:source",
                 "fail",
-                "Runtime source layout is incomplete",
+                "Installed runtime layout is incomplete",
                 {"error": str(error)},
             )
         return DiagnosticCheck(
             "runtime:source",
             "pass",
-            "Runtime source layout is complete",
+            "Installed runtime layout is complete",
             {"files": len(sources)},
         )
 
@@ -802,9 +843,10 @@ class AgentOSDistribution:
         agent_os_root: Path,
         checks: Sequence[DiagnosticCheck],
         ready_for_agent_execution: bool,
+        rerun: Sequence[str],
     ) -> Sequence[Mapping[str, Any]]:
-        rerun = ["agent-os", "setup", "--home", str(agent_os_root.resolve())]
-        actions = []
+        rerun = list(rerun)
+        actions: List[Mapping[str, Any]] = []
         for check in checks:
             if check.status == "pass":
                 continue
@@ -934,7 +976,7 @@ class AgentOSDistribution:
 
     def _compatibility_evidence(self) -> Mapping[str, Any]:
         path = self.source_root / _COMPATIBILITY_EVIDENCE_PATH
-        evidence = self._read_json(path)
+        evidence = read_json_object(path, label="release JSON")
         adapters = evidence.get("adapters")
         evidence_platform = evidence.get("platform")
         if (
@@ -975,8 +1017,59 @@ class AgentOSDistribution:
                     raise ContractViolation(
                         f"invalid compatibility evidence for {probe.probe_id}"
                     )
+                canary = record.get("runtime_canary")
+                if canary is not None:
+                    self._validate_runtime_canary(canary, probe.probe_id)
                 versions.add(record["version"])
         return evidence
+
+    @staticmethod
+    def _validate_runtime_canary(value: Any, executor_id: str) -> None:
+        required = {
+            "cost_usd",
+            "max_cost_usd",
+            "model_call",
+            "prompt_or_response_persisted",
+            "structured_output",
+            "success",
+            "tokens_used",
+            "tools",
+            "validated_at",
+        }
+        if not isinstance(value, dict) or set(value) != required:
+            raise ContractViolation(
+                f"invalid runtime canary evidence for {executor_id}"
+            )
+        cost = value["cost_usd"]
+        maximum = value["max_cost_usd"]
+        tokens = value["tokens_used"]
+        tools = value["tools"]
+        if (
+            isinstance(cost, bool)
+            or not isinstance(cost, (int, float))
+            or not math.isfinite(cost)
+            or cost < 0
+            or isinstance(maximum, bool)
+            or not isinstance(maximum, (int, float))
+            or not math.isfinite(maximum)
+            or maximum <= 0
+            or cost > maximum
+            or isinstance(tokens, bool)
+            or not isinstance(tokens, int)
+            or tokens < 0
+            or not isinstance(tools, list)
+            or not tools
+            or any(not isinstance(tool, str) or not tool for tool in tools)
+            or value["model_call"] is not True
+            or value["prompt_or_response_persisted"] is not False
+            or value["structured_output"] is not True
+            or value["success"] is not True
+            or not isinstance(value["validated_at"], str)
+            or not value["validated_at"].strip()
+        ):
+            raise ContractViolation(
+                f"invalid runtime canary evidence for {executor_id}"
+            )
 
     @classmethod
     def _installed_version(
@@ -1012,12 +1105,25 @@ class AgentOSDistribution:
             return None
         return value if isinstance(value, str) and value.strip() else None
 
-    def _copy_runtime(self, destination: Path) -> None:
-        for source in self._runtime_sources():
+    def _copy_runtime(
+        self, destination: Path, sources: Optional[Sequence[Path]] = None
+    ) -> None:
+        for source in sources if sources is not None else self._runtime_sources():
             relative = source.relative_to(self.source_root)
             target = destination / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, target)
+
+    def _installed_runtime_sources(self) -> Tuple[Path, ...]:
+        if not self.source_root.is_dir() or self.source_root.is_symlink():
+            raise ContractViolation("Graph Engineering install root must be a real directory")
+        sources = []
+        for relative in _INSTALLED_RUNTIME_FILES:
+            source = self.source_root / relative
+            if not source.is_file() or source.is_symlink():
+                raise ContractViolation(f"missing installed runtime file: {relative.as_posix()}")
+            sources.append(source)
+        return tuple(sources)
 
     def _runtime_sources(self) -> Tuple[Path, ...]:
         if not self.source_root.is_dir() or self.source_root.is_symlink():
@@ -1068,7 +1174,7 @@ class AgentOSDistribution:
         return [
             {
                 "path": relative.as_posix(),
-                "sha256": cls._sha256(path.read_bytes()),
+                "sha256": sha256_hex(path.read_bytes()),
                 "size": path.stat().st_size,
             }
             for relative, path in sorted(
@@ -1130,7 +1236,7 @@ class AgentOSDistribution:
 
     @classmethod
     def _portable_state_digest(cls, bundle: Path) -> str:
-        manifest = cls._read_json(bundle / "manifest.json")
+        manifest = read_json_object(bundle / "manifest.json", label="release JSON")
         records = manifest.get("files")
         if not isinstance(records, list):
             raise ContractViolation("Agent OS bundle files must be an array")
@@ -1147,16 +1253,12 @@ class AgentOSDistribution:
             )
         return cls._digest_json(sorted(identity, key=lambda item: str(item["path"])))
 
-    @staticmethod
-    def _sha256(data: bytes) -> str:
-        return hashlib.sha256(data).hexdigest()
-
     @classmethod
     def _digest_json(cls, value: Any) -> str:
         encoded = json.dumps(
             value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")
-        return cls._sha256(encoded)
+        return sha256_hex(encoded)
 
     @staticmethod
     def _write_json(path: Path, value: Mapping[str, Any]) -> None:
@@ -1165,17 +1267,6 @@ class AgentOSDistribution:
             value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
         path.write_text(data, encoding="utf-8")
-
-    @staticmethod
-    def _read_json(path: Path) -> Mapping[str, Any]:
-        try:
-            value = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
-            raise ContractViolation(f"invalid release JSON {path.name}: {error}") from error
-        if not isinstance(value, dict):
-            raise ContractViolation(f"release JSON {path.name} must be an object")
-        return value
-
 
 _RESTORE_GUIDE = """# Agent OS 发行包恢复清单
 

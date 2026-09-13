@@ -10,7 +10,6 @@ from .events import GraphEvent
 from .model import GraphSpec, NodeSpec
 from .validation import validate_graph
 
-
 ORCA_AGENT_IDS = {
     "claude-code": "claude",
     "codex": "codex",
@@ -137,7 +136,7 @@ class OrcaGraphCompiler:
                 raise ContractViolation(
                     f"agent node {node.id} uses executor {executor}, which Orca cannot launch"
                 ) from error
-        contract = {
+        contract: Dict[str, Any] = {
             "node_id": node.id,
             "task_type": node.agent.task_type,
             "model_family": node.agent.model_family,
@@ -146,7 +145,7 @@ class OrcaGraphCompiler:
             "tools": list(node.agent.tools),
             "result_protocol": {
                 "worker_done_payload": {
-                    "outputs": {key: "<value>" for key in node.writes},
+                    "outputs": dict.fromkeys(node.writes, "<value>"),
                     "text": "<final response>",
                     "tokens_used": "<non-negative integer>",
                     "cost_usd": "<optional non-negative number>",

@@ -1,4 +1,3 @@
-import fcntl
 import hashlib
 import json
 import math
@@ -10,12 +9,12 @@ from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
+from ._store import file_lock
 from .artifacts import ArtifactRecord
 from .errors import ContractViolation
 from .model import NodeSpec
 from .orca import ChangeSetArtifact
 from .publication import ArtifactVersion
-
 
 CONTROLLED_MERGE_SCHEMA_VERSION = 1
 _REVISION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$")
@@ -261,7 +260,7 @@ class ControlledGitMerger:
             "patch_path": change_set.patch_path,
             "conflicts": list(change_set.conflicts),
         }
-        identity = {
+        identity: Dict[str, Any] = {
             "schema_version": CONTROLLED_MERGE_SCHEMA_VERSION,
             "run_id": run_id,
             "source_node_id": source_node_id,
@@ -305,6 +304,8 @@ class ControlledGitMerger:
         )
         if rejection is not None:
             return self._rejected(candidate, rejection, authorization)
+        if authorization is None:
+            raise ContractViolation("accepted merge candidate has no authorization")
         with self._repository_lock():
             preflight = self._preflight(candidate, authorization)
             if preflight is not None:
@@ -367,6 +368,8 @@ class ControlledGitMerger:
         )
         if rejection is not None:
             return self._rejected(candidate, rejection, authorization)
+        if authorization is None:
+            raise ContractViolation("accepted merge candidate has no authorization")
         with self._repository_lock():
             current = self._revision(self.target_repository, "HEAD")
             if (
@@ -674,13 +677,8 @@ class ControlledGitMerger:
     def _repository_lock(self):
         common = self._common_dir(self.target_repository)
         lock_path = common / "grapheng-merge.lock"
-        lock_path.touch(exist_ok=True)
-        with lock_path.open("r+") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        with file_lock(lock_path):
+            yield
 
     def _assert_repository(self, repository: Path) -> None:
         if not repository.is_dir():

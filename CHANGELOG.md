@@ -4,6 +4,21 @@
 
 ## Unreleased
 
+- 统一本地主目录契约：`setup --home H`、日常任务和 Resident 现在共同使用 `H/state` 作为可迁移状态根；即使 `H/runtime` 已存在也能安全初始化，不再形成启动死锁或两套状态。
+- 将安装完整性与源码发行完整性拆开：wheel 安装后的 `setup` 不再依赖 README、测试和 `.workflow`，源码 release 仍严格要求完整 checkout；CI 新增真实 wheel/sdist smoke test。
+- 修复规划失败遗留无 ID 孤儿任务、后台 Resident 启动失败遗留批准状态，以及崩溃后无法通过 `status` / `center` / `resume` 恢复的问题。
+- 遥测统一对 `detail` / `reason` / `error` 等自由文本只保存摘要指纹与长度；Agent 执行类错误由 CLI 输出单行错误，不再显示 traceback。
+- 补充本机 Claude Code `2.1.266`、Pi `0.85.1` 与 Orca `1.4.192` 的 Darwin arm64 协议证据；Claude 另通过一次 `$0.25` 硬上限的只读结构化输出 canary（实际费用 `$0.02937175`）。
+- 将原子写、JSON 读取和文件锁收敛到唯一实现 `grapheng/_store.py`：原先散落在 16 个模块的副本语义已经漂移（部分缺 `fsync`、全部未 flush 父目录），统一实现补上目录 fsync 以保证重命名本身可在断电后存活；`scripts/check_shared_primitives.py` 在 CI 中阻止副本回归。
+- 为 Agent 调用增加硬输出上限：`run_bounded_process` 增量抽取 stdout/stderr，越限即终止进程并失败关闭，不再把整个流缓冲进内存；上限可用 `AGENT_OS_MAX_AGENT_OUTPUT_BYTES` 调整。
+- 将 Agent 失败归因显式化：`FailureClassification` 区分 `exit_code` / `structured` / `heuristic` 证据来源，路由与熔断不再把子串猜测当作事实。
+- 增加结构化遥测 `grapheng/telemetry.py`：无提示词的 JSONL 事件日志写入 `<home>/runtime/logs/`，同时经 `grapheng` logger 输出；覆盖 Graph 节点迁移、常驻任务状态迁移和 Agent 调用。
+- 增加 `grapheng/index.py` sqlite 投影索引：`center` 不再对每个历史任务重复读盘，仅在源文件指纹变化时重算；索引失败一律回退重算。
+- 拆分 Orca 协调器：协议解码（`orca_protocol`）、状态文档校验（`orca_state`）、结果发布（`orca_publication`）成为可独立测试的模块。
+- CLI 不再对预期内的契约失败抛出 traceback，改为可读错误与退出码 2。
+- 修复 `OrcaCoordinator._executor_id` 被误标为 `@staticmethod` 却引用 `self`，以及 `ExecutorProfile` 校验消息把 `dataclasses.field` 函数当成字段名输出。
+- CI 增加 ruff、mypy、macOS 与 Python 3.13 覆盖，测试统一为 pytest。
+
 - 将协议、版本和平台兼容证据提升为运行时硬闸门；`setup` 未认证的 Agent 不再被真实任务发现，并补充本机 Codex `0.149.0-alpha.4.1` 与 Claude Code `2.1.241` 的 Darwin arm64 零模型证据。
 - 修复 Claude Code `--safe-mode` 在版本间漂移导致的启动失败；按本机协议自适应参数，同时始终保持安全模式环境隔离。
 - 将 Agent 节点 `max_tokens` 提升为执行器硬能力契约；无硬 Token 上限的执行器和 Orca worker 会在调用前失败关闭，复用键与并发预留同步纳入该边界。

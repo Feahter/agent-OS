@@ -1,21 +1,25 @@
 """Stable user task actions over the bounded engineering workflow."""
 
-import json
 import os
 import re
-import tempfile
+import shutil
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
 
+from . import telemetry
+from ._store import (
+    atomic_json_write,
+    read_json_object,
+)
 from .adapters import discover_local_executors
+from .agents import ModelUsage
 from .engineering import EngineeringPlan, EngineeringWorkflow, ProjectPolicy
 from .errors import ContractViolation
 from .intents import IntentCompiler, TaskIntent
 from .learning import RSILoop
-from .os import AgentOS
-
+from .os import AgentOS, state_root_for_home
 
 USER_TASK_SCHEMA_VERSION = 1
 _TASK_ID = re.compile(r"^task-[0-9a-f]{16}$")
@@ -25,40 +29,6 @@ _TERMINAL_PHASES = {"succeeded", "failed", "cancelled"}
 def default_agent_os_home() -> Path:
     configured = os.environ.get("AGENT_OS_HOME")
     return Path(configured).expanduser() if configured else Path.home() / ".agent-os"
-
-
-def _atomic_json_write(path: Path, value: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handle = tempfile.NamedTemporaryFile(
-        mode="w", encoding="utf-8", dir=str(path.parent), delete=False
-    )
-    try:
-        with handle:
-            json.dump(
-                value,
-                handle,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(handle.name, path)
-    finally:
-        if os.path.exists(handle.name):
-            os.unlink(handle.name)
-
-
-def _read_json(path: Path, field: str) -> Mapping[str, Any]:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError as error:
-        raise ContractViolation(f"{field} does not exist: {path}") from error
-    except (OSError, json.JSONDecodeError) as error:
-        raise ContractViolation(f"cannot read {field}: {error}") from error
-    if not isinstance(value, dict):
-        raise ContractViolation(f"{field} must be a JSON object")
-    return value
 
 
 class UserTaskModule:
@@ -77,7 +47,7 @@ class UserTaskModule:
     ):
         self.home = (home or default_agent_os_home()).expanduser().absolute()
         self.tasks_root = self.home / "tasks"
-        self.state_root = self.home / "state"
+        self.state_root = state_root_for_home(self.home)
         for path, field in (
             (self.home, "Agent OS home"),
             (self.tasks_root, "Agent OS tasks root"),
@@ -88,6 +58,9 @@ class UserTaskModule:
             if path.exists() and not path.is_dir():
                 raise ContractViolation(f"{field} must be a directory")
         self.tasks_root.mkdir(parents=True, exist_ok=True)
+        # Point the telemetry journal at the same home the tasks live in, so a
+        # non-default --home never writes its trace somewhere else.
+        telemetry.configure(self.home)
         self.agent_os = AgentOS(self.state_root)
         self._workflow_factory = workflow_factory
         self._intent_compiler = intent_compiler or IntentCompiler()
@@ -140,19 +113,31 @@ class UserTaskModule:
             check_commands=intent.verification_commands
         )
         task_id, task_dir = self._allocate_task_dir()
-        _atomic_json_write(
-            task_dir / "task.json",
-            {
-                "schema_version": USER_TASK_SCHEMA_VERSION,
-                "task_id": task_id,
-                "kind": "engineering",
-                "workspace": str(workspace),
-                "policy": str(resolved_policy),
-                "created_at": self._clock(),
-            },
-        )
-        workflow = self._workflow(task_dir, policy)
-        workflow.prepare(objective.strip(), intent.to_dict())
+        try:
+            atomic_json_write(
+                task_dir / "task.json",
+                {
+                    "schema_version": USER_TASK_SCHEMA_VERSION,
+                    "task_id": task_id,
+                    "kind": "engineering",
+                    "workspace": str(workspace),
+                    "policy": str(resolved_policy),
+                    "created_at": self._clock(),
+                },
+            )
+            workflow = self._workflow(task_dir, policy)
+            workflow.prepare(objective.strip(), intent.to_dict())
+        except Exception as error:
+            # The caller has not received the task ID yet, so an incomplete
+            # preparation cannot be recovered through the public task actions.
+            # Remove only the directory allocated by this invocation.
+            try:
+                shutil.rmtree(task_dir)
+            except OSError as cleanup_error:
+                raise ContractViolation(
+                    f"task preparation failed and cleanup was incomplete: {cleanup_error}"
+                ) from error
+            raise
         return self.status(task_id)
 
     def status(self, task_id: str) -> Mapping[str, Any]:
@@ -199,6 +184,8 @@ class UserTaskModule:
         resident = self._resident_if_initialized()
         scheduling = resident.inspect(task_id) if resident is not None else None
         if scheduling is not None:
+            resident.ensure_running()
+            scheduling = resident.inspect(task_id) or scheduling
             value["scheduling"] = {
                 key: scheduling.get(key)
                 for key in (
@@ -250,7 +237,7 @@ class UserTaskModule:
             raise ContractViolation(
                 f"task {task_id} is {state.get('phase', 'preparing')}, not awaiting approval"
             )
-        plan = _read_json(task_dir / "plan.json", "task plan")
+        plan = read_json_object(task_dir / "plan.json", label="task plan")
         digest = plan.get("digest")
         if not isinstance(digest, str) or not digest:
             raise ContractViolation("task plan has no approval digest")
@@ -273,16 +260,18 @@ class UserTaskModule:
                     "updated_at": approved_at,
                 }
             )
-            _atomic_json_write(approval_path, approval)
-            _atomic_json_write(task_dir / "status.json", queued_state)
             resident = self._resident()
+            # Start the idle coordinator before publishing approval. If startup
+            # fails, no durable task or queue transition has happened yet.
+            resident.start_background()
             try:
+                atomic_json_write(approval_path, approval)
+                atomic_json_write(task_dir / "status.json", queued_state)
                 resident.submit(task_id, priority)
             except Exception:
-                _atomic_json_write(task_dir / "status.json", state)
+                atomic_json_write(task_dir / "status.json", state)
                 approval_path.unlink(missing_ok=True)
                 raise
-            resident.start_background()
             return self.status(task_id)
         self._workflow(task_dir).execute(actor.strip(), digest)
         return self.status(task_id)
@@ -311,7 +300,7 @@ class UserTaskModule:
                     "updated_at": cancelled_at,
                 }
             )
-            _atomic_json_write(task_dir / "status.json", state)
+            atomic_json_write(task_dir / "status.json", state)
             return self.status(task_id)
         resident = self._resident_if_initialized()
         scheduling = resident.inspect(task_id) if resident is not None else None
@@ -330,7 +319,7 @@ class UserTaskModule:
                     "updated_at": changed_at,
                 }
             )
-            _atomic_json_write(task_dir / "status.json", state)
+            atomic_json_write(task_dir / "status.json", state)
         elif updated["state"] == "paused":
             state.update(
                 {
@@ -340,7 +329,7 @@ class UserTaskModule:
                     "updated_at": changed_at,
                 }
             )
-            _atomic_json_write(task_dir / "status.json", state)
+            atomic_json_write(task_dir / "status.json", state)
         elif action == "resume":
             state.update(
                 {
@@ -350,8 +339,8 @@ class UserTaskModule:
                     "updated_at": changed_at,
                 }
             )
-            _atomic_json_write(task_dir / "status.json", state)
-            resident.start_background()
+            atomic_json_write(task_dir / "status.json", state)
+        resident.ensure_running()
         return self.status(task_id)
 
     def execute_queued(
@@ -365,7 +354,7 @@ class UserTaskModule:
             raise ContractViolation(
                 f"task {task_id} cannot run from phase {state.get('phase', 'preparing')}"
             )
-        approval = _read_json(task_dir / "approval.json", "task approval")
+        approval = read_json_object(task_dir / "approval.json", label="task approval")
         if set(approval) != {
             "schema_version",
             "task_id",
@@ -402,7 +391,7 @@ class UserTaskModule:
                 "updated_at": failed_at,
             }
         )
-        _atomic_json_write(task_dir / "status.json", state)
+        atomic_json_write(task_dir / "status.json", state)
 
     def execution_phase(self, task_id: str) -> str:
         task_dir, _ = self._task(task_id)
@@ -497,7 +486,7 @@ class UserTaskModule:
         task_dir = self.tasks_root / task_id
         if task_dir.is_symlink() or not task_dir.is_dir():
             raise ContractViolation(f"task {task_id} does not exist")
-        metadata = _read_json(task_dir / "task.json", "task metadata")
+        metadata = read_json_object(task_dir / "task.json", label="task metadata")
         required = {
             "schema_version",
             "task_id",
@@ -530,7 +519,7 @@ class UserTaskModule:
         task_dir: Path,
         policy_override: Optional[ProjectPolicy] = None,
     ) -> EngineeringWorkflow:
-        metadata = _read_json(task_dir / "task.json", "task metadata")
+        metadata = read_json_object(task_dir / "task.json", label="task metadata")
         workspace = Path(str(metadata["workspace"]))
         policy_path = Path(str(metadata["policy"]))
         if policy_override is not None:
@@ -579,9 +568,9 @@ class UserTaskModule:
         report = task_dir / "report.json"
         status = task_dir / "status.json"
         if report.is_file():
-            return _read_json(report, "task report")
+            return read_json_object(report, label="task report")
         if status.is_file():
-            return _read_json(status, "task status")
+            return read_json_object(status, label="task status")
         return {"phase": "preparing"}
 
     @staticmethod
@@ -591,11 +580,23 @@ class UserTaskModule:
         duration = None
         if isinstance(started, (int, float)) and isinstance(finished, (int, float)):
             duration = max(0.0, float(finished) - float(started))
+        tokens_used = int(state.get("tokens_used", 0))
+        cost_usd = float(state.get("cost_usd", 0.0))
+        explicit_cost_complete = state.get("cost_complete")
+        model_usage = ModelUsage.from_persisted(
+            state.get("usage"),
+            tokens_used,
+            cost_usd,
+            explicit_cost_complete
+            if isinstance(explicit_cost_complete, bool)
+            else None,
+        )
         return {
+            **model_usage.to_dict(),
             "agent_calls": int(state.get("agent_calls", 0)),
-            "tokens_used": int(state.get("tokens_used", 0)),
-            "cost_usd": float(state.get("cost_usd", 0.0)),
-            "cost_complete": bool(state.get("cost_complete", False)),
+            "tokens_used": tokens_used,
+            "cost_usd": cost_usd,
+            "cost_complete": model_usage.cost_complete,
             "duration_seconds": duration,
         }
 

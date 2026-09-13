@@ -1,14 +1,17 @@
-import fcntl
 import hashlib
 import json
-import os
-import tempfile
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
+from ._store import (
+    atomic_json_write,
+    atomic_text_write,
+    file_lock,
+    read_json_object,
+)
 from .checkpoint import CheckpointStore
 from .errors import ContractViolation
 from .events import JsonlEventSink
@@ -99,7 +102,7 @@ class ApprovalInbox:
                 "note": note,
                 "decided_at": time.time(),
             }
-            _atomic_json_write(self.state_root / "decisions.json", decisions)
+            atomic_json_write(self.state_root / "decisions.json", decisions)
             return next(item for item in self.list(run_id) if item.gate == gate)
 
     def policy_for(self, run_id: str) -> AllowListGatePolicy:
@@ -123,12 +126,8 @@ class ApprovalInbox:
 
     @contextmanager
     def _locked(self):
-        with self.lock_path.open("a+", encoding="utf-8") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        with file_lock(self.lock_path):
+            yield
 
 
 class OperationsConsole:
@@ -154,7 +153,7 @@ class OperationsConsole:
         if not run_dir.is_dir():
             raise ContractViolation(f"run {run_id} does not exist")
         graph = _read_graph(run_dir)
-        state = _read_json(run_dir / "state.json")
+        state = read_json_object(run_dir / "state.json")
         checkpoint = CheckpointStore(run_dir / "runtime" / "checkpoint.json").load()
         event_path = run_dir / "runtime" / "events.jsonl"
         events = tuple(JsonlEventSink(event_path).read()) if event_path.exists() else ()
@@ -187,7 +186,7 @@ class OperationsConsole:
                     "reuse_status": metadata.get("reuse_status"),
                 }
             )
-        readers = {}
+        readers: Dict[str, List[str]] = {}
         for node in graph.nodes:
             for key in node.reads:
                 readers.setdefault(key, []).append(node.id)
@@ -212,7 +211,7 @@ class OperationsConsole:
         publications = []
         publication_path = run_dir / "runtime" / "verified-publications.json"
         if publication_path.exists():
-            publication_state = _read_json(publication_path)
+            publication_state = read_json_object(publication_path)
             for item in publication_state.get("publications", ()):
                 if not isinstance(item, dict):
                     raise ContractViolation(
@@ -294,7 +293,7 @@ class OperationsConsole:
             self.snapshot(run_id), ensure_ascii=False, sort_keys=True, separators=(",", ":")
         ).replace("</", "<\\/")
         html = _HTML.replace("__GRAPHENG_PAYLOAD__", payload)
-        _atomic_text_write(output, html)
+        atomic_text_write(output, html)
         return output
 
     def _rsi_snapshot(self) -> Mapping[str, Any]:
@@ -322,7 +321,7 @@ class OperationsConsole:
 
 def _read_graph(run_dir: Path) -> GraphSpec:
     try:
-        return GraphSpec.from_dict(_read_json(run_dir / "graph.json"))
+        return GraphSpec.from_dict(read_json_object(run_dir / "graph.json"))
     except ContractViolation:
         raise
     except Exception as error:
@@ -330,22 +329,12 @@ def _read_graph(run_dir: Path) -> GraphSpec:
 
 
 def _read_statuses(run_dir: Path) -> Mapping[str, str]:
-    state = _read_json(run_dir / "state.json")
+    state = read_json_object(run_dir / "state.json")
     result = state.get("result") or {}
     if isinstance(result.get("statuses"), dict):
         return result["statuses"]
     checkpoint = CheckpointStore(run_dir / "runtime" / "checkpoint.json").load()
     return checkpoint.statuses if checkpoint is not None else {}
-
-
-def _read_json(path: Path) -> Mapping[str, Any]:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise ContractViolation(f"cannot read {path.name}: {error}") from error
-    if not isinstance(value, dict):
-        raise ContractViolation(f"{path.name} must contain an object")
-    return value
 
 
 def _validate_run_id(run_id: str) -> None:
@@ -356,29 +345,6 @@ def _validate_run_id(run_id: str) -> None:
         or Path(run_id).name != run_id
     ):
         raise ContractViolation("run id must be one path segment")
-
-
-def _atomic_json_write(path: Path, value: Any) -> None:
-    _atomic_text_write(
-        path,
-        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-    )
-
-
-def _atomic_text_write(path: Path, value: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        dir=str(path.parent),
-        prefix=f".{path.name}.",
-        delete=False,
-    ) as handle:
-        handle.write(value)
-        handle.flush()
-        os.fsync(handle.fileno())
-        temporary = Path(handle.name)
-    temporary.replace(path)
 
 
 _HTML = r"""<!doctype html>

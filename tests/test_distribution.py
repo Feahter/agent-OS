@@ -11,7 +11,6 @@ from unittest.mock import Mock, patch
 from grapheng import AgentOS, AgentOSDistribution, ContractViolation
 from grapheng.cli import main
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -208,15 +207,19 @@ class DistributionTests(unittest.TestCase):
         self.assertEqual("recommended", action["priority"])
         self.assertIsInstance(action["command"], list)
 
-    def test_setup_initializes_state_and_explains_missing_agents_without_model_calls(self):
+    def test_setup_initializes_portable_state_under_home_without_model_calls(self):
         distribution = AgentOSDistribution(PROJECT_ROOT, which=lambda command: None)
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory) / "agent-os"
-            first = distribution.setup(root)
-            second = distribution.setup(root)
+            home = Path(directory) / "agent-os"
+            first = distribution.setup(home)
+            second = distribution.setup(home)
+
+            self.assertTrue((home / "state" / "manifest.json").is_file())
+            self.assertFalse((home / "manifest.json").exists())
 
         self.assertTrue(first["initialized"])
         self.assertFalse(second["initialized"])
+        self.assertEqual(str((home / "state").resolve()), first["root"])
         self.assertEqual(0, first["model_calls"])
         self.assertEqual("needs_agent", first["readiness"])
         self.assertFalse(first["ready_for_agent_execution"])
@@ -225,6 +228,10 @@ class DistributionTests(unittest.TestCase):
         )
         self.assertEqual("required", first["next_actions"][0]["priority"])
         self.assertEqual(
+            ["agent-os", "setup", "--home", str(home.resolve())],
+            first["next_actions"][0]["command"],
+        )
+        self.assertEqual(
             "pass",
             next(
                 item["status"]
@@ -232,6 +239,23 @@ class DistributionTests(unittest.TestCase):
                 if item["check_id"] == "state:agent-os"
             ),
         )
+
+    def test_setup_bootstraps_state_when_home_already_contains_runtime_data(self):
+        distribution = AgentOSDistribution(PROJECT_ROOT, which=lambda command: None)
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "agent-os"
+            runtime = home / "runtime" / "logs"
+            runtime.mkdir(parents=True)
+            event = runtime / "events.jsonl"
+            event.write_text("{}\n", encoding="utf-8")
+
+            report = distribution.setup(home)
+
+            self.assertEqual("{}\n", event.read_text(encoding="utf-8"))
+            self.assertTrue((home / "state" / "manifest.json").is_file())
+
+        self.assertTrue(report["initialized"])
+        self.assertNotIn("state:agent-os", report["blocking_checks"])
 
     def test_setup_discovers_unintegrated_agents_without_marking_them_ready(self):
         calls = []
@@ -298,18 +322,53 @@ class DistributionTests(unittest.TestCase):
             report["discovered_agents"][0]["discovery_status"],
         )
 
-    def test_setup_does_not_initialize_an_existing_nonempty_directory(self):
+    def test_setup_preserves_existing_home_content_while_initializing_nested_state(self):
         distribution = AgentOSDistribution(PROJECT_ROOT, which=lambda command: None)
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory) / "unrelated"
-            root.mkdir()
-            marker = root / "keep.txt"
+            home = Path(directory) / "agent-os"
+            home.mkdir()
+            marker = home / "keep.txt"
             marker.write_text("keep", encoding="utf-8")
 
-            report = distribution.setup(root)
+            report = distribution.setup(home)
 
             self.assertEqual("keep", marker.read_text(encoding="utf-8"))
-            self.assertFalse((root / "manifest.json").exists())
+            self.assertTrue((home / "state" / "manifest.json").is_file())
+            self.assertFalse((home / "manifest.json").exists())
+
+        self.assertTrue(report["initialized"])
+        self.assertEqual("needs_agent", report["readiness"])
+
+    def test_setup_does_not_hide_legacy_portable_state_with_a_new_nested_root(self):
+        distribution = AgentOSDistribution(PROJECT_ROOT, which=lambda command: None)
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "agent-os"
+            legacy = AgentOS(home)
+            legacy_manifest = (home / "manifest.json").read_bytes()
+
+            report = distribution.setup(home)
+
+            self.assertEqual(legacy_manifest, (home / "manifest.json").read_bytes())
+            self.assertFalse((home / "state").exists())
+            self.assertEqual(legacy.root, home)
+
+        self.assertFalse(report["initialized"])
+        self.assertEqual("blocked", report["readiness"])
+        self.assertIn("state:agent-os", report["blocking_checks"])
+
+    def test_setup_does_not_overwrite_an_invalid_nonempty_state_directory(self):
+        distribution = AgentOSDistribution(PROJECT_ROOT, which=lambda command: None)
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "agent-os"
+            state = home / "state"
+            state.mkdir(parents=True)
+            marker = state / "keep.txt"
+            marker.write_text("keep", encoding="utf-8")
+
+            report = distribution.setup(home)
+
+            self.assertEqual("keep", marker.read_text(encoding="utf-8"))
+            self.assertFalse((state / "manifest.json").exists())
 
         self.assertFalse(report["initialized"])
         self.assertEqual("blocked", report["readiness"])
@@ -320,6 +379,55 @@ class DistributionTests(unittest.TestCase):
         )
         self.assertEqual("restore_or_choose_state", action["action_id"])
         self.assertNotIn("command", action)
+
+    def test_installed_runtime_check_does_not_require_a_source_checkout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / "grapheng"
+            package.mkdir()
+            for name in ("__init__.py", "cli.py", "distribution.py"):
+                (package / name).write_text("# installed runtime\n", encoding="utf-8")
+            (package / "compatibility-evidence.json").write_bytes(
+                (PROJECT_ROOT / "grapheng" / "compatibility-evidence.json").read_bytes()
+            )
+            distribution = AgentOSDistribution(root, which=lambda command: None)
+            home = root / "home"
+
+            report = distribution.setup(home)
+
+            source = next(
+                item for item in report["checks"] if item["check_id"] == "runtime:source"
+            )
+            self.assertEqual("pass", source["status"])
+            release = root / "release"
+            with self.assertRaisesRegex(
+                ContractViolation, "release requires a complete source checkout"
+            ):
+                distribution.create_release(home / "state", release)
+            self.assertFalse(release.exists())
+
+    def test_runtime_canary_evidence_is_validated_before_certification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / "grapheng"
+            package.mkdir()
+            evidence = json.loads(
+                (PROJECT_ROOT / "grapheng" / "compatibility-evidence.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            record = next(
+                item
+                for item in evidence["adapters"]["claude-code"]
+                if item["version"] == "2.1.266"
+            )
+            record["runtime_canary"]["success"] = False
+            (package / "compatibility-evidence.json").write_text(
+                json.dumps(evidence), encoding="utf-8"
+            )
+
+            with self.assertRaisesRegex(ContractViolation, "runtime canary"):
+                AgentOSDistribution(root).compatibility_matrix()
 
     def test_cli_setup_has_human_and_json_outputs(self):
         report = {
@@ -388,12 +496,12 @@ class DistributionTests(unittest.TestCase):
 
         for failure in ("timeout", "crash"):
             with self.subTest(failure=failure):
-                def runner(command, timeout_seconds):
+                def runner(command, timeout_seconds, _failure=failure):
                     if command[-1] == "--version":
                         return subprocess.CompletedProcess(
                             command, 0, stdout="codex 0.148.0-alpha.9", stderr=""
                         )
-                    if failure == "timeout":
+                    if _failure == "timeout":
                         raise subprocess.TimeoutExpired(command, timeout_seconds)
                     return subprocess.CompletedProcess(
                         command, -9, stdout="", stderr="terminated"
@@ -454,8 +562,12 @@ class DistributionTests(unittest.TestCase):
             },
             {item["agent_id"] for item in matrix["discoverable_agents"]},
         )
-        self.assertEqual(
-            "help/version protocol inspection only; no model calls or Orca object creation",
+        self.assertIn(
+            "exact-version help/protocol inspection",
+            matrix["evidence"]["verification_scope"],
+        )
+        self.assertIn(
+            "bounded real-model canary",
             matrix["evidence"]["verification_scope"],
         )
         self.assertTrue(

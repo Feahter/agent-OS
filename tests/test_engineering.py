@@ -20,7 +20,6 @@ from grapheng import (
     RSILoop,
 )
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -186,6 +185,7 @@ class EngineeringTests(unittest.TestCase):
         workflow, _, plan = self.prepared()
         value = plan.to_dict()
         value.pop("intent")
+        value["preparation_usage"].pop("usage")
         value["schema_version"] = 2
         value.pop("digest")
         encoded = json.dumps(
@@ -199,6 +199,23 @@ class EngineeringTests(unittest.TestCase):
         self.assertEqual("legacy", loaded.intent["project"]["kinds"][0])
         self.assertEqual(plan.objective, loaded.objective)
 
+    def test_version_three_plan_digest_remains_loadable(self):
+        workflow, _, plan = self.prepared()
+        value = plan.to_dict()
+        value["preparation_usage"].pop("usage")
+        value["schema_version"] = 3
+        value.pop("digest")
+        encoded = json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        value["digest"] = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        workflow.plan_path.write_text(json.dumps(value), encoding="utf-8")
+
+        loaded = EngineeringPlan.load(workflow.plan_path)
+
+        self.assertEqual(3, loaded.schema_version)
+        self.assertEqual(plan.objective, loaded.objective)
+
     def test_task_directory_cannot_be_reused_for_a_new_plan(self):
         workflow, executor, _ = self.prepared()
         calls_after_first_plan = len(executor.requests)
@@ -208,7 +225,7 @@ class EngineeringTests(unittest.TestCase):
         self.assertEqual(calls_after_first_plan, len(executor.requests))
 
     def test_execution_requires_approval_bound_to_plan(self):
-        workflow, _, plan = self.prepared()
+        workflow, _, _plan = self.prepared()
         with self.assertRaisesRegex(ContractViolation, "requires approved_by"):
             workflow.execute("")
         with self.assertRaisesRegex(ContractViolation, "requires plan_digest"):
@@ -230,6 +247,11 @@ class EngineeringTests(unittest.TestCase):
         self.assertTrue(report["cost_complete"])
         self.assertEqual(0.04, report["cost_usd"])
         self.assertEqual(2, report["preparation_usage"]["agent_calls"])
+        self.assertEqual(20, report["usage"]["total_tokens"])
+        self.assertTrue(report["usage"]["total_tokens_complete"])
+        self.assertEqual(0.04, report["usage"]["cost_usd"])
+        self.assertTrue(report["usage"]["cost_complete"])
+        self.assertIsNone(report["usage"]["input_tokens"])
         review = next(item for item in executor.requests if item.task_type == "engineering.review")
         implement = next(
             item for item in executor.requests if item.task_type == "engineering.implement"

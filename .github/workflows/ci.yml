@@ -8,20 +8,112 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  lint:
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: python -m pip install . ruff mypy pytest
+      - name: Ruff
+        run: python -m ruff check .
+      - name: Mypy
+        run: python -m mypy
+      - name: Shared durable-state primitives are not re-implemented
+        run: python scripts/check_shared_primitives.py
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build wheel and source distribution
+        run: |
+          python -m pip install build
+          python -m build
+      - name: Verify source distribution contents
+        run: |
+          python - <<'PY'
+          import glob
+          import tarfile
+
+          archive = glob.glob("dist/*.tar.gz")[0]
+          with tarfile.open(archive) as bundle:
+              names = bundle.getnames()
+          required = (
+              "/.workflow/agent-os/plan.md",
+              "/tests/conftest.py",
+              "/tests/fixtures/fake_agent_cli.py",
+          )
+          for suffix in required:
+              assert any(name.endswith(suffix) for name in names), suffix
+          PY
+      - name: Smoke test the source distribution outside the checkout
+        run: |
+          python -m venv "$RUNNER_TEMP/sdist-venv"
+          "$RUNNER_TEMP/sdist-venv/bin/python" -m pip install dist/*.tar.gz
+          mkdir -p "$RUNNER_TEMP/sdist-smoke"
+          cd "$RUNNER_TEMP/sdist-smoke"
+          set +e
+          "$RUNNER_TEMP/sdist-venv/bin/agent-os" setup \
+            --home "$RUNNER_TEMP/sdist-home" --json > setup.json
+          setup_status=$?
+          set -e
+          test "$setup_status" -eq 0 || test "$setup_status" -eq 2
+          "$RUNNER_TEMP/sdist-venv/bin/python" - <<'PY'
+          import json
+
+          report = json.load(open("setup.json", encoding="utf-8"))
+          assert report["initialized"] is True
+          assert report["model_calls"] == 0
+          assert report["blocking_checks"] == []
+          PY
+      - name: Smoke test the installed wheel outside the checkout
+        run: |
+          python -m pip install --force-reinstall dist/*.whl
+          cd "$RUNNER_TEMP"
+          set +e
+          agent-os setup --home "$RUNNER_TEMP/agent-os-home" --json > setup.json
+          setup_status=$?
+          set -e
+          test "$setup_status" -eq 0 || test "$setup_status" -eq 2
+          python - <<'PY'
+          import json
+          from importlib.metadata import version
+
+          import grapheng
+
+          report = json.load(open("setup.json", encoding="utf-8"))
+          assert version("graph-engineering-agent-os") == grapheng.__version__
+          assert report["initialized"] is True
+          assert report["model_calls"] == 0
+          assert report["blocking_checks"] == []
+          assert report["root"].endswith("/agent-os-home/state")
+          PY
+          agent-os validate "$GITHUB_WORKSPACE/examples/minimal_graph.json"
+          agent-os demo "$GITHUB_WORKSPACE/examples/minimal_graph.json" \
+            --work-dir "$RUNNER_TEMP/agent-os-demo"
+          agent-os agent-os rehearse --root "$RUNNER_TEMP/agent-os-home/state"
+
+  test:
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.12"]
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.9", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install
-        run: python -m pip install .
+        run: python -m pip install . pytest
       - name: Test
-        run: python -m unittest discover -s tests -v
+        run: python -m pytest -q
       - name: Compile
         run: python -m compileall -q grapheng tests

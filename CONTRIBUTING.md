@@ -8,7 +8,7 @@
 4. 提交前运行：
 
    ```bash
-   PYTHONPATH=. python3 -m unittest discover -s tests -v
+   python3 -m pytest -q
    PYTHONPYCACHEPREFIX=/tmp/agent-os-pycache python3 -m compileall -q grapheng tests
    ```
 

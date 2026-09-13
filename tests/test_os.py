@@ -8,10 +8,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from grapheng import (
+    BUNDLE_SCHEMA_VERSION,
     AgentOS,
     AgentRequest,
     AgentResult,
-    BUNDLE_SCHEMA_VERSION,
     BundleMigrationRegistry,
     ContractViolation,
     ProviderPolicy,

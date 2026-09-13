@@ -1,20 +1,21 @@
 import hashlib
-import fcntl
 import json
 import math
 import os
-import tempfile
 import threading
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, Mapping, Optional, Sequence, Tuple
 
+from ._store import (
+    atomic_json_write,
+    file_lock,
+)
 from .agents import AgentRequest, AgentResult, validate_agent_outputs
 from .errors import ContractViolation
 from .singleflight import SingleFlightCoordinator, SingleFlightTimeoutError
-
 
 REUSE_SCHEMA_VERSION = 1
 REUSABLE_CLASSIFICATIONS = ("public", "internal")
@@ -30,27 +31,6 @@ def _canonical(value: Any) -> Tuple[Any, str]:
             f"reuse values must be JSON serializable: {error}"
         ) from error
     return json.loads(encoded), hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-
-
-def _atomic_json_write(path: Path, value: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, raw_path = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
-    temporary = Path(raw_path)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(
-                value,
-                handle,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(str(temporary), str(path))
-    finally:
-        if temporary.exists():
-            temporary.unlink()
 
 
 @dataclass(frozen=True)
@@ -190,11 +170,13 @@ class VerifiedArtifactCache:
             return self._result_from_record(record)
 
         with self._lock:
-            flight = self._flights.get(key)
-            leader = flight is None
-            if leader:
+            existing = self._flights.get(key)
+            leader = existing is None
+            if existing is None:
                 flight = _Flight(request.task_id, threading.Event())
                 self._flights[key] = flight
+            else:
+                flight = existing
         if not leader:
             if not flight.completed.wait(request.timeout_seconds):
                 raise SingleFlightTimeoutError(
@@ -305,7 +287,7 @@ class VerifiedArtifactCache:
         _, checksum = _canonical(value)
         record = VerifiedReuseRecord(checksum=checksum, **value)
         record.validate()
-        _atomic_json_write(self.entries / f"{key}.json", record.to_dict())
+        atomic_json_write(self.entries / f"{key}.json", record.to_dict())
         self._record_event(request, result.executor_id, "published", "verified")
         return record
 
@@ -329,11 +311,12 @@ class VerifiedArtifactCache:
         saved_cost_usd = 0.0
         event_path = self.root / "events.jsonl"
         try:
-            with self._journal_guard(fcntl.LOCK_SH):
-                if not event_path.exists():
-                    event_lines = ()
-                else:
-                    event_lines = event_path.read_text(encoding="utf-8").splitlines()
+            with self._journal_guard(shared=True):
+                event_lines: Sequence[str] = (
+                    event_path.read_text(encoding="utf-8").splitlines()
+                    if event_path.exists()
+                    else ()
+                )
             for line in event_lines:
                 if not line.strip():
                     continue
@@ -488,7 +471,7 @@ class VerifiedArtifactCache:
             event, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         ).encode("utf-8") + b"\n"
         path = self.root / "events.jsonl"
-        with self._journal_guard(fcntl.LOCK_EX):
+        with self._journal_guard():
             event_descriptor = os.open(
                 str(path), os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600
             )
@@ -499,16 +482,11 @@ class VerifiedArtifactCache:
                 os.close(event_descriptor)
 
     @contextmanager
-    def _journal_guard(self, operation: int) -> Iterator[None]:
+    def _journal_guard(self, *, shared: bool = False) -> Iterator[None]:
         lock_path = self.singleflight.root / "events.lock"
         with self._journal_lock:
-            descriptor = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
-            with os.fdopen(descriptor, "a+") as lock_handle:
-                fcntl.flock(lock_handle.fileno(), operation)
-                try:
-                    yield
-                finally:
-                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            with file_lock(lock_path, shared=shared):
+                yield
 
 
 ReuseStore = VerifiedArtifactCache

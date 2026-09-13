@@ -10,7 +10,6 @@ from urllib.parse import parse_qs, urlsplit
 from .console import OperationsConsole
 from .errors import ContractViolation
 
-
 MAX_REQUEST_BYTES = 16 * 1024
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost"}
 
@@ -47,12 +46,18 @@ class OperationsAPI:
         unknown = set(value) - {"gate", "decision", "actor", "note"}
         if unknown:
             raise ContractViolation("approval request has unknown fields")
+        for required in ("gate", "decision", "actor"):
+            if not isinstance(value.get(required), str):
+                raise ContractViolation(f"approval {required} must be a string")
+        note = value.get("note")
+        if note is not None and not isinstance(note, str):
+            raise ContractViolation("approval note must be a string")
         item = self.console.approvals.decide(
             self.run_id,
-            value.get("gate"),
-            value.get("decision"),
-            value.get("actor"),
-            value.get("note"),
+            value["gate"],
+            value["decision"],
+            value["actor"],
+            note,
         )
         return {
             "approval": asdict(item),
@@ -133,7 +138,7 @@ class OperationsServer:
                         query = parse_qs(parsed.query, keep_blank_values=True)
                         revision = _single_query(query, "revision")
                         raw_after = _single_query(query, "after")
-                        after = 0 if raw_after in (None, "") else int(raw_after)
+                        after = int(raw_after) if raw_after else 0
                         self._send_json(
                             200,
                             owner.api.snapshot(revision=revision, after=after),

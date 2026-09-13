@@ -1,6 +1,5 @@
 import json
 import os
-import tempfile
 import threading
 import time
 import uuid
@@ -8,6 +7,10 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple
 
+from ._store import (
+    atomic_json_write,
+    read_json,
+)
 from .errors import ContractViolation
 from .governance import ProviderGovernanceStore
 from .routing import (
@@ -17,6 +20,25 @@ from .routing import (
     ProviderPolicy,
     RouteObservation,
 )
+
+
+def _preference_rank(
+    estimates: Mapping[str, LearnedExecutorEstimate], executor_id: str
+) -> Tuple[float, float, float, str]:
+    """Rank executors by cost, then latency, then quality, then id.
+
+    Both the global and the per-context preference use this ordering, so it
+    lives in one place rather than being duplicated inside two lambdas.
+    """
+
+    estimate = estimates[executor_id]
+    cost = (
+        float("inf")
+        if estimate.average_cost_usd is None
+        else float(estimate.average_cost_usd)
+    )
+    quality = 0.5 if estimate.average_quality is None else float(estimate.average_quality)
+    return (cost, float(estimate.average_latency_seconds), -quality, executor_id)
 
 
 @dataclass(frozen=True)
@@ -271,18 +293,7 @@ class RSILoop:
             if reliable:
                 preferred_id = min(
                     reliable,
-                    key=lambda key: (
-                        float("inf")
-                        if reliable[key].average_cost_usd is None
-                        else reliable[key].average_cost_usd,
-                        reliable[key].average_latency_seconds,
-                        -(
-                            reliable[key].average_quality
-                            if reliable[key].average_quality is not None
-                            else 0.5
-                        ),
-                        key,
-                    ),
+                    key=lambda key: _preference_rank(reliable, key),
                 )
             context_preferences = {}
             for context, estimates in sorted(
@@ -304,18 +315,7 @@ class RSILoop:
                 if context_reliable:
                     context_preferences[context] = min(
                         context_reliable,
-                        key=lambda key: (
-                            float("inf")
-                            if context_reliable[key].average_cost_usd is None
-                            else context_reliable[key].average_cost_usd,
-                            context_reliable[key].average_latency_seconds,
-                            -(
-                                context_reliable[key].average_quality
-                                if context_reliable[key].average_quality is not None
-                                else 0.5
-                            ),
-                            key,
-                        ),
+                        key=lambda key: _preference_rank(context_reliable, key),
                     )
             known_costs = [item.cost_usd for item in observations if item.cost_usd is not None]
             average_cost = sum(known_costs) / len(known_costs) if known_costs else None
@@ -399,12 +399,12 @@ class RSILoop:
             candidate = self._read_candidate(candidate_id)
             if candidate.status != "approved":
                 raise ContractViolation(f"candidate {candidate_id} is not approved")
-            active = self._read_json(self.root / "active.json", default=None)
-            history = self._read_json(self.root / "history.json", default=[])
+            active = read_json(self.root / "active.json", None)
+            history = read_json(self.root / "history.json", [])
             if active is not None:
                 history.append(active)
-            _atomic_json_write(self.root / "history.json", history)
-            _atomic_json_write(
+            atomic_json_write(self.root / "history.json", history)
+            atomic_json_write(
                 self.root / "active.json",
                 {"candidate_id": candidate_id, "policy": candidate.policy.to_dict()},
             )
@@ -413,15 +413,15 @@ class RSILoop:
 
     def rollback(self) -> Optional[LearnedRoutingPolicy]:
         with self._lock:
-            active = self._read_json(self.root / "active.json", default=None)
+            active = read_json(self.root / "active.json", None)
             if active is None:
                 raise ContractViolation("there is no active RSI policy to roll back")
-            history = self._read_json(self.root / "history.json", default=[])
+            history = read_json(self.root / "history.json", [])
             current = self._read_candidate(str(active["candidate_id"]))
             self._write_candidate(replace(current, status="rolled_back"))
             previous = history.pop() if history else None
-            _atomic_json_write(self.root / "history.json", history)
-            _atomic_json_write(self.root / "active.json", previous)
+            atomic_json_write(self.root / "history.json", history)
+            atomic_json_write(self.root / "active.json", previous)
             if previous is None:
                 return None
             previous_candidate = self._read_candidate(str(previous["candidate_id"]))
@@ -429,7 +429,7 @@ class RSILoop:
             return LearnedRoutingPolicy.from_dict(previous["policy"])
 
     def active_policy(self) -> Optional[LearnedRoutingPolicy]:
-        active = self._read_json(self.root / "active.json", default=None)
+        active = read_json(self.root / "active.json", None)
         if active is None:
             return None
         return LearnedRoutingPolicy.from_dict(active["policy"])
@@ -465,41 +465,15 @@ class RSILoop:
         return self.root / "candidates" / f"{candidate_id}.json"
 
     def _write_candidate(self, candidate: RSICandidate) -> None:
-        _atomic_json_write(self._candidate_path(candidate.candidate_id), candidate.to_dict())
+        atomic_json_write(self._candidate_path(candidate.candidate_id), candidate.to_dict())
 
     def _read_candidate(self, candidate_id: str) -> RSICandidate:
-        value = self._read_json(self._candidate_path(candidate_id), default=None)
+        value = read_json(self._candidate_path(candidate_id), None)
         if value is None:
             raise ContractViolation(f"RSI candidate {candidate_id} does not exist")
         return RSICandidate.from_dict(value)
-
-    @staticmethod
-    def _read_json(path: Path, default: Any) -> Any:
-        if not path.exists():
-            return default
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
-            raise ContractViolation(f"invalid RSI state {path.name}: {error}") from error
-
 
 def _improvement(baseline: Optional[float], projected: Optional[float]) -> Optional[float]:
     if baseline is None or projected is None or baseline <= 0:
         return None
     return max(-100.0, min(100.0, (baseline - projected) / baseline * 100.0))
-
-
-def _atomic_json_write(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        dir=str(path.parent),
-        prefix=f".{path.name}.",
-        delete=False,
-    ) as handle:
-        json.dump(value, handle, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        handle.flush()
-        os.fsync(handle.fileno())
-        temporary = Path(handle.name)
-    temporary.replace(path)

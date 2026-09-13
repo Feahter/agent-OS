@@ -5,21 +5,20 @@ import json
 import math
 import os
 import subprocess
-import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
-from .agents import AgentRequest, AgentResult, ExecutorRegistry
+from ._store import atomic_json_write
+from .agents import AgentRequest, AgentResult, ExecutorRegistry, ModelUsage
 from .control import EffectJournal
 from .errors import ContractViolation
 from .intents import TaskIntent
 from .learning import RSILoop
 
-
 ENGINEERING_POLICY_SCHEMA_VERSION = 1
-ENGINEERING_PLAN_SCHEMA_VERSION = 3
+ENGINEERING_PLAN_SCHEMA_VERSION = 4
 ENGINEERING_REPORT_SCHEMA_VERSION = 1
 _ROLES = ("explore", "plan", "implement", "review", "repair")
 
@@ -29,28 +28,6 @@ def _canonical_digest(value: Any) -> str:
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     )
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-
-
-def _atomic_json_write(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handle = tempfile.NamedTemporaryFile(
-        mode="w", encoding="utf-8", dir=str(path.parent), delete=False
-    )
-    try:
-        with handle:
-            json.dump(
-                value,
-                handle,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(handle.name, path)
-    finally:
-        if os.path.exists(handle.name):
-            os.unlink(handle.name)
 
 
 def _safe_relative_path(value: str, field: str) -> Path:
@@ -68,7 +45,9 @@ def _positive_int(value: Any, field: str) -> int:
     return value
 
 
-def _validated_usage(value: Any, field: str) -> Dict[str, Any]:
+def _validated_usage(
+    value: Any, field: str, require_details: bool = False
+) -> Dict[str, Any]:
     required = {
         "agent_calls",
         "tokens_used",
@@ -76,7 +55,8 @@ def _validated_usage(value: Any, field: str) -> Dict[str, Any]:
         "cost_complete",
         "elapsed_seconds",
     }
-    if not isinstance(value, dict) or set(value) != required:
+    expected = required | ({"usage"} if require_details else set())
+    if not isinstance(value, dict) or set(value) != expected:
         raise ContractViolation(f"{field} has an invalid contract")
     for key in ("agent_calls", "tokens_used"):
         item = value[key]
@@ -102,12 +82,44 @@ def _validated_usage(value: Any, field: str) -> Dict[str, Any]:
         raise ContractViolation(
             f"{field}.elapsed_seconds must be finite and non-negative"
         )
-    return {
+    normalized = {
         "agent_calls": value["agent_calls"],
         "tokens_used": value["tokens_used"],
         "cost_usd": float(cost),
         "cost_complete": value["cost_complete"],
         "elapsed_seconds": float(elapsed),
+    }
+    if require_details:
+        normalized["usage"] = ModelUsage.from_persisted(
+            value["usage"],
+            normalized["tokens_used"],
+            normalized["cost_usd"],
+            normalized["cost_complete"],
+        ).to_dict()
+    return normalized
+
+
+def _usage_from_record(value: Mapping[str, Any]) -> ModelUsage:
+    return ModelUsage.from_persisted(
+        value.get("usage"),
+        int(value.get("tokens_used", 0)),
+        float(value.get("cost_usd", 0.0)),
+        value.get("cost_complete")
+        if isinstance(value.get("cost_complete"), bool)
+        else None,
+    )
+
+
+def _usage_record(
+    agent_calls: int, usage: ModelUsage, elapsed_seconds: float
+) -> Dict[str, Any]:
+    return {
+        "agent_calls": agent_calls,
+        "tokens_used": usage.total_tokens or 0,
+        "cost_usd": usage.cost_usd or 0.0,
+        "cost_complete": usage.cost_complete,
+        "elapsed_seconds": elapsed_seconds,
+        "usage": usage.to_dict(),
     }
 
 
@@ -125,7 +137,7 @@ class ProjectPolicy:
         "CLAUDE.md",
     )
     instruction_files: Tuple[str, ...] = ("AGENTS.md", "CLAUDE.md")
-    role_executors: Mapping[str, str] = None
+    role_executors: Optional[Mapping[str, str]] = None
     require_clean_worktree: bool = True
     max_review_cycles: int = 2
     max_agent_calls: int = 8
@@ -231,7 +243,7 @@ class ProjectPolicy:
             "check_commands": [list(command) for command in self.check_commands],
             "protected_paths": list(self.protected_paths),
             "instruction_files": list(self.instruction_files),
-            "role_executors": dict(self.role_executors),
+            "role_executors": dict(self.role_executors or {}),
             "require_clean_worktree": self.require_clean_worktree,
             "max_review_cycles": self.max_review_cycles,
             "max_agent_calls": self.max_agent_calls,
@@ -257,6 +269,7 @@ class EngineeringPlan:
     preparation_usage: Mapping[str, Any]
     created_at: float
     digest: str
+    schema_version: int = ENGINEERING_PLAN_SCHEMA_VERSION
 
     @classmethod
     def create(
@@ -284,15 +297,21 @@ class EngineeringPlan:
             "instructions_digest": instructions_digest,
             "workspace_digest": workspace_digest,
             "preparation_usage": _validated_usage(
-                dict(preparation_usage), "engineering preparation_usage"
+                dict(preparation_usage),
+                "engineering preparation_usage",
+                require_details=True,
             ),
             "created_at": created_at,
         }
-        return cls(digest=_canonical_digest(body), **{k: v for k, v in body.items() if k != "schema_version"})
+        return cls(
+            digest=_canonical_digest(body),
+            schema_version=ENGINEERING_PLAN_SCHEMA_VERSION,
+            **{k: v for k, v in body.items() if k != "schema_version"},
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "schema_version": ENGINEERING_PLAN_SCHEMA_VERSION,
+            "schema_version": self.schema_version,
             "objective": self.objective,
             "intent": dict(self.intent),
             "exploration": self.exploration,
@@ -331,7 +350,7 @@ class EngineeringPlan:
             if value["digest"] != _canonical_digest(body):
                 raise ContractViolation("engineering plan digest mismatch")
             intent = TaskIntent.legacy(str(value["objective"])).to_dict()
-        elif schema_version == ENGINEERING_PLAN_SCHEMA_VERSION:
+        elif schema_version in (3, ENGINEERING_PLAN_SCHEMA_VERSION):
             if set(value) != required:
                 raise ContractViolation("engineering plan has an invalid contract")
             body = {key: value[key] for key in required if key != "digest"}
@@ -353,10 +372,13 @@ class EngineeringPlan:
             instructions_digest=str(value["instructions_digest"]),
             workspace_digest=str(value["workspace_digest"]),
             preparation_usage=_validated_usage(
-                value["preparation_usage"], "engineering preparation_usage"
+                value["preparation_usage"],
+                "engineering preparation_usage",
+                require_details=schema_version == ENGINEERING_PLAN_SCHEMA_VERSION,
             ),
             created_at=float(value["created_at"]),
             digest=str(value["digest"]),
+            schema_version=int(schema_version),
         )
 
     @classmethod
@@ -524,16 +546,20 @@ class EngineeringWorkflow:
         )
         self._require_time(started)
         preparation_results = (exploration, proposal)
-        known_costs = [
-            item.cost_usd for item in preparation_results if item.cost_usd is not None
-        ]
-        preparation_usage = {
-            "agent_calls": len(preparation_results),
-            "tokens_used": sum(item.tokens_used for item in preparation_results),
-            "cost_usd": sum(known_costs),
-            "cost_complete": len(known_costs) == len(preparation_results),
-            "elapsed_seconds": self._monotonic() - started,
-        }
+        normalized_usage = ModelUsage.combine(
+            tuple(
+                item.usage
+                or ModelUsage.from_legacy_constructor(
+                    item.tokens_used, item.cost_usd
+                )
+                for item in preparation_results
+            )
+        )
+        preparation_usage = _usage_record(
+            len(preparation_results),
+            normalized_usage,
+            self._monotonic() - started,
+        )
         plan = EngineeringPlan.create(
             objective.strip(),
             compiled_intent.to_dict(),
@@ -545,8 +571,8 @@ class EngineeringWorkflow:
             preparation_usage,
             self._clock(),
         )
-        _atomic_json_write(self.plan_path, plan.to_dict())
-        _atomic_json_write(
+        atomic_json_write(self.plan_path, plan.to_dict())
+        atomic_json_write(
             self.task_dir / "status.json",
             {
                 "phase": "awaiting_approval",
@@ -555,6 +581,7 @@ class EngineeringWorkflow:
                 "tokens_used": preparation_usage["tokens_used"],
                 "cost_usd": preparation_usage["cost_usd"],
                 "cost_complete": preparation_usage["cost_complete"],
+                "usage": preparation_usage["usage"],
                 "updated_at": self._clock(),
             },
         )
@@ -596,8 +623,11 @@ class EngineeringWorkflow:
         execution_workspace_digest = self._workspace_fingerprint()
         mutation_allowed = compiled_intent.mutation_allowed
         preparation_usage = _validated_usage(
-            plan.preparation_usage, "engineering preparation_usage"
+            plan.preparation_usage,
+            "engineering preparation_usage",
+            require_details=plan.schema_version == ENGINEERING_PLAN_SCHEMA_VERSION,
         )
+        preparation_model_usage = _usage_from_record(preparation_usage)
         state: Dict[str, Any] = {
             "schema_version": ENGINEERING_REPORT_SCHEMA_VERSION,
             "phase": "running",
@@ -611,7 +641,8 @@ class EngineeringWorkflow:
             "review_cycles": 0,
             "tokens_used": preparation_usage["tokens_used"],
             "cost_usd": preparation_usage["cost_usd"],
-            "cost_complete": preparation_usage["cost_complete"],
+            "cost_complete": preparation_model_usage.cost_complete,
+            "usage": preparation_model_usage.to_dict(),
             "preparation_usage": preparation_usage,
             "implementation": None,
             "checks": [],
@@ -791,19 +822,19 @@ class EngineeringWorkflow:
             state["phase"] = "cancelled"
             state["finished_at"] = self._clock()
             state["failure"] = None
-            _atomic_json_write(self.report_path, state)
+            atomic_json_write(self.report_path, state)
             self._write_running_state(state)
             return state
         except Exception as error:
             state["phase"] = "failed"
             state["failure"] = f"{type(error).__name__}: {error}"
             state["finished_at"] = self._clock()
-            _atomic_json_write(self.report_path, state)
+            atomic_json_write(self.report_path, state)
             self._write_running_state(state)
             raise
 
         state["finished_at"] = self._clock()
-        _atomic_json_write(self.report_path, state)
+        atomic_json_write(self.report_path, state)
         self._write_running_state(state)
         return state
 
@@ -872,7 +903,7 @@ class EngineeringWorkflow:
             reuse_allowed=reuse_allowed,
         )
         return self.executors.execute(
-            request, executor_id=self.policy.role_executors.get(role)
+            request, executor_id=(self.policy.role_executors or {}).get(role)
         )
 
     def _bounded_agent_call(
@@ -910,6 +941,12 @@ class EngineeringWorkflow:
                 "outputs": dict(result.outputs),
                 "tokens_used": result.tokens_used,
                 "cost_usd": result.cost_usd,
+                "usage": (
+                    result.usage
+                    or ModelUsage.from_legacy_constructor(
+                        result.tokens_used, result.cost_usd
+                    )
+                ).to_dict(),
             }
 
         if mutating:
@@ -922,11 +959,20 @@ class EngineeringWorkflow:
             value = invoke()
         self._require_time(started)
         state["agent_calls"] += 1
+        current_usage = _usage_from_record(state)
+        persisted_cost = value.get("cost_usd")
+        call_usage = ModelUsage.from_persisted(
+            value.get("usage"),
+            int(value["tokens_used"]),
+            float(persisted_cost) if persisted_cost is not None else None,
+            None,
+        )
+        combined_usage = ModelUsage.combine((current_usage, call_usage))
+        state["usage"] = combined_usage.to_dict()
         state["tokens_used"] += int(value["tokens_used"])
-        if value["cost_usd"] is None:
-            state["cost_complete"] = False
-        else:
-            state["cost_usd"] += float(value["cost_usd"])
+        if persisted_cost is not None:
+            state["cost_usd"] += float(persisted_cost)
+        state["cost_complete"] = combined_usage.cost_complete
         self._write_running_state(state)
         return value
 
@@ -1127,7 +1173,7 @@ class EngineeringWorkflow:
         return remaining if maximum is None else min(maximum, remaining)
 
     def _write_running_state(self, state: Mapping[str, Any]) -> None:
-        _atomic_json_write(
+        atomic_json_write(
             self.task_dir / "status.json",
             {
                 "phase": state["phase"],
@@ -1138,6 +1184,7 @@ class EngineeringWorkflow:
                 "tokens_used": state["tokens_used"],
                 "cost_usd": state["cost_usd"],
                 "cost_complete": state["cost_complete"],
+                "usage": dict(state["usage"]),
                 "failure": state["failure"],
                 "updated_at": self._clock(),
             },

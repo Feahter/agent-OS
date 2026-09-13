@@ -3,10 +3,9 @@
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .errors import ContractViolation
-
 
 TASK_INTENT_SCHEMA_VERSION = 1
 TASK_TEMPLATES = ("fix", "test", "refactor", "research", "release", "general")
@@ -33,37 +32,46 @@ _TEMPLATE_TERMS = {
     ),
 }
 
-_TEMPLATE_DETAILS = {
-    "fix": {
-        "deliverables": ("root cause", "minimal fix", "regression coverage"),
-        "risk_focus": ("reproduction evidence", "nearby regressions", "rollback safety"),
-        "mutation_allowed": True,
-    },
-    "test": {
-        "deliverables": ("behavioral tests", "failure evidence", "coverage rationale"),
-        "risk_focus": ("false positives", "test isolation", "production behavior drift"),
-        "mutation_allowed": True,
-    },
-    "refactor": {
-        "deliverables": ("behavior-preserving change", "focused verification", "rollback point"),
-        "risk_focus": ("public contracts", "hidden callers", "behavior drift"),
-        "mutation_allowed": True,
-    },
-    "research": {
-        "deliverables": ("evidence-backed findings", "options and tradeoffs", "recommended next step"),
-        "risk_focus": ("source quality", "uncertainty", "unintended workspace changes"),
-        "mutation_allowed": False,
-    },
-    "release": {
-        "deliverables": ("release readiness findings", "verification evidence", "release blockers"),
-        "risk_focus": ("version consistency", "artifact completeness", "rollback readiness"),
-        "mutation_allowed": True,
-    },
-    "general": {
-        "deliverables": ("small scoped change", "verification evidence", "rollback point"),
-        "risk_focus": ("scope creep", "project contracts", "behavior regressions"),
-        "mutation_allowed": True,
-    },
+@dataclass(frozen=True)
+class _TemplateDetails:
+    """Fixed per-template expectations resolved before an intent is built."""
+
+    deliverables: Tuple[str, ...]
+    risk_focus: Tuple[str, ...]
+    mutation_allowed: bool
+
+
+_TEMPLATE_DETAILS: Mapping[str, _TemplateDetails] = {
+    "fix": _TemplateDetails(
+        deliverables=("root cause", "minimal fix", "regression coverage"),
+        risk_focus=("reproduction evidence", "nearby regressions", "rollback safety"),
+        mutation_allowed=True,
+    ),
+    "test": _TemplateDetails(
+        deliverables=("behavioral tests", "failure evidence", "coverage rationale"),
+        risk_focus=("false positives", "test isolation", "production behavior drift"),
+        mutation_allowed=True,
+    ),
+    "refactor": _TemplateDetails(
+        deliverables=("behavior-preserving change", "focused verification", "rollback point"),
+        risk_focus=("public contracts", "hidden callers", "behavior drift"),
+        mutation_allowed=True,
+    ),
+    "research": _TemplateDetails(
+        deliverables=("evidence-backed findings", "options and tradeoffs", "recommended next step"),
+        risk_focus=("source quality", "uncertainty", "unintended workspace changes"),
+        mutation_allowed=False,
+    ),
+    "release": _TemplateDetails(
+        deliverables=("release readiness findings", "verification evidence", "release blockers"),
+        risk_focus=("version consistency", "artifact completeness", "rollback readiness"),
+        mutation_allowed=True,
+    ),
+    "general": _TemplateDetails(
+        deliverables=("small scoped change", "verification evidence", "rollback point"),
+        risk_focus=("scope creep", "project contracts", "behavior regressions"),
+        mutation_allowed=True,
+    ),
 }
 
 _VAGUE_OBJECTIVES = {
@@ -208,8 +216,8 @@ class TaskIntent:
             project_markers=(),
             verification_commands=tuple(tuple(item) for item in verification_commands),
             assumptions=("Task intent was supplied through the advanced engineering interface.",),
-            deliverables=details["deliverables"],
-            risk_focus=details["risk_focus"],
+            deliverables=details.deliverables,
+            risk_focus=details.risk_focus,
             mutation_allowed=True,
         )
 
@@ -224,8 +232,8 @@ class TaskIntent:
             project_markers=(),
             verification_commands=(),
             assumptions=("Loaded from an engineering plan created before intent compilation.",),
-            deliverables=details["deliverables"],
-            risk_focus=details["risk_focus"],
+            deliverables=details.deliverables,
+            risk_focus=details.risk_focus,
             mutation_allowed=True,
         )
 
@@ -264,7 +272,7 @@ class IntentCompiler:
         if objective.strip().casefold().rstrip("。.!！?") in _VAGUE_OBJECTIVES:
             questions.append("What exact behavior, area, or outcome should this task address?")
         if not commands:
-            if not details["mutation_allowed"] and (workspace / ".git").exists():
+            if not details.mutation_allowed and (workspace / ".git").exists():
                 commands = (("git", "diff", "--exit-code"),)
             else:
                 questions.append(
@@ -286,9 +294,9 @@ class IntentCompiler:
             project_markers=profile.markers,
             verification_commands=commands,
             assumptions=tuple(assumptions),
-            deliverables=details["deliverables"],
-            risk_focus=details["risk_focus"],
-            mutation_allowed=details["mutation_allowed"],
+            deliverables=details.deliverables,
+            risk_focus=details.risk_focus,
+            mutation_allowed=details.mutation_allowed,
             clarification_questions=tuple(questions),
         )
 
@@ -306,9 +314,9 @@ class IntentCompiler:
 
 
 def inspect_project(workspace: Path) -> ProjectProfile:
-    kinds = []
-    markers = []
-    checks = []
+    kinds: List[str] = []
+    markers: List[str] = []
+    checks: List[Tuple[str, ...]] = []
 
     package_json = workspace / "package.json"
     if package_json.is_file():
@@ -362,6 +370,7 @@ def _node_checks(workspace: Path, package_json: Path) -> Tuple[Tuple[str, ...], 
     scripts = package.get("scripts", {}) if isinstance(package, dict) else {}
     if not isinstance(scripts, dict):
         return ()
+    prefix: Tuple[str, ...]
     if (workspace / "pnpm-lock.yaml").is_file():
         prefix = ("pnpm",)
     elif (workspace / "yarn.lock").is_file():
@@ -370,13 +379,13 @@ def _node_checks(workspace: Path, package_json: Path) -> Tuple[Tuple[str, ...], 
         prefix = ("bun", "run")
     else:
         prefix = ("npm", "run")
-    commands = []
+    commands: List[Tuple[str, ...]] = []
     for name in ("test", "typecheck", "lint", "build"):
         script = scripts.get(name)
         if isinstance(script, str) and script.strip():
             if name == "test" and "no test specified" in script.casefold():
                 continue
-            commands.append(prefix + (name,))
+            commands.append((*prefix, name))
         if len(commands) == 2:
             break
     return tuple(commands)

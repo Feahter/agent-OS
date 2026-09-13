@@ -1,9 +1,6 @@
-import fcntl
 import hashlib
 import json
 import math
-import os
-import tempfile
 import threading
 import time
 import uuid
@@ -12,8 +9,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, Mapping, Optional, Tuple
 
+from ._store import (
+    atomic_json_write,
+    file_lock,
+)
 from .errors import ContractViolation
-
 
 SINGLE_FLIGHT_SCHEMA_VERSION = 1
 _VALID_STATES = ("running", "completed", "failed")
@@ -29,27 +29,6 @@ def _canonical(value: Any) -> Tuple[Any, str]:
             f"single-flight payload must be JSON serializable: {error}"
         ) from error
     return json.loads(encoded), hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-
-
-def _atomic_json_write(path: Path, value: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, raw_path = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
-    temporary = Path(raw_path)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(
-                value,
-                handle,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(str(temporary), str(path))
-    finally:
-        if temporary.exists():
-            temporary.unlink()
 
 
 class RemoteFlightError(RuntimeError):
@@ -216,49 +195,58 @@ class SingleFlightCoordinator:
     ) -> Tuple[str, Mapping[str, Any]]:
         with self._locked(key):
             path = self._state_path(key)
-            state = self._read_state(path) if path.exists() else None
+            existing = self._read_state(path) if path.exists() else None
             now = self._clock()
-            if state is None:
-                state = self._running_state(key, source_id, now, ())
-                self._write_state(path, state)
-                return "leader", state
-            status = state["status"]
+            if existing is None:
+                return "leader", self._claim(path, key, source_id, now, ())
+            status = str(existing["status"])
             if status == "running":
-                if float(state["lease_expires_at"]) <= now:
-                    waiters = tuple(
+                if float(existing["lease_expires_at"]) <= now:
+                    inherited = tuple(
                         str(item)
-                        for item in state.get("waiters", ())
+                        for item in existing.get("waiters", ())
                         if item != waiter_id
                     )
-                    state = self._running_state(key, source_id, now, waiters)
-                    self._write_state(path, state)
-                    return "leader", state
-                waiters = list(state.get("waiters", ()))
-                if waiter_id not in waiters:
-                    waiters.append(waiter_id)
-                    state = dict(state)
-                    state["waiters"] = waiters
-                    self._write_state(path, state)
-                return "wait", state
+                    return "leader", self._claim(
+                        path, key, source_id, now, inherited
+                    )
+                waiters = [str(item) for item in existing.get("waiters", ())]
+                if waiter_id in waiters:
+                    return "wait", existing
+                waiters.append(waiter_id)
+                joined = dict(existing)
+                joined["waiters"] = waiters
+                self._write_state(path, joined)
+                return "wait", joined
 
-            delivery_expired = float(state["delivery_expires_at"]) <= now
-            waiters = list(state.get("waiters", ()))
+            delivery_expired = float(existing["delivery_expires_at"]) <= now
+            waiters = [str(item) for item in existing.get("waiters", ())]
             if waiter_id in waiters:
+                delivered = dict(existing)
                 waiters.remove(waiter_id)
-                delivered = dict(state)
                 if waiters:
-                    state = dict(state)
-                    state["waiters"] = waiters
-                    self._write_state(path, state)
+                    remaining = dict(existing)
+                    remaining["waiters"] = waiters
+                    self._write_state(path, remaining)
                 else:
                     path.unlink(missing_ok=True)
                 return status, delivered
             if waiters and not delivery_expired:
-                return "wait", state
+                return "wait", existing
             path.unlink(missing_ok=True)
-            state = self._running_state(key, source_id, now, ())
-            self._write_state(path, state)
-            return "leader", state
+            return "leader", self._claim(path, key, source_id, now, ())
+
+    def _claim(
+        self,
+        path: Path,
+        key: str,
+        source_id: str,
+        now: float,
+        waiters: Tuple[str, ...],
+    ) -> Mapping[str, Any]:
+        state = self._running_state(key, source_id, now, waiters)
+        self._write_state(path, state)
+        return state
 
     def _run_as_leader(
         self,
@@ -407,14 +395,8 @@ class SingleFlightCoordinator:
 
     @contextmanager
     def _locked(self, key: str) -> Iterator[None]:
-        path = self.locks / f"{key}.lock"
-        descriptor = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o600)
-        with os.fdopen(descriptor, "a+") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        with file_lock(self.locks / f"{key}.lock"):
+            yield
 
     def _state_path(self, key: str) -> Path:
         return self.states / f"{key}.json"
@@ -503,4 +485,4 @@ class SingleFlightCoordinator:
         value.pop("checksum", None)
         _, checksum = _canonical(value)
         value["checksum"] = checksum
-        _atomic_json_write(path, value)
+        atomic_json_write(path, value)

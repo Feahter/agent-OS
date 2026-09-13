@@ -6,4 +6,8 @@ include CHANGELOG.md
 include CONTRIBUTING.md
 include SECURITY.md
 include LICENSE
+include pyproject.toml
+recursive-include .workflow *.md
 recursive-include examples *.json
+recursive-include scripts *.py
+recursive-include tests *.py
