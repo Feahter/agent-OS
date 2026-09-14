@@ -1,3 +1,4 @@
+import json
 import tempfile
 import threading
 import unittest
@@ -9,6 +10,8 @@ from grapheng import (
     EffectJournal,
     GraphSpec,
     LocalControlPlane,
+    ModelUsage,
+    NodeOutcome,
     NodeRegistry,
 )
 
@@ -60,6 +63,51 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(42, snapshot.result["artifacts"]["answer"])
         self.assertGreater(first_page.next_cursor, 0)
         self.assertEqual((), second_page.events)
+
+    def test_result_checkpoint_and_events_preserve_identical_usage(self):
+        spec = graph([{"id": "work", "kind": "work", "writes": ["answer"]}])
+        usage = ModelUsage(
+            input_tokens=100,
+            cached_input_tokens=25,
+            output_tokens=10,
+            total_tokens=110,
+            input_tokens_complete=True,
+            cached_input_tokens_complete=True,
+            output_tokens_complete=True,
+            total_tokens_complete=True,
+        )
+        registry = NodeRegistry()
+        registry.register(
+            "work",
+            lambda context: NodeOutcome(
+                {"answer": 42}, tokens_used=110, usage=usage
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plane = LocalControlPlane(root, owner_id="controller-test")
+            run_id = plane.submit(spec, registry)
+            snapshot = plane.wait(run_id, timeout=2)
+            events = plane.events(run_id).events
+            checkpoint = json.loads(
+                (
+                    root
+                    / "runs"
+                    / run_id
+                    / "runtime"
+                    / "checkpoint.json"
+                ).read_text(encoding="utf-8")
+            )
+            plane.close()
+
+        completed = next(
+            item for item in events if item["event"] == "node_completed"
+        )
+        expected = usage.with_accounted_totals(110, 0.0).to_dict()
+        self.assertEqual(expected, snapshot.result["usage"])
+        self.assertEqual(expected, checkpoint["usage"])
+        self.assertEqual(expected, completed["payload"]["usage"])
 
     def test_cancel_stops_scheduling_new_nodes(self):
         spec = graph(

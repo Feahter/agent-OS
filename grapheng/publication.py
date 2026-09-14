@@ -65,6 +65,7 @@ class PublicationCandidate:
     cost_usd: Optional[float]
     input_artifacts: Tuple[ArtifactVersion, ...]
     output_artifacts: Tuple[ArtifactVersion, ...]
+    reasoning_effort: Optional[str] = None
     status: str = "pending"
     verifier_id: Optional[str] = None
     verifier_attempt: Optional[int] = None
@@ -98,6 +99,11 @@ class PublicationCandidate:
             output_artifacts=tuple(
                 ArtifactVersion.from_dict(item)
                 for item in value.get("output_artifacts", ())
+            ),
+            reasoning_effort=(
+                None
+                if value.get("reasoning_effort") is None
+                else str(value["reasoning_effort"])
             ),
             status=str(value.get("status", "pending")),
             verifier_id=(
@@ -145,6 +151,16 @@ class PublicationCandidate:
             or not 0 <= self.quality_score <= 1
         ):
             raise ContractViolation("invalid verified publication quality score")
+        if self.reasoning_effort is not None and (
+            not self.reasoning_effort
+            or len(self.reasoning_effort) > 32
+            or any(
+                char
+                not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-"
+                for char in self.reasoning_effort
+            )
+        ):
+            raise ContractViolation("invalid verified publication reasoning effort")
 
 
 @dataclass(frozen=True)
@@ -196,6 +212,15 @@ class VerifiedResultPublisher:
                 None,
                 "missing_agent_execution_receipt",
             )
+        bypass_reason = self._cache.bypass_reason(execution.request)
+        if bypass_reason is not None:
+            return self._event(
+                "verified_result_stage_skipped",
+                node,
+                attempt,
+                None,
+                bypass_reason,
+            )
         if execution.result.reuse_status not in ("none", "miss"):
             return self._event(
                 "verified_result_stage_skipped",
@@ -233,6 +258,7 @@ class VerifiedResultPublisher:
             output_artifacts=tuple(
                 ArtifactVersion.from_record(item) for item in output_records
             ),
+            reasoning_effort=execution.request.reasoning_effort,
         )
         candidate.validate()
         self._candidates[identifier] = candidate
@@ -351,7 +377,23 @@ class VerifiedResultPublisher:
                 task_type=spec.task_type,
                 model_family=spec.model_family,
                 reuse_scope=spec.reuse_scope,
+                reuse_allowed=(
+                    source.controlled_merge is None
+                    and spec.workspace.mode == "shared"
+                ),
+                reasoning_effort=candidate.reasoning_effort,
             )
+            bypass_reason = self._cache.bypass_reason(request)
+            if bypass_reason is not None:
+                skipped = replace(candidate, status="skipped", reason=bypass_reason)
+                self._replace(skipped)
+                return self._event(
+                    "verified_result_publish_skipped",
+                    self._verifier_node(graph, skipped),
+                    skipped.verifier_attempt,
+                    skipped,
+                    bypass_reason,
+                )
             result = AgentResult(
                 candidate.executor_id,
                 outputs,

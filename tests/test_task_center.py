@@ -219,6 +219,24 @@ class TaskCenterTests(unittest.TestCase):
                 with self.assertRaisesRegex(ContractViolation, "between 1 and 200"):
                     coordinator.task_center(invalid)
 
+    def test_queue_control_state_overrides_stale_cached_summary_and_next_action(self):
+        self.graph.details["run-1"] = {
+            "phase": "queued",
+            "summary": "Graph is ready to run",
+            "next_action": "status",
+        }
+        coordinator = self.coordinator()
+        coordinator.schedule("graph", "run-1")
+        coordinator.task_center()
+
+        coordinator.request_job("graph", "run-1", "pause")
+        value = coordinator.task_center()
+        job = next(item for item in value["jobs"] if item["reference"] == "run-1")
+
+        self.assertEqual("paused", job["state"])
+        self.assertEqual("Graph is paused", job["summary"])
+        self.assertEqual("resume", job["next_action"])
+
     def test_notifications_cover_attention_and_terminal_states(self):
         sink = RecordingSink()
         coordinator = self.coordinator(sink)

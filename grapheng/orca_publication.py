@@ -133,6 +133,10 @@ class OrcaPublicationRecorder:
             task_type=node.agent.task_type,
             model_family=node.agent.model_family,
             reuse_scope=node.agent.reuse_scope,
+            reuse_allowed=(
+                node.controlled_merge is None
+                and node.agent.workspace.mode == "shared"
+            ),
         )
 
     def _publish(

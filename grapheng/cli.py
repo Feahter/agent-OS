@@ -2,7 +2,7 @@ import argparse
 import json
 import shlex
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
@@ -11,7 +11,15 @@ from .adapters import discover_local_executors
 from .agent_nodes import AgentNodeHandler
 from .console import ApprovalInbox, OperationsConsole
 from .console_server import OperationsServer
+from .control import LocalControlPlane
 from .distribution import AgentOSDistribution
+from .economics import (
+    BenchmarkProtocol,
+    BenchmarkRun,
+    BenchmarkSuite,
+    PriceCatalog,
+    RunEconomics,
+)
 from .engineering import EngineeringWorkflow, ProjectPolicy, default_project_policy
 from .errors import ContractViolation, GraphEngineeringError
 from .evaluation import EvaluationCase, EvaluationLab
@@ -31,6 +39,7 @@ from .publication import VerifiedResultPublisher
 from .resident import ResidentCoordinator
 from .runtime import GraphRuntime, NodeOutcome, NodeRegistry
 from .tasks import UserTaskModule, default_agent_os_home
+from .token_reservations import HistoricalTokenReservations
 from .validation import validate_graph
 
 
@@ -264,6 +273,293 @@ def _run_evaluation_command(args, parser) -> int:
         value = lab.status()
     print(json.dumps(value, ensure_ascii=False, sort_keys=True))
     return 0
+
+
+def _run_benchmark_command(args, parser, agent_os=None) -> int:
+    if args.action == "freeze-suite":
+        required = {
+            "--output": args.output,
+            "--suite-id": args.suite_id,
+            "--suite-version": args.suite_version,
+            "--micro-protocol": args.micro_protocol,
+            "--engineering-protocol": args.engineering_protocol,
+            "--recovery-protocol": args.recovery_protocol,
+        }
+        missing = [flag for flag, value in required.items() if value is None]
+        if missing:
+            parser.error("benchmark freeze-suite requires " + ", ".join(missing))
+        suite = BenchmarkSuite.freeze(
+            args.output,
+            suite_id=args.suite_id,
+            suite_version=args.suite_version,
+            micro=BenchmarkProtocol.load(args.micro_protocol),
+            engineering=BenchmarkProtocol.load(args.engineering_protocol),
+            recovery=BenchmarkProtocol.load(args.recovery_protocol),
+        )
+        print(json.dumps(suite.to_dict(), ensure_ascii=False, sort_keys=True))
+        return 0
+
+    if args.action == "freeze":
+        required = {
+            "--spec": args.benchmark_spec,
+            "--inputs": args.benchmark_inputs,
+            "--output": args.output,
+            "--benchmark-id": args.benchmark_id,
+            "--scenario-version": args.scenario_version,
+            "--provider": args.provider,
+            "--model": args.model,
+            "--reasoning": args.reasoning,
+            "--executor": args.executor,
+            "--executor-version": args.executor_version,
+        }
+        missing = [flag for flag, value in required.items() if value is None]
+        if missing:
+            parser.error("benchmark freeze requires " + ", ".join(missing))
+        graph = GraphSpec.from_json(args.benchmark_spec)
+        validate_graph(graph)
+        protocol = BenchmarkProtocol.freeze(
+            args.output,
+            benchmark_id=args.benchmark_id,
+            scenario_version=args.scenario_version,
+            provider=args.provider,
+            model=args.model,
+            reasoning=args.reasoning,
+            executor=args.executor,
+            executor_version=args.executor_version,
+            graph=graph,
+            inputs=_json_file(args.benchmark_inputs),
+            concurrency_matrix=tuple(args.concurrency or (1, 2)),
+            repetitions_per_cell=args.repetitions,
+        )
+        print(json.dumps(protocol.to_dict(), ensure_ascii=False, sort_keys=True))
+        return 0
+
+    if args.action == "execute":
+        required = {
+            "--root": args.root,
+            "--protocol": args.protocol,
+            "--spec": args.benchmark_spec,
+            "--inputs": args.benchmark_inputs,
+            "--workspace": args.workspace,
+        }
+        missing = [flag for flag, value in required.items() if value is None]
+        if missing:
+            parser.error("benchmark execute requires " + ", ".join(missing))
+        if args.timeout_seconds <= 0:
+            parser.error("benchmark execute --timeout-seconds must be positive")
+        protocol = BenchmarkProtocol.load(args.protocol)
+        graph = GraphSpec.from_json(args.benchmark_spec)
+        validate_graph(graph)
+        inputs = _json_file(args.benchmark_inputs)
+        if BenchmarkProtocol.graph_fingerprint(graph) != protocol.dag_fingerprint:
+            raise ContractViolation(
+                "benchmark graph fingerprint does not match the protocol"
+            )
+        if BenchmarkProtocol.inputs_fingerprint(inputs) != protocol.input_fingerprint:
+            raise ContractViolation(
+                "benchmark input fingerprint does not match the protocol"
+            )
+        if not args.workspace.is_dir():
+            raise ContractViolation("benchmark workspace must be a directory")
+        for node in graph.nodes:
+            if node.agent is None or node.kind != "agent":
+                raise ContractViolation(
+                    "benchmark execute currently requires agent-only graphs"
+                )
+            if node.agent.executor != protocol.executor:
+                raise ContractViolation(
+                    f"benchmark node {node.id} executor does not match the protocol"
+                )
+            if node.agent.model != protocol.model:
+                raise ContractViolation(
+                    f"benchmark node {node.id} model does not match the protocol"
+                )
+            if node.agent.workspace.mode != "shared":
+                raise ContractViolation(
+                    "benchmark execute requires shared agent workspaces"
+                )
+
+        reuse_store = agent_os.reuse_store() if agent_os is not None else None
+        router = agent_os.router() if agent_os is not None else None
+        executors = discover_local_executors(router, reuse_store)
+        available = {
+            capability.executor_id for capability in executors.capabilities()
+        }
+        if protocol.executor not in available:
+            raise ContractViolation(
+                f"benchmark executor is unavailable: {protocol.executor}"
+            )
+        token_reservations = (
+            agent_os.token_reservations() if agent_os is not None else None
+        )
+        economics = RunEconomics(args.root)
+        prices = PriceCatalog.load(args.prices) if args.prices is not None else None
+        artifacts_root = args.root / "artifacts"
+        if artifacts_root.is_symlink():
+            raise ContractViolation("benchmark artifacts directory cannot be a symlink")
+        plane = LocalControlPlane(
+            artifacts_root,
+            max_workers=1,
+            reuse_store=reuse_store,
+            token_reservations=token_reservations,
+        )
+        snapshots = []
+        try:
+            for concurrency in protocol.concurrency_matrix:
+                run_graph = replace(graph, max_concurrency=concurrency)
+                for _ in range(protocol.repetitions_per_cell):
+                    registry = NodeRegistry()
+                    registry.register(
+                        "agent",
+                        AgentNodeHandler(
+                            run_graph,
+                            executors,
+                            args.workspace,
+                            reasoning_effort=protocol.reasoning,
+                        ),
+                    )
+                    run_id = plane.submit(
+                        run_graph,
+                        registry,
+                        AllowListGatePolicy(set(args.allow_gate)),
+                    )
+                    completed = plane.wait(run_id, timeout=args.timeout_seconds)
+                    snapshots.append(
+                        economics.record_control_run(
+                            protocol,
+                            artifacts_root / "runs" / run_id,
+                            verified=args.verified and completed.phase == "succeeded",
+                            prices=prices,
+                        )
+                    )
+        finally:
+            plane.close()
+        runs_by_concurrency = {
+            str(concurrency): sum(
+                snapshot["concurrency"] == concurrency for snapshot in snapshots
+            )
+            for concurrency in protocol.concurrency_matrix
+        }
+        result = {
+            "benchmark_protocol_fingerprint": protocol.fingerprint,
+            "runs": len(snapshots),
+            "runs_by_concurrency": runs_by_concurrency,
+            "successful_runs": sum(
+                snapshot["outcome"]["success"] for snapshot in snapshots
+            ),
+            "verified_results": sum(
+                snapshot["outcome"]["verified"] for snapshot in snapshots
+            ),
+            "run_ids": [snapshot["run_id"] for snapshot in snapshots],
+        }
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return 0 if result["successful_runs"] == result["runs"] else 1
+
+    if args.root is None:
+        parser.error(f"benchmark {args.action} requires --root")
+    economics = RunEconomics(args.root)
+    if args.action == "record":
+        if args.protocol is None:
+            parser.error("benchmark record requires --protocol")
+        if (args.run is None) == (args.run_artifacts is None):
+            parser.error(
+                "benchmark record requires exactly one of --run or --run-artifacts"
+            )
+        protocol = BenchmarkProtocol.load(args.protocol)
+        prices = PriceCatalog.load(args.prices) if args.prices is not None else None
+        if args.run_artifacts is not None:
+            value = economics.record_control_run(
+                protocol,
+                args.run_artifacts,
+                verified=args.verified,
+                prices=prices,
+            )
+        else:
+            if args.verified:
+                parser.error("benchmark --verified is only valid with --run-artifacts")
+            value = economics.record(protocol, BenchmarkRun.load(args.run), prices)
+        print(json.dumps(value, ensure_ascii=False, sort_keys=True))
+        return 0
+
+    if args.action == "reprice":
+        if args.run_id is None or args.prices is None:
+            parser.error("benchmark reprice requires --run-id and --prices")
+        value = economics.reprice(args.run_id, PriceCatalog.load(args.prices))
+        print(json.dumps(value, ensure_ascii=False, sort_keys=True))
+        return 0
+
+    if args.baseline_protocol is None or args.candidate_protocol is None:
+        parser.error(
+            "benchmark report requires --baseline-protocol and --candidate-protocol"
+        )
+    value = economics.report(
+        BenchmarkProtocol.load(args.baseline_protocol),
+        BenchmarkProtocol.load(args.candidate_protocol),
+    )
+    if args.json_output:
+        print(json.dumps(value, ensure_ascii=False, sort_keys=True))
+    else:
+        _print_benchmark_report(value)
+    return 0
+
+
+def _print_benchmark_report(value: Mapping[str, Any]) -> None:
+    baseline = value["baseline"]["overall"]
+    candidate = value["candidate"]["overall"]
+    roi = value["roi"]
+
+    def metric(item: Optional[float], suffix: str = "") -> str:
+        return "unknown" if item is None else f"{item:.4f}{suffix}"
+
+    def percentage(item: Optional[float]) -> str:
+        return "unknown" if item is None else f"{item:.2%}"
+
+    print(f"Benchmark {value['benchmark_id']} ({value['scenario_version']})")
+    print(
+        "verified success: "
+        f"{percentage(baseline['verified_success_rate'])} -> "
+        f"{percentage(candidate['verified_success_rate'])}"
+    )
+    print(
+        "tokens / verified result: "
+        f"{metric(baseline['tokens']['per_verified_result'])} -> "
+        f"{metric(candidate['tokens']['per_verified_result'])}"
+    )
+    print(
+        "median wall clock: "
+        f"{metric(baseline['wall_clock_seconds']['median'], 's')} -> "
+        f"{metric(candidate['wall_clock_seconds']['median'], 's')}"
+    )
+    print(
+        "token reduction: "
+        + (
+            "unknown"
+            if roi["token_reduction_fraction"] is None
+            else f"{roi['token_reduction_fraction']:.2%}"
+        )
+    )
+    print(
+        "cost ROI: "
+        + (
+            roi["cost_roi_unavailable_reason"]
+            if roi["cost_reduction_fraction"] is None
+            else f"{roi['cost_reduction_fraction']:.2%}"
+        )
+    )
+    warning_names = sorted(
+        set(baseline["warnings"]["counts"])
+        | set(candidate["warnings"]["counts"])
+    )
+    for warning in warning_names:
+        print(
+            f"warning: {warning} "
+            f"(baseline={baseline['warnings']['counts'].get(warning, 0)}, "
+            f"candidate={candidate['warnings']['counts'].get(warning, 0)})"
+        )
+    print(
+        f"failed samples: baseline={len(baseline['failed_run_ids'])}, "
+        f"candidate={len(candidate['failed_run_ids'])}"
+    )
 
 
 def _cost_text(usage: Mapping[str, Any]) -> str:
@@ -671,6 +967,49 @@ def _dispatch(argv: Optional[Sequence[str]] = None) -> int:
     evaluation_parser.add_argument("--human-decisions", type=int)
     evaluation_parser.add_argument("--recovery-attempted", action="store_true")
     evaluation_parser.add_argument("--recovery-succeeded", action="store_true")
+    benchmark_parser = subparsers.add_parser("benchmark")
+    benchmark_parser.add_argument(
+        "action",
+        choices=(
+            "freeze",
+            "freeze-suite",
+            "execute",
+            "record",
+            "reprice",
+            "report",
+        ),
+    )
+    benchmark_parser.add_argument("--root", type=Path)
+    benchmark_parser.add_argument("--protocol", type=Path)
+    benchmark_parser.add_argument("--run", type=Path)
+    benchmark_parser.add_argument("--run-id")
+    benchmark_parser.add_argument("--run-artifacts", type=Path)
+    benchmark_parser.add_argument("--verified", action="store_true")
+    benchmark_parser.add_argument("--prices", type=Path)
+    benchmark_parser.add_argument("--baseline-protocol", type=Path)
+    benchmark_parser.add_argument("--candidate-protocol", type=Path)
+    benchmark_parser.add_argument("--json", action="store_true", dest="json_output")
+    benchmark_parser.add_argument("--spec", type=Path, dest="benchmark_spec")
+    benchmark_parser.add_argument("--inputs", type=Path, dest="benchmark_inputs")
+    benchmark_parser.add_argument("--output", type=Path)
+    benchmark_parser.add_argument("--benchmark-id")
+    benchmark_parser.add_argument("--scenario-version")
+    benchmark_parser.add_argument("--provider")
+    benchmark_parser.add_argument("--model")
+    benchmark_parser.add_argument("--reasoning")
+    benchmark_parser.add_argument("--executor")
+    benchmark_parser.add_argument("--executor-version")
+    benchmark_parser.add_argument("--concurrency", type=int, action="append")
+    benchmark_parser.add_argument("--repetitions", type=int, default=5)
+    benchmark_parser.add_argument("--workspace", type=Path)
+    benchmark_parser.add_argument("--allow-gate", action="append", default=[])
+    benchmark_parser.add_argument("--timeout-seconds", type=float, default=3600.0)
+    benchmark_parser.add_argument("--agent-os-root", type=Path)
+    benchmark_parser.add_argument("--suite-id")
+    benchmark_parser.add_argument("--suite-version")
+    benchmark_parser.add_argument("--micro-protocol", type=Path)
+    benchmark_parser.add_argument("--engineering-protocol", type=Path)
+    benchmark_parser.add_argument("--recovery-protocol", type=Path)
     args = parser.parse_args(argv)
 
     if args.command == "setup":
@@ -723,6 +1062,9 @@ def _dispatch(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.command == "evaluate":
         return _run_evaluation_command(args, parser)
+
+    if args.command == "benchmark":
+        return _run_benchmark_command(args, parser, agent_os)
 
     if args.command == "engineer":
         return _run_engineering_command(args, parser, agent_os)
@@ -927,10 +1269,14 @@ def _dispatch(argv: Optional[Sequence[str]] = None) -> int:
     if args.command == "agent-run":
         telemetry.configure(args.work_dir)
         learning_root = agent_os.learning_root if agent_os else args.learning_root
-        router = (
-            agent_os.router()
+        learning_loop = RSILoop(learning_root) if learning_root else None
+        router = agent_os.router() if agent_os else learning_loop.router() if learning_loop else None
+        token_reservations = (
+            agent_os.token_reservations()
             if agent_os
-            else RSILoop(learning_root).router() if learning_root else None
+            else HistoricalTokenReservations(learning_loop.journal.read())
+            if learning_loop
+            else None
         )
         reuse_store = agent_os.reuse_store() if agent_os else None
         executors = discover_local_executors(router, reuse_store)
@@ -948,6 +1294,7 @@ def _dispatch(argv: Optional[Sequence[str]] = None) -> int:
                 if reuse_store is not None
                 else None
             ),
+            token_reservations=token_reservations,
         ).run(resume=args.resume)
         print(
             json.dumps(

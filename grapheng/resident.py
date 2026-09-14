@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import hashlib
 import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -35,7 +37,7 @@ from .task_center import (
     ResidentNotificationJournal,
 )
 
-RESIDENT_QUEUE_SCHEMA_VERSION = 2
+RESIDENT_QUEUE_SCHEMA_VERSION = 3
 _ACTIVE_STATES = {
     "queued",
     "running",
@@ -51,6 +53,9 @@ _REFERENCE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _JOB_KINDS = {"engineering", "graph", "orca"}
 _PRIORITY_AGING_SECONDS = 60.0
 _MAX_PRIORITY = 100
+_WAITING_PROBE_INTERVAL_SECONDS = 1.0
+_WAITING_FAILURE_BACKOFF_SECONDS = 1.0
+_WAITING_FAILURE_BACKOFF_CAP_SECONDS = 30.0
 
 
 class ResidentJobHandler(Protocol):
@@ -166,18 +171,21 @@ class ResidentCoordinator:
                 "updated_at": now,
                 "attempts": 0,
                 "error": None,
+                "probe_failures": 0,
+                "next_probe_at": None,
             }
             queue["updated_at"] = now
             self._write_queue(queue)
-            telemetry.emit(
-                "resident.job_scheduled",
-                job_id=job_id,
-                job_kind=kind,
-                reference=reference,
-                priority=priority,
-                sequence=sequence,
-            )
-            return dict(items[job_id])
+            scheduled = dict(items[job_id])
+        telemetry.emit(
+            "resident.job_scheduled",
+            job_id=job_id,
+            job_kind=kind,
+            reference=reference,
+            priority=priority,
+            sequence=sequence,
+        )
+        return scheduled
 
     def schedule_graph(
         self, graph: GraphSpec, workspace: Path, priority: int = 0
@@ -387,10 +395,16 @@ class ResidentCoordinator:
                 item["requested_action"] = "cancel"
             else:
                 item["priority"] = self._priority(priority)
+            if action in ("pause", "resume", "cancel"):
+                item["probe_failures"] = 0
+                item["next_probe_at"] = None
             item["updated_at"] = now
             queue["updated_at"] = now
             self._write_queue(queue)
-            return dict(item)
+            updated = dict(item)
+        self.projections.forget(f"inspect:{kind}", reference)
+        self.projections.forget(f"describe:{kind}", reference)
+        return updated
 
     def control_probe(self, task_id: str) -> Optional[str]:
         self._validate_task_id(task_id)
@@ -484,6 +498,7 @@ class ResidentCoordinator:
                 self._stop.set()
                 heartbeat.join(timeout=max(1.0, self._heartbeat_seconds * 2))
                 self.instance_path.unlink(missing_ok=True)
+                self.projections.close()
 
     def stop(self) -> None:
         self._stop.set()
@@ -550,6 +565,8 @@ class ResidentCoordinator:
         return True
 
     def _claim_next(self) -> Optional[Mapping[str, Any]]:
+        claimed = None
+        event = None
         with file_lock(self.queue_lock_path):
             queue = self._read_queue()
             candidates = [
@@ -572,15 +589,17 @@ class ResidentCoordinator:
             item["attempts"] = int(item["attempts"]) + 1
             queue["updated_at"] = now
             self._write_queue(queue)
-            telemetry.emit(
-                "resident.job_claimed",
-                job_id=item["job_id"],
-                job_kind=item["kind"],
-                attempts=item["attempts"],
-                effective_priority=effective_priority,
-                queue_wait_seconds=queue_wait_seconds,
-            )
-            return dict(item)
+            claimed = dict(item)
+            event = {
+                "job_id": item["job_id"],
+                "job_kind": item["kind"],
+                "attempts": item["attempts"],
+                "effective_priority": effective_priority,
+                "queue_wait_seconds": queue_wait_seconds,
+            }
+        assert event is not None
+        telemetry.emit("resident.job_claimed", **event)
+        return claimed
 
     @staticmethod
     def _effective_priority(item: Mapping[str, Any], now: float) -> int:
@@ -612,17 +631,24 @@ class ResidentCoordinator:
             else:
                 item["state"] = phase
                 item["requested_action"] = None
+            if phase == "waiting":
+                item["probe_failures"] = 0
+                item["next_probe_at"] = self._clock() + _WAITING_PROBE_INTERVAL_SECONDS
+            else:
+                item["probe_failures"] = 0
+                item["next_probe_at"] = None
             item["error"] = error
             item["updated_at"] = self._clock()
             queue["updated_at"] = item["updated_at"]
             self._write_queue(queue)
             settled = dict(item)
+        if settled is not None:
             telemetry.emit(
                 "resident.job_settled",
                 level=logging.WARNING if error else logging.INFO,
                 job_id=job_id,
-                job_kind=item["kind"],
-                state=item["state"],
+                job_kind=settled["kind"],
+                state=settled["state"],
                 error=error,
             )
         if settled is not None and self._notifications is not None:
@@ -644,36 +670,85 @@ class ResidentCoordinator:
                     item["state"] = "queued"
                 else:
                     continue
+                item["probe_failures"] = 0
+                item["next_probe_at"] = None
                 item["updated_at"] = now
                 changed = True
             if changed:
                 queue["updated_at"] = now
                 self._write_queue(queue)
-                telemetry.emit("resident.interrupted_jobs_recovered")
+        if changed:
+            telemetry.emit("resident.interrupted_jobs_recovered")
 
     def _refresh_waiting(self) -> None:
+        now = self._clock()
         with file_lock(self.queue_lock_path):
             waiting = [
                 (str(item["job_id"]), str(item["kind"]), str(item["reference"]))
                 for item in self._read_queue()["items"].values()
-                if isinstance(item, dict) and item.get("state") == "waiting"
+                if isinstance(item, dict)
+                and item.get("state") == "waiting"
+                and (
+                    item.get("next_probe_at") is None
+                    or float(item["next_probe_at"]) <= now
+                )
             ]
         for job_id, kind, reference in waiting:
             try:
                 phase = str(self._job_handlers[kind].inspect(reference))
             except Exception as error:
+                probe = self._schedule_waiting_probe(job_id, failed=True)
                 telemetry.emit(
                     "resident.waiting_probe_failed",
                     level=logging.WARNING,
                     job_id=job_id,
                     job_kind=kind,
                     error=f"{type(error).__name__}: {error}",
+                    probe_failures=(
+                        probe.get("probe_failures") if probe is not None else None
+                    ),
+                    next_probe_at=(
+                        probe.get("next_probe_at") if probe is not None else None
+                    ),
                 )
                 continue
             if phase in _TERMINAL_STATES:
                 self._settle(job_id, phase, None)
             elif phase != "waiting":
                 self._requeue_waiting(job_id)
+            else:
+                self._schedule_waiting_probe(job_id, failed=False)
+
+    def _schedule_waiting_probe(
+        self, job_id: str, *, failed: bool
+    ) -> Optional[Mapping[str, Any]]:
+        with file_lock(self.queue_lock_path):
+            queue = self._read_queue()
+            item = queue["items"].get(job_id)
+            if not isinstance(item, dict) or item.get("state") != "waiting":
+                return None
+            failures = int(item["probe_failures"]) + 1 if failed else 0
+            delay = (
+                self._waiting_failure_delay(job_id, failures)
+                if failed
+                else _WAITING_PROBE_INTERVAL_SECONDS
+            )
+            item["probe_failures"] = failures
+            item["next_probe_at"] = self._clock() + delay
+            queue["updated_at"] = self._clock()
+            self._write_queue(queue)
+            return dict(item)
+
+    @staticmethod
+    def _waiting_failure_delay(job_id: str, failures: int) -> float:
+        exponent = min(failures - 1, 30)
+        base = min(
+            _WAITING_FAILURE_BACKOFF_CAP_SECONDS,
+            _WAITING_FAILURE_BACKOFF_SECONDS * (2**exponent),
+        )
+        digest = hashlib.sha256(f"{job_id}:{failures}".encode()).digest()
+        unit = int.from_bytes(digest[:4], "big") / 0xFFFFFFFF
+        return base * (0.9 + unit * 0.2)
 
     def _requeue_waiting(self, job_id: str) -> None:
         with file_lock(self.queue_lock_path):
@@ -682,6 +757,8 @@ class ResidentCoordinator:
             if not isinstance(item, dict) or item.get("state") != "waiting":
                 return
             item["state"] = "queued"
+            item["probe_failures"] = 0
+            item["next_probe_at"] = None
             item["updated_at"] = self._clock()
             queue["updated_at"] = item["updated_at"]
             self._write_queue(queue)
@@ -711,6 +788,9 @@ class ResidentCoordinator:
         migrated_from_v1 = isinstance(value, dict) and value.get("schema_version") == 1
         if migrated_from_v1:
             value = self._migrate_v1_queue(value)
+        migrated_from_v2 = isinstance(value, dict) and value.get("schema_version") == 2
+        if migrated_from_v2:
+            value = self._migrate_v2_queue(value)
         if (
             not isinstance(value, dict)
             or value.get("schema_version") != RESIDENT_QUEUE_SCHEMA_VERSION
@@ -733,6 +813,8 @@ class ResidentCoordinator:
                 "updated_at",
                 "attempts",
                 "error",
+                "probe_failures",
+                "next_probe_at",
             }:
                 raise ContractViolation("resident queue item has an invalid contract")
             if (
@@ -752,6 +834,17 @@ class ResidentCoordinator:
                 or isinstance(item["attempts"], bool)
                 or not isinstance(item["attempts"], int)
                 or item["attempts"] < 0
+                or isinstance(item["probe_failures"], bool)
+                or not isinstance(item["probe_failures"], int)
+                or item["probe_failures"] < 0
+                or (
+                    item["next_probe_at"] is not None
+                    and (
+                        isinstance(item["next_probe_at"], bool)
+                        or not isinstance(item["next_probe_at"], (int, float))
+                        or not math.isfinite(float(item["next_probe_at"]))
+                    )
+                )
                 or (item["error"] is not None and not isinstance(item["error"], str))
             ):
                 raise ContractViolation("resident queue item fields are invalid")
@@ -760,7 +853,7 @@ class ResidentCoordinator:
                     item[field], (int, float)
                 ):
                     raise ContractViolation("resident queue item timestamps are invalid")
-        if migrated_from_v1:
+        if migrated_from_v1 or migrated_from_v2:
             self._write_queue(value)
         return value
 
@@ -769,7 +862,7 @@ class ResidentCoordinator:
         if not isinstance(items, dict):
             raise ContractViolation("resident queue has an invalid v1 contract")
         migrated = dict(value)
-        migrated["schema_version"] = RESIDENT_QUEUE_SCHEMA_VERSION
+        migrated["schema_version"] = 2
         migrated["items"] = {}
         for task_id, item in items.items():
             if (
@@ -784,6 +877,23 @@ class ResidentCoordinator:
             converted.update(
                 {"job_id": job_id, "kind": "engineering", "reference": task_id}
             )
+            migrated["items"][job_id] = converted
+        return migrated
+
+    @staticmethod
+    def _migrate_v2_queue(value: Mapping[str, Any]) -> Dict[str, Any]:
+        items = value.get("items")
+        if not isinstance(items, dict):
+            raise ContractViolation("resident queue has an invalid v2 contract")
+        migrated = dict(value)
+        migrated["schema_version"] = RESIDENT_QUEUE_SCHEMA_VERSION
+        migrated["items"] = {}
+        for job_id, item in items.items():
+            if not isinstance(job_id, str) or not isinstance(item, dict):
+                raise ContractViolation("resident queue has an invalid v2 job")
+            converted = dict(item)
+            converted.setdefault("probe_failures", 0)
+            converted.setdefault("next_probe_at", None)
             migrated["items"][job_id] = converted
         return migrated
 
@@ -811,10 +921,28 @@ class ResidentCoordinator:
                 details = {}
         if item.get("_scheduled") is False:
             state = str(details.get("phase", state))
+        details_phase = details.get("phase")
+        queue_state_is_authoritative = (
+            item.get("_scheduled") is not False
+            and state
+            in {
+                "queued",
+                "waiting",
+                "paused",
+                "pause_requested",
+                "cancel_requested",
+                "succeeded",
+                "failed",
+                "cancelled",
+            }
+            and details_phase != state
+        )
         summary = details.get("summary")
-        if not isinstance(summary, str) or not summary:
+        if queue_state_is_authoritative or not isinstance(summary, str) or not summary:
             summary = self._state_summary(kind, state)
         next_action = details.get("next_action")
+        if queue_state_is_authoritative:
+            next_action = None
         if next_action is not None and not isinstance(next_action, str):
             next_action = None
         if next_action is None:

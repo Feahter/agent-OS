@@ -19,9 +19,15 @@ from grapheng import (
 
 
 class CountingExecutor:
-    def __init__(self, started=None, release=None, error=None):
+    def __init__(
+        self,
+        started=None,
+        release=None,
+        error=None,
+        features=("structured_output", "token_budget"),
+    ):
         self._capabilities = ExecutorCapabilities(
-            "counting", ("structured_output", "token_budget"), ()
+            "counting", features, ()
         )
         self.started = started
         self.release = release
@@ -63,6 +69,38 @@ def make_request(workspace, task_id="task", **overrides):
 
 
 class ReuseTests(unittest.TestCase):
+    def test_reasoning_effort_is_part_of_the_verified_reuse_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            cache = VerifiedArtifactCache(root / "reuse")
+            executor = CountingExecutor(
+                features=(
+                    "reasoning_control",
+                    "structured_output",
+                    "token_budget",
+                )
+            )
+            registry = ExecutorRegistry(reuse_store=cache)
+            registry.register(executor)
+            low_request = make_request(workspace, reasoning_effort="low")
+            low = registry.execute(low_request)
+            cache.publish_verified(
+                low_request,
+                low,
+                source_run_id="run-low",
+                verification_id="anchor-low",
+                quality_score=1.0,
+            )
+
+            high = registry.execute(
+                make_request(workspace, "run-high", reasoning_effort="high")
+            )
+
+        self.assertEqual("miss", high.reuse_status)
+        self.assertEqual(2, executor.calls)
+
     def test_stricter_token_budget_never_reuses_a_looser_result(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -196,6 +234,91 @@ class ReuseTests(unittest.TestCase):
         self.assertEqual("bypassed", second.reuse_status)
         self.assertEqual(2, executor.calls)
 
+    def test_mutating_tools_always_bypass_even_when_caller_allows_reuse(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            cache = VerifiedArtifactCache(root / "reuse")
+            executor = CountingExecutor()
+            request = make_request(workspace, tools=("write",))
+
+            first = cache.resolve(
+                request, "counting", lambda: executor.execute(request)
+            )
+            second = cache.resolve(
+                request, "counting", lambda: executor.execute(request)
+            )
+            with self.assertRaisesRegex(
+                ContractViolation, "mutating_tools=write"
+            ):
+                cache.publish_verified(request, first, "run", "anchor", 1.0)
+
+        self.assertEqual("bypassed", first.reuse_status)
+        self.assertEqual("bypassed", second.reuse_status)
+        self.assertEqual(2, executor.calls)
+
+    def test_read_only_extraction_can_reuse_and_reports_measured_savings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            cache = VerifiedArtifactCache(root / "reuse")
+            executor = CountingExecutor()
+            request = make_request(workspace, tools=("read",))
+
+            first = cache.resolve(
+                request, "counting", lambda: executor.execute(request)
+            )
+            cache.publish_verified(request, first, "run", "anchor", 1.0)
+            hit = cache.resolve(
+                make_request(workspace, "hit", tools=("read",)),
+                "counting",
+                lambda: executor.execute(request),
+            )
+            status = cache.status()
+
+        self.assertEqual("hit", hit.reuse_status)
+        self.assertEqual(11, hit.reuse_saved_tokens)
+        self.assertEqual(1, executor.calls)
+        self.assertEqual(11, status["saved_tokens"])
+        self.assertEqual(0.25, status["saved_cost_usd"])
+        self.assertTrue(status["saved_cost_complete"])
+
+    def test_unknown_source_cost_keeps_saved_cost_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            cache = VerifiedArtifactCache(root / "reuse")
+            request = make_request(workspace)
+            original = AgentResult(
+                "counting", {"answer": "HELLO"}, "done", tokens_used=11
+            )
+
+            first = cache.resolve(request, "counting", lambda: original)
+            cache.publish_verified(request, first, "run", "anchor", 1.0)
+            hit = cache.resolve(
+                make_request(workspace, "hit"),
+                "counting",
+                lambda: original,
+            )
+            status = cache.status()
+            events = [
+                json.loads(line)
+                for line in (root / "reuse" / "events.jsonl").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            hit_event = next(item for item in events if item["status"] == "hit")
+
+        self.assertEqual("hit", hit.reuse_status)
+        self.assertEqual(11, status["saved_tokens"])
+        self.assertIsNone(status["saved_cost_usd"])
+        self.assertFalse(status["saved_cost_complete"])
+        self.assertIsNone(hit_event["saved_cost_usd"])
+        self.assertFalse(hit_event["saved_cost_complete"])
+
     def test_scope_ttl_and_checksum_prevent_unsafe_reuse(self):
         clock = [10.0]
         with tempfile.TemporaryDirectory() as directory:
@@ -264,6 +387,7 @@ class ReuseTests(unittest.TestCase):
         self.assertEqual((), entries)
         coalesced = next(item for item in results if item.reuse_status == "coalesced")
         self.assertEqual(0, coalesced.tokens_used)
+        self.assertEqual(11, coalesced.reuse_saved_tokens)
         self.assertEqual("leader", coalesced.source_task_id)
 
     def test_leader_failure_is_shared_with_waiters(self):

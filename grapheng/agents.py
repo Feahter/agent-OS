@@ -60,6 +60,7 @@ class AgentRequest:
     model_family: str = "default"
     reuse_scope: str = "local"
     reuse_allowed: bool = True
+    reasoning_effort: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not self.prompt.strip():
@@ -107,6 +108,19 @@ class AgentRequest:
             raise ContractViolation("agent reuse_scope must be a safe non-empty identifier")
         if not isinstance(self.reuse_allowed, bool):
             raise ContractViolation("agent reuse_allowed must be a boolean")
+        if self.reasoning_effort is not None and (
+            not isinstance(self.reasoning_effort, str)
+            or not self.reasoning_effort
+            or len(self.reasoning_effort) > 32
+            or any(
+                char
+                not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-"
+                for char in self.reasoning_effort
+            )
+        ):
+            raise ContractViolation(
+                "agent reasoning_effort must be a safe non-empty identifier or null"
+            )
 
 
 @dataclass(frozen=True)
@@ -350,6 +364,7 @@ class AgentResult:
     source_run_id: Optional[str] = None
     verification_id: Optional[str] = None
     usage: Optional[ModelUsage] = None
+    reuse_saved_tokens: Optional[int] = None
 
     def __post_init__(self) -> None:
         if (
@@ -373,6 +388,21 @@ class AgentResult:
             "coalesced",
         ):
             raise ContractViolation("invalid agent reuse_status")
+        if self.reuse_saved_tokens is not None and (
+            isinstance(self.reuse_saved_tokens, bool)
+            or not isinstance(self.reuse_saved_tokens, int)
+            or self.reuse_saved_tokens < 0
+        ):
+            raise ContractViolation(
+                "agent reuse_saved_tokens must be a non-negative integer or null"
+            )
+        if (
+            self.reuse_status not in ("hit", "coalesced")
+            and self.reuse_saved_tokens not in (None, 0)
+        ):
+            raise ContractViolation(
+                "agent reuse_saved_tokens require a hit or coalesced result"
+            )
         usage = self.usage
         if usage is None:
             usage = ModelUsage.from_legacy_constructor(
@@ -448,6 +478,8 @@ class ExecutorRegistry:
             implied_features.add("cost_budget")
         if request.max_tokens is not None:
             implied_features.add("token_budget")
+        if request.reasoning_effort is not None:
+            implied_features.add("reasoning_control")
         all_features = set(required_features) | implied_features
         candidates = []
         for candidate_id in sorted(self._executors):
@@ -489,6 +521,8 @@ class ExecutorRegistry:
                 request,
                 time.monotonic() - started,
                 result.cost_usd,
+                (result.usage or ModelUsage.unknown()).total_tokens,
+                (result.usage or ModelUsage.unknown()).total_tokens_complete,
             )
             return result
 

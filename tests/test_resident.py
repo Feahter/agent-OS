@@ -1,8 +1,9 @@
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from grapheng import (
     AgentOS,
@@ -45,8 +46,10 @@ class FakeJob:
     def __init__(self):
         self.phases = {}
         self.executed = []
+        self.inspections = []
 
     def inspect(self, reference):
+        self.inspections.append(reference)
         return self.phases.get(reference, "queued")
 
     def execute(self, reference, control_probe):
@@ -67,6 +70,7 @@ class FaultInjectingJob(FakeJob):
 
     def inspect(self, reference):
         if reference in self.probe_failures:
+            self.inspections.append(reference)
             raise RuntimeError("probe unavailable")
         return super().inspect(reference)
 
@@ -315,6 +319,7 @@ class ResidentCoordinatorTests(unittest.TestCase):
             self.coordinator.inspect(task_id)
 
     def test_heterogeneous_jobs_share_priority_and_waiting_lifecycle(self):
+        clock = [104.0]
         graph_job = FakeJob()
         orca_job = FakeJob()
         graph_job.phases["run-1"] = "waiting"
@@ -322,7 +327,7 @@ class ResidentCoordinatorTests(unittest.TestCase):
             self.root,
             task_module_factory=lambda: self.tasks,
             job_handlers={"graph": graph_job, "orca": orca_job},
-            clock=lambda: 104.0,
+            clock=lambda: clock[0],
         )
         coordinator.schedule("graph", "run-1", priority=20)
         coordinator.schedule("orca", "orca-1", priority=10)
@@ -333,6 +338,7 @@ class ResidentCoordinatorTests(unittest.TestCase):
         self.assertEqual(["orca-1"], orca_job.executed)
 
         graph_job.phases["run-1"] = "queued"
+        clock[0] = 105.0
         self.assertTrue(coordinator.serve_once())
         self.assertEqual(["run-1"], graph_job.executed)
 
@@ -355,6 +361,35 @@ class ResidentCoordinatorTests(unittest.TestCase):
         self.assertEqual("waiting", coordinator.inspect_job("graph", "broken")["state"])
         self.assertEqual("succeeded", coordinator.inspect_job("graph", "healthy")["state"])
 
+    def test_waiting_probe_failures_back_off_and_persist_next_due_time(self):
+        clock = [0.0]
+        handler = FaultInjectingJob()
+        handler.phases["broken"] = "waiting"
+        coordinator = ResidentCoordinator(
+            self.root,
+            task_module_factory=lambda: self.tasks,
+            job_handlers={"graph": handler},
+            clock=lambda: clock[0],
+        )
+        coordinator.schedule("graph", "broken")
+        self.assertTrue(coordinator.serve_once())
+        handler.probe_failures.add("broken")
+
+        clock[0] = 1.1
+        self.assertFalse(coordinator.serve_once())
+        after_failure = coordinator.inspect_job("graph", "broken")
+        calls_after_failure = len(handler.inspections)
+        for _ in range(20):
+            self.assertFalse(coordinator.serve_once())
+
+        self.assertEqual(1, after_failure["probe_failures"])
+        self.assertGreater(after_failure["next_probe_at"], clock[0])
+        self.assertEqual(calls_after_failure, len(handler.inspections))
+
+        clock[0] = after_failure["next_probe_at"]
+        self.assertFalse(coordinator.serve_once())
+        self.assertEqual(calls_after_failure + 1, len(handler.inspections))
+
     def test_failure_recording_error_does_not_escape_daemon_loop(self):
         handler = FaultInjectingJob()
         handler.execute_failures.add("broken")
@@ -373,6 +408,37 @@ class ResidentCoordinatorTests(unittest.TestCase):
         self.assertEqual("failed", item["state"])
         self.assertIn("execution failed", item["error"])
         self.assertIn("failure journal unavailable", item["error"])
+
+    def test_blocked_telemetry_does_not_hold_queue_lock(self):
+        task_id = "task-0000000000000013"
+        scheduled = self.coordinator.submit(task_id)
+        telemetry_entered = threading.Event()
+        release_telemetry = threading.Event()
+        inspected = threading.Event()
+
+        def blocking_emit(event, **fields):
+            if event == "resident.job_settled":
+                telemetry_entered.set()
+                release_telemetry.wait(timeout=1)
+
+        with patch("grapheng.resident.telemetry.emit", side_effect=blocking_emit):
+            settling = threading.Thread(
+                target=self.coordinator._settle,
+                args=(scheduled["job_id"], "succeeded", None),
+            )
+            settling.start()
+            self.assertTrue(telemetry_entered.wait(timeout=1))
+
+            def inspect():
+                self.coordinator.inspect(task_id)
+                inspected.set()
+
+            reading = threading.Thread(target=inspect)
+            reading.start()
+            self.assertTrue(inspected.wait(timeout=0.2))
+            release_telemetry.set()
+            settling.join(timeout=1)
+            reading.join(timeout=1)
 
     def test_v1_task_queue_migrates_without_losing_control_state(self):
         task_id = "task-0000000000000007"
@@ -396,8 +462,36 @@ class ResidentCoordinatorTests(unittest.TestCase):
         migrated = restored.inspect(task_id)
         self.assertEqual("engineering:task-0000000000000007", migrated["job_id"])
         self.assertEqual(7, migrated["priority"])
+        self.assertEqual(0, migrated["probe_failures"])
+        self.assertIsNone(migrated["next_probe_at"])
+
+    def test_v2_queue_migrates_without_losing_attempts_or_requested_action(self):
+        task_id = "task-0000000000000012"
+        self.coordinator.submit(task_id, priority=7)
+        self.coordinator.request(task_id, "pause")
+        value = json.loads(self.coordinator.queue_path.read_text(encoding="utf-8"))
+        item = value["items"][f"engineering:{task_id}"]
+        attempts = item["attempts"]
+        item.pop("probe_failures")
+        item.pop("next_probe_at")
+        value["schema_version"] = 2
+        self.coordinator.queue_path.write_text(json.dumps(value), encoding="utf-8")
+
+        restored = ResidentCoordinator(
+            self.root,
+            task_module_factory=lambda: self.tasks,
+            clock=lambda: 105.0,
+        )
+        migrated = restored.inspect(task_id)
+
+        self.assertEqual(7, migrated["priority"])
+        self.assertEqual(attempts, migrated["attempts"])
+        self.assertEqual("pause", migrated["requested_action"])
+        self.assertEqual(0, migrated["probe_failures"])
+        self.assertIsNone(migrated["next_probe_at"])
 
     def test_graph_approval_resume_does_not_repeat_completed_node(self):
+        clock = [106.0]
         workspace = self.root / "workspace"
         workspace.mkdir()
         calls = []
@@ -445,13 +539,14 @@ class ResidentCoordinatorTests(unittest.TestCase):
             self.root,
             task_module_factory=lambda: self.tasks,
             job_handlers={"graph": catalog.graph},
-            clock=lambda: 106.0,
+            clock=lambda: clock[0],
         )
         coordinator.schedule("graph", run_id)
 
         self.assertTrue(coordinator.serve_once())
         self.assertEqual("waiting", coordinator.inspect_job("graph", run_id)["state"])
         catalog.graph.inbox.decide(run_id, "ship", "allow", "operator")
+        clock[0] = 107.0
         self.assertTrue(coordinator.serve_once())
 
         self.assertEqual("succeeded", coordinator.inspect_job("graph", run_id)["state"])

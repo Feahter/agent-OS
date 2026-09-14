@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Optional
 
 from .agents import AgentExecution, AgentRequest, ExecutorRegistry
 from .errors import ContractViolation
@@ -7,12 +8,19 @@ from .runtime import NodeContext, NodeOutcome
 
 
 class AgentNodeHandler:
-    def __init__(self, graph: GraphSpec, executors: ExecutorRegistry, workspace: Path):
+    def __init__(
+        self,
+        graph: GraphSpec,
+        executors: ExecutorRegistry,
+        workspace: Path,
+        reasoning_effort: Optional[str] = None,
+    ):
         if not workspace.is_dir():
             raise ContractViolation(f"agent workspace does not exist: {workspace}")
         self._nodes = graph.node_map()
         self._executors = executors
         self._workspace = workspace.resolve()
+        self._reasoning_effort = reasoning_effort
 
     def __call__(self, context: NodeContext) -> NodeOutcome:
         node = self._nodes[context.node_id]
@@ -39,6 +47,7 @@ class AgentNodeHandler:
             task_type=spec.task_type,
             model_family=spec.model_family,
             reuse_scope=spec.reuse_scope,
+            reasoning_effort=self._reasoning_effort,
         )
         result = self._executors.execute(
             request,
@@ -54,6 +63,13 @@ class AgentNodeHandler:
                 "cost_usd": result.cost_usd,
                 "session_id": result.session_id,
                 "reuse_status": result.reuse_status,
+                "reuse_saved_tokens": (
+                    result.reuse_saved_tokens
+                    if result.reuse_saved_tokens is not None
+                    else 0
+                    if result.reuse_status in ("none", "miss", "bypassed")
+                    else None
+                ),
                 "source_task_id": result.source_task_id,
                 "source_run_id": result.source_run_id,
                 "verification_id": result.verification_id,

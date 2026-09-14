@@ -76,7 +76,7 @@ class AdapterTests(unittest.TestCase):
             return subprocess.CompletedProcess(
                 command,
                 0,
-                stdout="--json --ephemeral --sandbox --output-schema",
+                stdout="--json --ephemeral --sandbox --output-schema --config",
                 stderr="",
             )
 
@@ -137,7 +137,7 @@ class AdapterTests(unittest.TestCase):
             return subprocess.CompletedProcess(
                 command,
                 0,
-                stdout="--json --ephemeral --sandbox --output-schema",
+                stdout="--json --ephemeral --sandbox --output-schema --config",
                 stderr="",
             )
 
@@ -176,7 +176,7 @@ class AdapterTests(unittest.TestCase):
                     stdout=(
                         "--print --output-format --json-schema "
                         "--no-session-persistence --permission-mode --tools "
-                        "--max-budget-usd"
+                        "--max-budget-usd --effort"
                     ),
                     stderr="",
                 )
@@ -303,6 +303,104 @@ class AdapterTests(unittest.TestCase):
             result.usage.input_tokens + result.usage.output_tokens,
             result.tokens_used,
         )
+
+    def test_supported_adapters_forward_reasoning_effort(self):
+        claude = subprocess.CompletedProcess(
+            ("claude",),
+            0,
+            stdout=json.dumps(
+                {
+                    "is_error": False,
+                    "structured_output": {"answer": "claude"},
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                }
+            ),
+            stderr="",
+        )
+        pi = subprocess.CompletedProcess(
+            ("pi",),
+            0,
+            stdout=json.dumps(
+                {
+                    "type": "message_end",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": '{"answer":"pi"}'}
+                        ],
+                        "stopReason": "stop",
+                        "usage": {
+                            "input": 1,
+                            "cacheRead": 0,
+                            "cacheWrite": 0,
+                            "output": 1,
+                        },
+                    },
+                }
+            ),
+            stderr="",
+        )
+        codex = subprocess.CompletedProcess(
+            ("codex",),
+            0,
+            stdout="\n".join(
+                (
+                    json.dumps(
+                        {
+                            "type": "item.completed",
+                            "item": {
+                                "type": "agent_message",
+                                "text": '{"answer":"codex"}',
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "turn.completed",
+                            "usage": {
+                                "input_tokens": 1,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 1,
+                                "total_tokens": 2,
+                            },
+                        }
+                    ),
+                )
+            ),
+            stderr="",
+        )
+        cases = (
+            (ClaudeCodeExecutor(("claude",), safe_mode_flag=False), claude, "--effort", "low"),
+            (PiAgentExecutor(("pi",)), pi, "--thinking", "low"),
+            (
+                CodexExecutor(("codex",)),
+                codex,
+                "--config",
+                'model_reasoning_effort="low"',
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            for executor, completed, flag, value in cases:
+                agent_request = request(workspace)
+                agent_request = AgentRequest(
+                    task_id=agent_request.task_id,
+                    prompt=agent_request.prompt,
+                    inputs=agent_request.inputs,
+                    output_keys=agent_request.output_keys,
+                    workspace=agent_request.workspace,
+                    tools=agent_request.tools,
+                    timeout_seconds=agent_request.timeout_seconds,
+                    reasoning_effort="low",
+                )
+                with self.subTest(executor=executor.capabilities.executor_id), patch.object(
+                    executor, "run_cli", return_value=completed
+                ) as run:
+                    executor.execute(agent_request)
+
+                arguments = run.call_args.args[0]
+                position = arguments.index(flag)
+                self.assertEqual(value, arguments[position + 1])
 
     def test_agent_result_distinguishes_measured_zero_from_unknown_cost(self):
         measured = AgentResult("test", {}, "", cost_usd=0.0)

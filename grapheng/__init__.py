@@ -23,6 +23,17 @@ from .agents import (
 from .artifacts import ArtifactRecord, ArtifactStore
 from .console import ApprovalInbox, ApprovalItem, OperationsConsole
 from .console_server import OperationsAPI, OperationsServer
+from .context_compiler import (
+    CONTEXT_CONTRACT_VERSION,
+    DEFAULT_MAX_CONTEXT_BYTES,
+    CompiledContext,
+    ContextBudgetDecision,
+    ContextBudgetExceeded,
+    ContextCompiler,
+    ContextInclusion,
+    ContextOmission,
+    ContextPolicy,
+)
 from .control import (
     EffectJournal,
     EffectReceipt,
@@ -41,6 +52,21 @@ from .distribution import (
     AgentOSDistribution,
     DiagnosticCheck,
 )
+from .economics import (
+    BENCHMARK_PROTOCOL_SCHEMA_VERSION,
+    BENCHMARK_RUN_SCHEMA_VERSION,
+    BENCHMARK_SUITE_SCHEMA_VERSION,
+    PRICE_CATALOG_SCHEMA_VERSION,
+    ROI_REPORT_SCHEMA_VERSION,
+    RUN_ECONOMICS_SCHEMA_VERSION,
+    BenchmarkProtocol,
+    BenchmarkRun,
+    BenchmarkSuite,
+    PriceCatalog,
+    RunEconomics,
+)
+from .economics import BenchmarkNode as BenchmarkNode
+from .economics import ReuseMetrics as ReuseMetrics
 from .engineering import (
     ENGINEERING_PLAN_SCHEMA_VERSION,
     ENGINEERING_POLICY_SCHEMA_VERSION,
@@ -176,14 +202,24 @@ from .task_center import (
     NotificationSink,
 )
 from .tasks import USER_TASK_SCHEMA_VERSION, UserTaskModule, default_agent_os_home
+from .token_reservations import (
+    HistoricalTokenReservations,
+    TokenReservation,
+    TokenReservationWarning,
+)
 from .validation import validate_graph
 
 __version__ = "0.0.1"
 
 __all__ = [
+    "BENCHMARK_PROTOCOL_SCHEMA_VERSION",
+    "BENCHMARK_RUN_SCHEMA_VERSION",
+    "BENCHMARK_SUITE_SCHEMA_VERSION",
     "BUNDLE_SCHEMA_VERSION",
     "COMPATIBILITY_MATRIX_VERSION",
+    "CONTEXT_CONTRACT_VERSION",
     "CONTROLLED_MERGE_SCHEMA_VERSION",
+    "DEFAULT_MAX_CONTEXT_BYTES",
     "DIAGNOSTIC_SCHEMA_VERSION",
     "ENGINEERING_PLAN_SCHEMA_VERSION",
     "ENGINEERING_POLICY_SCHEMA_VERSION",
@@ -192,10 +228,13 @@ __all__ = [
     "EVALUATION_CASE_SCHEMA_VERSION",
     "EVALUATION_RECORD_SCHEMA_VERSION",
     "ORCA_COORDINATOR_SCHEMA_VERSION",
+    "PRICE_CATALOG_SCHEMA_VERSION",
     "PROVIDER_GOVERNANCE_SCHEMA_VERSION",
     "RELEASE_SCHEMA_VERSION",
     "RESIDENT_NOTIFICATION_SCHEMA_VERSION",
     "RESIDENT_QUEUE_SCHEMA_VERSION",
+    "ROI_REPORT_SCHEMA_VERSION",
+    "RUN_ECONOMICS_SCHEMA_VERSION",
     "TASK_CENTER_SCHEMA_VERSION",
     "TASK_INTENT_SCHEMA_VERSION",
     "TASK_TEMPLATES",
@@ -219,6 +258,9 @@ __all__ = [
     "ArtifactRecord",
     "ArtifactStore",
     "ArtifactVersion",
+    "BenchmarkProtocol",
+    "BenchmarkRun",
+    "BenchmarkSuite",
     "BundleMigrationRegistry",
     "CanaryObservation",
     "CancellationToken",
@@ -227,6 +269,13 @@ __all__ = [
     "ClaudeCodeExecutor",
     "CliAgentAdapter",
     "CodexExecutor",
+    "CompiledContext",
+    "ContextBudgetDecision",
+    "ContextBudgetExceeded",
+    "ContextCompiler",
+    "ContextInclusion",
+    "ContextOmission",
+    "ContextPolicy",
     "ContractViolation",
     "ControlledGitMerger",
     "ControlledMergeSpec",
@@ -253,6 +302,7 @@ __all__ = [
     "GraphRuntime",
     "GraphSpec",
     "GraphValidationError",
+    "HistoricalTokenReservations",
     "IntentCompiler",
     "LearnedExecutorEstimate",
     "LearnedRoutingPolicy",
@@ -287,6 +337,7 @@ __all__ = [
     "OrcaRunStore",
     "PiAgentExecutor",
     "PolicyRouter",
+    "PriceCatalog",
     "ProjectPolicy",
     "ProjectProfile",
     "ProviderAdmission",
@@ -309,10 +360,13 @@ __all__ = [
     "ReuseStore",
     "RouteDecision",
     "RouteObservation",
+    "RunEconomics",
     "RunSnapshot",
     "SingleFlightCoordinator",
     "SingleFlightTimeoutError",
     "TaskIntent",
+    "TokenReservation",
+    "TokenReservationWarning",
     "UserTaskModule",
     "VerifiedArtifactCache",
     "VerifiedResultPublisher",

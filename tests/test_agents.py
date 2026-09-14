@@ -85,6 +85,22 @@ class AgentTests(unittest.TestCase):
             with self.assertRaisesRegex(ContractViolation, "cost_budget"):
                 registry.execute(request)
 
+    def test_registry_requires_reasoning_control_capability_when_requested(self):
+        registry = ExecutorRegistry()
+        registry.register(MemoryExecutor())
+        with tempfile.TemporaryDirectory() as directory:
+            request = AgentRequest(
+                "task",
+                "prompt",
+                {},
+                ("answer",),
+                Path(directory),
+                reasoning_effort="low",
+            )
+
+            with self.assertRaisesRegex(ContractViolation, "reasoning_control"):
+                registry.execute(request)
+
     def test_agent_node_token_budget_fails_before_unbounded_executor_runs(self):
         graph = GraphSpec.from_dict(
             {

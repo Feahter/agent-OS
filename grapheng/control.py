@@ -18,6 +18,7 @@ from .policy import GatePolicy
 from .publication import VerifiedResultPublisher
 from .reuse import VerifiedArtifactCache
 from .runtime import CancellationToken, GraphRuntime, NodeRegistry, NodeStatus, RunResult
+from .token_reservations import HistoricalTokenReservations
 from .validation import validate_graph
 
 RUN_ID = re.compile(r"^[A-Za-z0-9-]{1,128}$")
@@ -212,6 +213,7 @@ class LocalControlPlane:
         lease_seconds: float = 30.0,
         owner_id: Optional[str] = None,
         reuse_store: Optional[VerifiedArtifactCache] = None,
+        token_reservations: Optional[HistoricalTokenReservations] = None,
     ):
         if isinstance(max_workers, bool) or not isinstance(max_workers, int) or max_workers < 1:
             raise ContractViolation("control plane max_workers must be a positive integer")
@@ -226,6 +228,7 @@ class LocalControlPlane:
         self.owner_id = owner_id or f"controller-{uuid.uuid4()}"
         self.lease_seconds = float(lease_seconds)
         self.reuse_store = reuse_store
+        self.token_reservations = token_reservations
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._futures: Dict[str, Future] = {}
         self._tokens: Dict[str, CancellationToken] = {}
@@ -443,6 +446,7 @@ class LocalControlPlane:
                     if self.reuse_store is not None
                     else None
                 ),
+                token_reservations=self.token_reservations,
             ).run(resume=resume, run_id=run_id, cancellation=token)
             self._settle_success(run_id, result, token.cancelled)
         except Exception as error:
@@ -488,6 +492,7 @@ class LocalControlPlane:
                         "statuses": statuses,
                         "tokens_used": result.tokens_used,
                         "cost_usd": result.cost_usd,
+                        "usage": result.usage.to_dict(),
                         "artifacts": dict(result.artifacts),
                     },
                 }

@@ -19,6 +19,13 @@ from .agents import (
     ModelUsage,
     validate_agent_outputs,
 )
+from .context_compiler import (
+    DEFAULT_MAX_CONTEXT_BYTES,
+    CompiledContext,
+    ContextBudgetExceeded,
+    ContextCompiler,
+    ContextPolicy,
+)
 from .errors import (
     AgentExecutionError,
     AgentProtocolError,
@@ -301,23 +308,11 @@ def run_bounded_process(
     return subprocess.CompletedProcess(list(command), returncode, stdout, stderr)
 
 
-def _prompt(request: AgentRequest) -> str:
-    envelope = {
-        "inputs": request.inputs,
-        "required_outputs": list(request.output_keys),
-    }
-    return (
-        f"{request.prompt}\n\n"
-        "Graph execution contract:\n"
-        f"{json.dumps(envelope, ensure_ascii=False, sort_keys=True)}\n"
-        "Return only one JSON object whose keys exactly match required_outputs."
-    )
-
-
 class CliAgentAdapter(ABC):
     """Shared process, timeout, fault, environment, and tool-mapping Adapter kit."""
 
     tool_map: ClassVar[Mapping[str, str]] = {}
+    native_output_schema: ClassVar[bool] = False
 
     #: Exit codes whose meaning this Adapter declares explicitly. Anything not
     #: listed here falls through to the Agent's structured error payload and
@@ -329,10 +324,18 @@ class CliAgentAdapter(ABC):
     #: and the circuit breaker trust ``source == "exit_code"``.
     exit_code_failures: ClassVar[Mapping[int, str]] = _POSIX_EXIT_FAILURES
 
-    def __init__(self, command: Sequence[str]):
+    def __init__(
+        self,
+        command: Sequence[str],
+        *,
+        max_context_bytes: Optional[int] = DEFAULT_MAX_CONTEXT_BYTES,
+    ):
         if not command:
             raise ContractViolation("agent command cannot be empty")
         self._command = tuple(command)
+        policy = ContextPolicy(max_context_bytes=max_context_bytes)
+        self._max_context_bytes = policy.max_context_bytes
+        self._context_compiler = ContextCompiler()
 
     @property
     def command(self) -> Tuple[str, ...]:
@@ -354,6 +357,44 @@ class CliAgentAdapter(ABC):
             raise ContractViolation(
                 f"executor {self.capabilities.executor_id} does not map tool {error.args[0]}"
             ) from error
+
+    def compile_context(self, request: AgentRequest) -> CompiledContext:
+        """Compile and record one complete context before starting a provider."""
+
+        transport = "provider_schema" if self.native_output_schema else "prompt"
+        try:
+            compiled = self._context_compiler.compile(
+                request,
+                ContextPolicy(
+                    max_context_bytes=self._max_context_bytes,
+                    output_contract=transport,
+                ),
+            )
+        except ContextBudgetExceeded as error:
+            telemetry.emit_failure(
+                "agent.context_rejected",
+                executor_id=self.capabilities.executor_id,
+                task_id=request.task_id,
+                context_total_bytes=error.used_bytes,
+                context_budget_bytes=error.limit_bytes,
+                context_budget_status="rejected",
+            )
+            raise
+        telemetry.emit(
+            "agent.context_compiled",
+            executor_id=self.capabilities.executor_id,
+            task_id=request.task_id,
+            context_fingerprint=compiled.fingerprint,
+            context_total_bytes=compiled.total_bytes,
+            context_prompt_bytes=compiled.prompt_bytes,
+            context_artifact_bytes=compiled.artifact_bytes,
+            context_contract_bytes=compiled.contract_bytes,
+            context_budget_bytes=compiled.budget.limit_bytes,
+            context_budget_status=compiled.budget.status,
+            output_contract_transport=transport,
+            omitted_items=",".join(item.item for item in compiled.omissions),
+        )
+        return compiled
 
     def run_cli(
         self,
@@ -426,6 +467,7 @@ class CliAgentAdapter(ABC):
 
 
 class ClaudeCodeExecutor(CliAgentAdapter):
+    native_output_schema = True
     tool_map: ClassVar[Mapping[str, str]] = {
         "read": "Read",
         "shell": "Bash",
@@ -437,8 +479,10 @@ class ClaudeCodeExecutor(CliAgentAdapter):
         self,
         command: Sequence[str],
         safe_mode_flag: Optional[bool] = None,
+        *,
+        max_context_bytes: Optional[int] = DEFAULT_MAX_CONTEXT_BYTES,
     ):
-        super().__init__(command)
+        super().__init__(command, max_context_bytes=max_context_bytes)
         detected = (
             _claude_safe_mode_flag(command)
             if safe_mode_flag is None
@@ -450,24 +494,28 @@ class ClaudeCodeExecutor(CliAgentAdapter):
     def capabilities(self) -> ExecutorCapabilities:
         return ExecutorCapabilities(
             "claude-code",
-            ("cost_budget", "model_selection", "structured_output", "token_usage", "tool_policy"),
+            (
+                "cost_budget",
+                "model_selection",
+                "reasoning_control",
+                "structured_output",
+                "token_usage",
+                "tool_policy",
+            ),
             CANONICAL_TOOLS,
         )
 
     def execute(self, request: AgentRequest) -> AgentResult:
-        schema = {
-            "type": "object",
-            "properties": {key: {} for key in request.output_keys},
-            "required": list(request.output_keys),
-            "additionalProperties": False,
-        }
+        compiled = self.compile_context(request)
+        if compiled.output_schema_json is None:  # pragma: no cover - class invariant
+            raise ContractViolation("Claude Code context is missing its output schema")
         mapped_tools = self.map_tools(request.tools)
         arguments = [
             "--print",
             "--output-format",
             "json",
             "--json-schema",
-            json.dumps(schema, separators=(",", ":")),
+            compiled.output_schema_json,
             "--no-session-persistence",
             "--permission-mode",
             "dontAsk",
@@ -478,9 +526,11 @@ class ClaudeCodeExecutor(CliAgentAdapter):
             arguments.insert(arguments.index("--permission-mode"), "--safe-mode")
         if request.model:
             arguments.extend(("--model", request.model))
+        if request.reasoning_effort:
+            arguments.extend(("--effort", request.reasoning_effort))
         if request.max_cost_usd is not None:
             arguments.extend(("--max-budget-usd", str(request.max_cost_usd)))
-        arguments.append(_prompt(request))
+        arguments.append(compiled.body)
         completed = self.run_cli(
             arguments,
             request,
@@ -567,11 +617,18 @@ class PiAgentExecutor(CliAgentAdapter):
     def capabilities(self) -> ExecutorCapabilities:
         return ExecutorCapabilities(
             "pi-agent",
-            ("model_selection", "structured_output", "token_usage", "tool_policy"),
+            (
+                "model_selection",
+                "reasoning_control",
+                "structured_output",
+                "token_usage",
+                "tool_policy",
+            ),
             CANONICAL_TOOLS,
         )
 
     def execute(self, request: AgentRequest) -> AgentResult:
+        compiled = self.compile_context(request)
         mapped_tools = self.map_tools(request.tools)
         arguments = [
             "--mode",
@@ -587,7 +644,9 @@ class PiAgentExecutor(CliAgentAdapter):
         ]
         if request.model:
             arguments.extend(("--model", request.model))
-        arguments.append(_prompt(request))
+        if request.reasoning_effort:
+            arguments.extend(("--thinking", request.reasoning_effort))
+        arguments.append(compiled.body)
         completed = self.run_cli(arguments, request)
         self.require_success(completed, self.capabilities.executor_id)
         final_message: Optional[Mapping[str, Any]] = None
@@ -673,11 +732,18 @@ class PiAgentExecutor(CliAgentAdapter):
 
 
 class CodexExecutor(CliAgentAdapter):
+    native_output_schema = True
     @property
     def capabilities(self) -> ExecutorCapabilities:
         return ExecutorCapabilities(
             "codex",
-            ("model_selection", "structured_output", "token_usage", "tool_policy"),
+            (
+                "model_selection",
+                "reasoning_control",
+                "structured_output",
+                "token_usage",
+                "tool_policy",
+            ),
             CANONICAL_TOOLS,
         )
 
@@ -688,18 +754,15 @@ class CodexExecutor(CliAgentAdapter):
         return "read-only"
 
     def execute(self, request: AgentRequest) -> AgentResult:
-        schema = {
-            "type": "object",
-            "properties": {key: {} for key in request.output_keys},
-            "required": list(request.output_keys),
-            "additionalProperties": False,
-        }
+        compiled = self.compile_context(request)
+        if compiled.output_schema_json is None:  # pragma: no cover - class invariant
+            raise ContractViolation("Codex context is missing its output schema")
         schema_path: Optional[Path] = None
         try:
             with tempfile.NamedTemporaryFile(
                 mode="w", encoding="utf-8", suffix=".json", delete=False
             ) as handle:
-                json.dump(schema, handle, ensure_ascii=False, separators=(",", ":"))
+                handle.write(compiled.output_schema_json)
                 schema_path = Path(handle.name)
             arguments = [
                 "exec",
@@ -712,9 +775,13 @@ class CodexExecutor(CliAgentAdapter):
             ]
             if request.model:
                 arguments.extend(("--model", request.model))
+            if request.reasoning_effort:
+                arguments.extend(
+                    ("--config", f'model_reasoning_effort="{request.reasoning_effort}"')
+                )
             if not any((parent / ".git").exists() for parent in (request.workspace, *request.workspace.parents)):
                 arguments.append("--skip-git-repo-check")
-            arguments.append(_prompt(request))
+            arguments.append(compiled.body)
             completed = self.run_cli(arguments, request)
         finally:
             if schema_path is not None:
@@ -852,10 +919,11 @@ class OpenCodeExecutor(CliAgentAdapter):
         ).raise_for(executor_id)
 
     def execute(self, request: AgentRequest) -> AgentResult:
+        compiled = self.compile_context(request)
         arguments = ["run", "--format", "json", "--pure"]
         if request.model:
             arguments.extend(("--model", request.model))
-        arguments.append(_prompt(request))
+        arguments.append(compiled.body)
         permissions = self._permission_policy(request.tools)
         completed = self.run_cli(
             arguments,

@@ -7,7 +7,7 @@ from grapheng.artifacts import ArtifactStore
 from grapheng.orca_publication import DEFERRED_EVENT, OrcaPublicationRecorder
 
 
-def graph():
+def graph(workspace_mode="shared"):
     return GraphSpec.from_dict(
         {
             "id": "publication-graph",
@@ -20,7 +20,11 @@ def graph():
                     "writes": ["plan_out"],
                     "retry": {"max_attempts": 1},
                     "estimated_tokens": 0,
-                    "agent": {"executor": "codex", "prompt": "run plan"},
+                    "agent": {
+                        "executor": "codex",
+                        "prompt": "run plan",
+                        "workspace": {"mode": workspace_mode},
+                    },
                 }
             ],
             "max_concurrency": 1,
@@ -52,9 +56,11 @@ class CountingPublisher:
         self.staged = 0
         self.observed = 0
         self.reconciled = 0
+        self.requests = []
 
     def stage(self, *args, **kwargs):
         self.staged += 1
+        self.requests.append(args[4].request)
         return None
 
     def observe_verifier(self, *args, **kwargs):
@@ -99,6 +105,29 @@ class OrcaPublicationRecorderTests(unittest.TestCase):
         self.assertEqual(1, publisher.staged)
         self.assertEqual(1, publisher.observed)
         self.assertEqual([], self.emit.events)
+
+    def test_isolated_workspace_result_is_marked_ineligible_for_reuse(self):
+        publisher = CountingPublisher()
+        spec = graph(workspace_mode="isolated")
+        recorder = OrcaPublicationRecorder(
+            spec,
+            publisher,
+            lambda node, workspace_id: self.workspace,
+            self.emit,
+        )
+
+        recorder.record(
+            self.state,
+            spec.nodes[0],
+            1,
+            object(),
+            (),
+            (),
+            ArtifactStore(),
+            "workspace-1",
+        )
+
+        self.assertFalse(publisher.requests[0].reuse_allowed)
 
     def test_a_publication_failure_is_deferred_instead_of_failing_the_run(self):
         recorder = self.recorder(ExplodingPublisher())

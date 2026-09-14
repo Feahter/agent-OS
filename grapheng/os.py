@@ -25,6 +25,7 @@ from .model import GraphSpec
 from .optimization import RegressionSuite, RSIOptimizationLab
 from .reuse import VerifiedArtifactCache, VerifiedReuseRecord
 from .routing import PolicyRouter, ProviderPolicy
+from .token_reservations import HistoricalTokenReservations
 
 AGENT_OS_SCHEMA_VERSION = 1
 AGENT_OS_DIRECTORIES = (
@@ -150,6 +151,9 @@ class AgentOS:
 
     def reuse_store(self) -> VerifiedArtifactCache:
         return VerifiedArtifactCache(self.reuse_root)
+
+    def token_reservations(self) -> HistoricalTokenReservations:
+        return HistoricalTokenReservations(RSILoop(self.learning_root).journal.read())
 
     def approval_inbox(self, control_root: Path) -> ApprovalInbox:
         return ApprovalInbox(control_root, self.approvals_root)

@@ -19,6 +19,7 @@ from .singleflight import SingleFlightCoordinator, SingleFlightTimeoutError
 
 REUSE_SCHEMA_VERSION = 1
 REUSABLE_CLASSIFICATIONS = ("public", "internal")
+MUTATING_TOOLS = frozenset({"edit", "shell", "write"})
 
 
 def _canonical(value: Any) -> Tuple[Any, str]:
@@ -148,13 +149,15 @@ class VerifiedArtifactCache:
         executor_id: str,
         loader: Callable[[], AgentResult],
     ) -> AgentResult:
-        bypass_reason = self._bypass_reason(request)
+        bypass_reason = self.bypass_reason(request)
         if bypass_reason is not None:
             result = loader()
             self._record_event(
                 request, result.executor_id, "bypassed", bypass_reason
             )
-            return replace(result, reuse_status="bypassed")
+            return replace(
+                result, reuse_status="bypassed", reuse_saved_tokens=0
+            )
 
         key, key_fields = self._key(request, executor_id)
         record, miss_reason = self._read(key, key_fields)
@@ -224,7 +227,7 @@ class VerifiedArtifactCache:
                 return result
             flight.result = result
             self._record_event(request, result.executor_id, "miss", miss_reason)
-            return replace(result, reuse_status="miss")
+            return replace(result, reuse_status="miss", reuse_saved_tokens=0)
         except BaseException as error:
             flight.error = error
             raise
@@ -241,7 +244,7 @@ class VerifiedArtifactCache:
         verification_id: str,
         quality_score: float,
     ) -> VerifiedReuseRecord:
-        reason = self._bypass_reason(request)
+        reason = self.bypass_reason(request)
         if reason is not None:
             raise ContractViolation(f"request is not eligible for verified reuse: {reason}")
         if not source_run_id.strip() or not verification_id.strip():
@@ -309,6 +312,7 @@ class VerifiedArtifactCache:
         events = {"hit": 0, "miss": 0, "coalesced": 0, "bypassed": 0}
         saved_tokens = 0
         saved_cost_usd = 0.0
+        saved_cost_complete = True
         event_path = self.root / "events.jsonl"
         try:
             with self._journal_guard(shared=True):
@@ -325,23 +329,49 @@ class VerifiedArtifactCache:
                 if status in events:
                     events[status] += 1
                 saved_tokens += int(event.get("saved_tokens", 0))
-                saved_cost_usd += float(event.get("saved_cost_usd", 0.0))
+                if status in ("hit", "coalesced"):
+                    raw_cost = event.get("saved_cost_usd")
+                    if event.get("saved_cost_complete") is not True:
+                        # Legacy journals cannot distinguish an unknown cost
+                        # from the old zero placeholder, so stay conservative.
+                        saved_cost_complete = False
+                    if raw_cost is not None:
+                        if (
+                            isinstance(raw_cost, bool)
+                            or not isinstance(raw_cost, (int, float))
+                            or not math.isfinite(raw_cost)
+                            or raw_cost < 0
+                        ):
+                            raise ValueError("saved_cost_usd must be non-negative")
+                        saved_cost_usd += float(raw_cost)
+                    elif event.get("saved_cost_complete") is True:
+                        raise ValueError(
+                            "saved_cost_complete requires saved_cost_usd"
+                        )
         except (OSError, ValueError, TypeError) as error:
             raise ContractViolation(f"invalid reuse event journal: {error}") from error
         return {
             "entries": {"valid": valid, "expired": expired, "invalid": invalid},
             "events": events,
             "saved_tokens": saved_tokens,
-            "saved_cost_usd": saved_cost_usd,
+            "saved_cost_usd": (
+                saved_cost_usd if saved_cost_complete else None
+            ),
+            "saved_cost_complete": saved_cost_complete,
             "singleflight": self.singleflight.status(),
         }
 
     @staticmethod
-    def _bypass_reason(request: AgentRequest) -> Optional[str]:
+    def bypass_reason(request: AgentRequest) -> Optional[str]:
+        """Explain why a request cannot safely skip its Agent execution."""
+
         if not request.reuse_allowed:
             return "request_disabled"
         if request.data_classification not in REUSABLE_CLASSIFICATIONS:
             return f"classification={request.data_classification}"
+        mutating = sorted(set(request.tools) & MUTATING_TOOLS)
+        if mutating:
+            return f"mutating_tools={','.join(mutating)}"
         return None
 
     def _read(
@@ -376,6 +406,7 @@ class VerifiedArtifactCache:
             "executor_id": executor_id,
             "model_family": request.model_family,
             "model": request.model,
+            "reasoning_effort": request.reasoning_effort,
             "max_tokens": request.max_tokens,
             "max_cost_usd": request.max_cost_usd,
             "tools": sorted(set(request.tools)),
@@ -398,6 +429,7 @@ class VerifiedArtifactCache:
             source_task_id=record.source_task_id,
             source_run_id=record.source_run_id,
             verification_id=record.verification_id,
+            reuse_saved_tokens=record.original_tokens,
         )
 
     @staticmethod
@@ -431,6 +463,11 @@ class VerifiedArtifactCache:
     @staticmethod
     def _coalesced_result(result: AgentResult, source_task_id: str) -> AgentResult:
         outputs, _ = _canonical(result.outputs)
+        saved_tokens = (
+            result.tokens_used
+            if result.tokens_used > 0
+            else result.reuse_saved_tokens
+        )
         return AgentResult(
             executor_id=result.executor_id,
             outputs=outputs,
@@ -441,6 +478,7 @@ class VerifiedArtifactCache:
             source_task_id=source_task_id,
             source_run_id=result.source_run_id,
             verification_id=result.verification_id,
+            reuse_saved_tokens=saved_tokens,
         )
 
     def _record_event(
@@ -463,8 +501,13 @@ class VerifiedArtifactCache:
             "saved_tokens": saved_tokens if status in ("hit", "coalesced") else 0,
             "saved_cost_usd": (
                 saved_cost_usd
-                if status in ("hit", "coalesced") and saved_cost_usd is not None
+                if status in ("hit", "coalesced")
                 else 0.0
+            ),
+            "saved_cost_complete": (
+                saved_cost_usd is not None
+                if status in ("hit", "coalesced")
+                else True
             ),
         }
         line = json.dumps(

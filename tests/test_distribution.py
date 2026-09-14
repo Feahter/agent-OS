@@ -85,7 +85,7 @@ class DistributionTests(unittest.TestCase):
         )
         self.assertEqual("verified", codex["details"]["support_status"])
         self.assertEqual(
-            "2026-08-24T11:23:10Z", codex["details"]["last_verified_at"]
+            "2026-09-14T03:39:21Z", codex["details"]["last_verified_at"]
         )
         opencode = next(
             item
@@ -130,7 +130,7 @@ class DistributionTests(unittest.TestCase):
         self.assertEqual([], report["ready_executors"])
         self.assertEqual("fail", codex["status"])
         self.assertEqual(
-            ["--ephemeral", "--output-schema"],
+            ["--ephemeral", "--output-schema", "--config"],
             codex["details"]["missing_help_flags"],
         )
         self.assertEqual("protocol_mismatch", codex["details"]["support_status"])

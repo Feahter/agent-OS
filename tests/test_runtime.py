@@ -8,11 +8,13 @@ from grapheng import (
     ContractViolation,
     GraphRuntime,
     GraphSpec,
+    HistoricalTokenReservations,
     ModelUsage,
     NodeOutcome,
     NodeRegistry,
     NodeStatus,
     RetryableNodeError,
+    RouteObservation,
 )
 
 
@@ -383,6 +385,150 @@ class RuntimeTests(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.assertEqual(["first", "second"], starts)
+
+    def test_historical_agent_reservations_improve_admission_without_overwriting_usage(self):
+        graph = spec(
+            [
+                {
+                    "id": "first",
+                    "kind": "agent",
+                    "writes": ["first"],
+                    "estimated_tokens": 10,
+                    "max_tokens": 100,
+                    "agent": {"prompt": "first", "task_type": "coding"},
+                },
+                {
+                    "id": "second",
+                    "kind": "agent",
+                    "writes": ["second"],
+                    "estimated_tokens": 10,
+                    "max_tokens": 100,
+                    "agent": {"prompt": "second", "task_type": "coding"},
+                },
+            ],
+            max_concurrency=2,
+            max_tokens=100,
+        )
+        history = tuple(
+            RouteObservation(
+                observed_at=float(index),
+                task_id=f"task-{index}",
+                executor_id="memory",
+                provider="memory",
+                success=True,
+                latency_seconds=1.0,
+                cost_usd=None,
+                data_classification="public",
+                task_type="coding",
+                total_tokens=50,
+                total_tokens_complete=True,
+            )
+            for index in range(5)
+        )
+        reservations = HistoricalTokenReservations(history)
+        registry = NodeRegistry()
+        lock = threading.Lock()
+        active = 0
+        peak = 0
+        release = threading.Event()
+
+        def work(context):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+                if active == 2:
+                    release.set()
+            release.wait(timeout=1)
+            with lock:
+                active -= 1
+            return NodeOutcome(
+                {context.node_id: True},
+                tokens_used=50,
+                usage=ModelUsage(total_tokens=50, total_tokens_complete=True),
+            )
+
+        registry.register("agent", work)
+
+        result = GraphRuntime(
+            graph,
+            registry,
+            token_reservations=reservations,
+        ).run()
+
+        self.assertTrue(result.success)
+        self.assertEqual(2, peak)
+        self.assertEqual(100, result.tokens_used)
+        self.assertEqual(100, result.usage.total_tokens)
+        self.assertTrue(result.usage.total_tokens_complete)
+
+    def test_persistent_token_underprediction_warns_without_relaxing_reservation(self):
+        graph = spec(
+            [
+                {
+                    "id": f"work-{index}",
+                    "kind": "agent",
+                    "writes": [f"value-{index}"],
+                    "max_tokens": 100,
+                    "agent": {"prompt": "work", "task_type": "coding"},
+                }
+                for index in range(3)
+            ],
+            max_concurrency=1,
+            max_tokens=180,
+        )
+        history = tuple(
+            RouteObservation(
+                observed_at=float(index),
+                task_id=f"history-{index}",
+                executor_id="memory",
+                provider="memory",
+                success=True,
+                latency_seconds=1.0,
+                cost_usd=None,
+                data_classification="public",
+                task_type="coding",
+                total_tokens=50,
+                total_tokens_complete=True,
+            )
+            for index in range(5)
+        )
+        registry = NodeRegistry()
+        registry.register(
+            "agent",
+            lambda context: NodeOutcome(
+                {f"value-{context.node_id[-1]}": True},
+                tokens_used=60,
+                usage=ModelUsage(total_tokens=60, total_tokens_complete=True),
+            ),
+        )
+
+        class RecordingSink:
+            def __init__(self):
+                self.events = []
+
+            def emit(self, event):
+                self.events.append(event)
+
+        sink = RecordingSink()
+        result = GraphRuntime(
+            graph,
+            registry,
+            event_sink=sink,
+            token_reservations=HistoricalTokenReservations(history),
+        ).run()
+
+        starts = [event for event in sink.events if event.event == "node_started"]
+        warnings = [
+            event
+            for event in sink.events
+            if event.event == "token_reservation_warning"
+        ]
+        self.assertTrue(result.success)
+        self.assertEqual(180, result.tokens_used)
+        self.assertEqual([50, 50, 50], [item.payload["token_reservation"] for item in starts])
+        self.assertEqual(1, len(warnings))
+        self.assertIn("budgets unchanged", warnings[0].payload["action"])
 
     def test_cost_reservation_defers_ready_node_until_running_work_settles(self):
         graph = spec(

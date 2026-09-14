@@ -179,6 +179,7 @@ class AdvancedGraphJob:
             max_workers=1,
             lease_seconds=2.0,
             reuse_store=self.agent_os.reuse_store(),
+            token_reservations=self.agent_os.token_reservations(),
         )
 
     def projection_sources(self, run_id: str) -> Tuple[Path, ...]:

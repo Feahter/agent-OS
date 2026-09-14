@@ -17,6 +17,7 @@ from .events import EventSink, GraphEvent, JsonlEventSink, NullEventSink
 from .model import GraphSpec, NodeSpec
 from .policy import DenyNamedGatesPolicy, GateDecision, GatePolicy
 from .publication import PublicationEvent, VerifiedResultPublisher
+from .token_reservations import HistoricalTokenReservations, TokenReservation
 from .validation import validate_graph
 
 
@@ -200,6 +201,7 @@ class GraphRuntime:
         gate_policy: Optional[GatePolicy] = None,
         event_sink: Optional[EventSink] = None,
         verified_result_publisher: Optional[VerifiedResultPublisher] = None,
+        token_reservations: Optional[HistoricalTokenReservations] = None,
     ):
         validate_graph(graph)
         merge_nodes = [node.id for node in graph.nodes if node.controlled_merge is not None]
@@ -218,6 +220,7 @@ class GraphRuntime:
         else:
             self.event_sink = NullEventSink()
         self.verified_result_publisher = verified_result_publisher
+        self.token_reservations = token_reservations or HistoricalTokenReservations(())
         self.checkpoints = CheckpointStore(work_dir / "checkpoint.json") if work_dir else None
         self._checkpoint_lock = threading.Lock()
 
@@ -309,11 +312,8 @@ class GraphRuntime:
             checkpoint.usage,
         )
 
-    @staticmethod
-    def _token_reservation(node: NodeSpec) -> int:
-        if node.agent is not None and node.max_tokens is not None:
-            return node.max_tokens
-        return node.estimated_tokens
+    def _token_reservation(self, node: NodeSpec) -> TokenReservation:
+        return self.token_reservations.reserve(node)
 
     @staticmethod
     def _cost_reservation(node: NodeSpec) -> float:
@@ -508,7 +508,7 @@ class GraphRuntime:
                         changed = True
                         continue
                     token_reservation = self._token_reservation(node)
-                    if not ledger.can_reserve(token_reservation):
+                    if not ledger.can_reserve(token_reservation.tokens):
                         if futures:
                             continue
                         statuses[node.id] = NodeStatus.BLOCKED
@@ -524,7 +524,7 @@ class GraphRuntime:
                         changed = True
                         continue
                     attempts[node.id] += 1
-                    ledger.reserve(token_reservation)
+                    ledger.reserve(token_reservation.tokens)
                     cost_ledger.reserve(cost_reservation)
                     reservations[node.id] = (token_reservation, cost_reservation)
                     statuses[node.id] = NodeStatus.RUNNING
@@ -538,7 +538,17 @@ class GraphRuntime:
                         attempts[node.id],
                     )
                     futures[future] = node.id
-                    self._emit("node_started", run_id, node.id, attempts[node.id])
+                    self._emit(
+                        "node_started",
+                        run_id,
+                        node.id,
+                        attempts[node.id],
+                        {
+                            "token_reservation": token_reservation.tokens,
+                            "token_reservation_source": token_reservation.source,
+                            "token_reservation_samples": token_reservation.samples,
+                        },
+                    )
                     changed = True
 
                 if changed:
@@ -573,13 +583,40 @@ class GraphRuntime:
                 for future in done:
                     node_id = futures.pop(future)
                     node = nodes[node_id]
-                    reserved_tokens, reserved_cost = reservations.pop(node_id)
+                    token_reservation, reserved_cost = reservations.pop(node_id)
+                    reserved_tokens = token_reservation.tokens
                     try:
                         execution = future.result()
                         outcome = execution.outcome
                         outcome_usage = outcome.usage or ModelUsage.no_call()
+                        accounted_usage = outcome_usage
                         within_graph_budget = ledger.settle(reserved_tokens, outcome.tokens_used)
                         within_cost_budget = cost_ledger.settle(reserved_cost, outcome.cost_usd)
+                        if (
+                            outcome_usage.total_tokens_complete
+                            and outcome_usage.total_tokens is not None
+                        ):
+                            warning = self.token_reservations.deviation_warning(
+                                node,
+                                token_reservation,
+                                outcome_usage.total_tokens,
+                            )
+                            if warning is not None:
+                                self._emit(
+                                    "token_reservation_warning",
+                                    run_id,
+                                    node_id,
+                                    attempts[node_id],
+                                    {
+                                        "code": warning.code,
+                                        "reserved_tokens": warning.reserved_tokens,
+                                        "actual_tokens": warning.actual_tokens,
+                                        "consecutive_deviations": (
+                                            warning.consecutive_deviations
+                                        ),
+                                        "action": warning.action,
+                                    },
+                                )
                         if not (
                             outcome.agent_execution is None
                             and outcome_usage == ModelUsage.no_call()
@@ -589,12 +626,13 @@ class GraphRuntime:
                                 if outcome.cost_usd is None
                                 else outcome.cost_usd
                             )
+                            accounted_usage = outcome_usage.with_accounted_totals(
+                                outcome.tokens_used, accounted_cost
+                            )
                             usage = ModelUsage.combine(
                                 (
                                     usage,
-                                    outcome_usage.with_accounted_totals(
-                                        outcome.tokens_used, accounted_cost
-                                    ),
+                                    accounted_usage,
                                 )
                             )
                         within_node_budget = node.max_tokens is None or outcome.tokens_used <= node.max_tokens
@@ -623,7 +661,7 @@ class GraphRuntime:
                             {
                                 "tokens_used": outcome.tokens_used,
                                 "cost_usd": outcome.cost_usd,
-                                "usage": outcome_usage.to_dict(),
+                                "usage": accounted_usage.to_dict(),
                                 "artifacts": [record.key for record in records],
                                 "metadata": dict(outcome.metadata),
                             },

@@ -241,6 +241,26 @@ class RouteObservation:
     task_type: str = "general"
     toolset: Tuple[str, ...] = ()
     model_family: str = "default"
+    total_tokens: Optional[int] = None
+    total_tokens_complete: bool = False
+
+    def __post_init__(self) -> None:
+        if self.total_tokens is not None and (
+            isinstance(self.total_tokens, bool)
+            or not isinstance(self.total_tokens, int)
+            or self.total_tokens < 0
+        ):
+            raise ContractViolation(
+                "route observation total_tokens must be a non-negative integer or null"
+            )
+        if not isinstance(self.total_tokens_complete, bool):
+            raise ContractViolation(
+                "route observation total_tokens_complete must be a boolean"
+            )
+        if self.total_tokens_complete and self.total_tokens is None:
+            raise ContractViolation(
+                "route observation complete total_tokens requires a measured value"
+            )
 
     @property
     def context_key(self) -> str:
@@ -264,6 +284,12 @@ class RouteObservation:
             task_type=str(value.get("task_type", "general")),
             toolset=tuple(str(item) for item in value.get("toolset", ())),
             model_family=str(value.get("model_family", "default")),
+            total_tokens=(
+                None
+                if value.get("total_tokens") is None
+                else int(value["total_tokens"])
+            ),
+            total_tokens_complete=bool(value.get("total_tokens_complete", False)),
         )
 
 
@@ -411,11 +437,22 @@ class PolicyRouter:
         request: Optional[Any] = None,
         latency_seconds: float = 0.0,
         cost_usd: Optional[float] = None,
+        total_tokens: Optional[int] = None,
+        total_tokens_complete: bool = False,
     ) -> None:
         self._governance.record_success(
             decision.provider, decision.governance_token
         )
-        self._observe(decision, request, True, latency_seconds, cost_usd, None)
+        self._observe(
+            decision,
+            request,
+            True,
+            latency_seconds,
+            cost_usd,
+            None,
+            total_tokens,
+            total_tokens_complete,
+        )
 
     def record_failure(
         self,
@@ -429,7 +466,16 @@ class PolicyRouter:
             self._policy(decision.provider),
             decision.governance_token,
         )
-        self._observe(decision, request, False, latency_seconds, None, error_type)
+        self._observe(
+            decision,
+            request,
+            False,
+            latency_seconds,
+            None,
+            error_type,
+            None,
+            False,
+        )
 
     def governance_status(self) -> Mapping[str, Any]:
         return self._governance.status()
@@ -485,6 +531,8 @@ class PolicyRouter:
         latency_seconds: float,
         cost_usd: Optional[float],
         error_type: Optional[str],
+        total_tokens: Optional[int],
+        total_tokens_complete: bool,
     ) -> None:
         if self._observer is None or request is None:
             return
@@ -501,6 +549,8 @@ class PolicyRouter:
             task_type=request.task_type,
             toolset=tuple(sorted(set(request.tools))),
             model_family=request.model_family,
+            total_tokens=total_tokens,
+            total_tokens_complete=total_tokens_complete,
         )
         try:
             self._observer(observation)

@@ -149,6 +149,8 @@ class LearningTests(unittest.TestCase):
             self.assertEqual(1, len(records))
             self.assertEqual("memory", records[0].executor_id)
             self.assertAlmostEqual(0.2, records[0].cost_usd)
+            self.assertEqual(0, records[0].total_tokens)
+            self.assertTrue(records[0].total_tokens_complete)
             self.assertNotIn("secret prompt", raw)
             self.assertNotIn("value", raw)
 

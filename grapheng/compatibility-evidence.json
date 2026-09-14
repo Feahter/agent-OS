@@ -39,6 +39,13 @@
         "validated_at": "2026-09-09T11:43:46Z",
         "version": "2.1.266",
         "version_source": "installed claude --version"
+      },
+      {
+        "inspection": "installed Darwin arm64 CLI --version and --help only; all required non-interactive flags including --effort present; no model call",
+        "protocol": "json-envelope-v1",
+        "validated_at": "2026-09-14T03:39:21Z",
+        "version": "2.1.270",
+        "version_source": "installed claude --version"
       }
     ],
     "codex": [
@@ -53,6 +60,13 @@
         "protocol": "exec-jsonl-v1",
         "validated_at": "2026-08-24T11:23:10Z",
         "version": "0.149.0-alpha.4.1",
+        "version_source": "installed codex --version"
+      },
+      {
+        "inspection": "installed Darwin arm64 CLI --version and exec --help; all required non-interactive flags including --config present; bounded six-node real-model canary succeeded 6/6 with structured output and low reasoning; provider cost remained unknown, so no measured-cost runtime_canary is claimed",
+        "protocol": "exec-jsonl-v1",
+        "validated_at": "2026-09-14T03:39:21Z",
+        "version": "0.154.0-alpha.6.2",
         "version_source": "installed codex --version"
       }
     ],
@@ -90,9 +104,9 @@
         "version_source": "pi --version"
       },
       {
-        "inspection": "installed Darwin arm64 CLI --version and --help only; all required non-interactive flags present; no model call",
+        "inspection": "installed Darwin arm64 CLI --version and --help only; all required non-interactive flags including --thinking present; no model call",
         "protocol": "message-end-jsonl-v1",
-        "validated_at": "2026-09-09T11:43:46Z",
+        "validated_at": "2026-09-14T03:39:21Z",
         "version": "0.85.1",
         "version_source": "installed pi --version"
       }
