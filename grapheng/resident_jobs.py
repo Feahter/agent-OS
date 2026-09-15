@@ -19,9 +19,10 @@ from .errors import ContractViolation
 from .model import GraphSpec
 from .orca import OrcaBackend, OrcaClient, OrcaGraphCompiler
 from .os import AgentOS, state_root_for_home
+from .resident_archive import terminal_fact_evidence
 from .runtime import NodeRegistry
-
-_TERMINAL_PHASES = {"succeeded", "failed", "cancelled"}
+from .state_machine import TERMINAL_PHASES as _TERMINAL_PHASES
+from .state_machine import project_execution_phase
 
 
 class ResidentJobCatalog:
@@ -155,7 +156,14 @@ class AdvancedGraphJob:
                         pause_requested = True
         finally:
             plane.close()
-        if pause_requested:
+        projected_phase = project_execution_phase(
+            snapshot.phase,
+            pause_requested=pause_requested,
+        )
+        if projected_phase in _TERMINAL_PHASES:
+            phase = self.inspect(run_id)
+            return {"phase": phase, "run_phase": snapshot.phase}
+        if projected_phase == "paused":
             return {"phase": "paused"}
         phase = self.inspect(run_id)
         return {"phase": phase, "run_phase": snapshot.phase}
@@ -190,6 +198,12 @@ class AdvancedGraphJob:
             self._definition_path(run_id),
             run_root / "state.json",
             run_root / "approvals.json",
+        )
+
+    def terminal_fact(self, run_id: str, phase: str) -> Optional[Mapping[str, str]]:
+        return terminal_fact_evidence(
+            self.control_root / "runs" / run_id / "state.json",
+            phase,
         )
 
     def _definition_path(self, run_id: str) -> Path:
@@ -337,6 +351,11 @@ class OrcaResidentJob:
 
         job_root = self.root / reference
         return (job_root / "definition.json", job_root / "state.json")
+
+    def terminal_fact(
+        self, reference: str, phase: str
+    ) -> Optional[Mapping[str, str]]:
+        return terminal_fact_evidence(self.root / reference / "state.json", phase)
 
     def _definition(self, reference: str):
         job_root = self.root / reference

@@ -100,13 +100,9 @@ def _max_output_bytes() -> int:
     try:
         value = int(raw)
     except ValueError as error:
-        raise ContractViolation(
-            f"{_ENV_MAX_OUTPUT_BYTES} must be a positive integer"
-        ) from error
+        raise ContractViolation(f"{_ENV_MAX_OUTPUT_BYTES} must be a positive integer") from error
     if value < 1024:
-        raise ContractViolation(
-            f"{_ENV_MAX_OUTPUT_BYTES} must be at least 1024 bytes"
-        )
+        raise ContractViolation(f"{_ENV_MAX_OUTPUT_BYTES} must be at least 1024 bytes")
     return value
 
 
@@ -140,9 +136,7 @@ class FailureClassification:
             detail=self.detail,
         )
         if self.kind == "rate_limit":
-            raise AgentRateLimitError(
-                f"agent {executor_id} was rate limited: {self.detail}"
-            )
+            raise AgentRateLimitError(f"agent {executor_id} was rate limited: {self.detail}")
         if self.kind == "timeout":
             raise AgentTimeoutError(f"agent {executor_id} timed out: {self.detail}")
         raise AgentExecutionError(f"agent {executor_id} failed: {self.detail}")
@@ -170,9 +164,7 @@ def _heuristic_kind(text: str) -> Optional[str]:
     return None
 
 
-def _read_stream_bounded(
-    stream, limit: int, overflow: threading.Event
-) -> Tuple[str, int]:
+def _read_stream_bounded(stream, limit: int, overflow: threading.Event) -> Tuple[str, int]:
     """Drain ``stream`` up to ``limit`` bytes, flagging overflow.
 
     Reading incrementally keeps a runaway Agent from filling memory, and the
@@ -221,9 +213,7 @@ def _await_process(
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             _terminate(process)
-            raise AgentTimeoutError(
-                f"agent {executor_id} timed out after {timeout_seconds}s"
-            )
+            raise AgentTimeoutError(f"agent {executor_id} timed out after {timeout_seconds}s")
         try:
             return process.wait(timeout=min(0.1, remaining))
         except subprocess.TimeoutExpired:
@@ -262,9 +252,7 @@ def run_bounded_process(
             env=dict(env),
         )
     except FileNotFoundError as error:
-        raise AgentExecutionError(
-            f"agent executable is unavailable: {command[0]}"
-        ) from error
+        raise AgentExecutionError(f"agent executable is unavailable: {command[0]}") from error
 
     overflow = threading.Event()
     captured: Dict[str, Tuple[str, int]] = {}
@@ -276,18 +264,14 @@ def run_bounded_process(
             stream.close()
 
     readers = [
-        threading.Thread(
-            target=drain, args=(name, stream), name=f"grapheng-{name}", daemon=True
-        )
+        threading.Thread(target=drain, args=(name, stream), name=f"grapheng-{name}", daemon=True)
         for name, stream in (("stdout", process.stdout), ("stderr", process.stderr))
         if stream is not None
     ]
     for reader in readers:
         reader.start()
     try:
-        returncode = _await_process(
-            process, executor_id, timeout_seconds, overflow
-        )
+        returncode = _await_process(process, executor_id, timeout_seconds, overflow)
     finally:
         for reader in readers:
             reader.join(timeout=5)
@@ -447,7 +431,9 @@ class CliAgentAdapter(ABC):
             return FailureClassification(
                 declared,
                 "exit_code",
-                f"exit {completed.returncode}: {detail}" if detail else f"exit {completed.returncode}",
+                f"exit {completed.returncode}: {detail}"
+                if detail
+                else f"exit {completed.returncode}",
             )
         heuristic = _heuristic_kind(detail)
         if heuristic is not None:
@@ -458,9 +444,7 @@ class CliAgentAdapter(ABC):
             f"exit {completed.returncode}: {detail}" if detail else f"exit {completed.returncode}",
         )
 
-    def require_success(
-        self, completed: subprocess.CompletedProcess, executor_id: str
-    ) -> None:
+    def require_success(self, completed: subprocess.CompletedProcess, executor_id: str) -> None:
         classification = self.classify_exit(completed)
         if classification is not None:
             classification.raise_for(executor_id)
@@ -483,11 +467,7 @@ class ClaudeCodeExecutor(CliAgentAdapter):
         max_context_bytes: Optional[int] = DEFAULT_MAX_CONTEXT_BYTES,
     ):
         super().__init__(command, max_context_bytes=max_context_bytes)
-        detected = (
-            _claude_safe_mode_flag(command)
-            if safe_mode_flag is None
-            else safe_mode_flag
-        )
+        detected = _claude_safe_mode_flag(command) if safe_mode_flag is None else safe_mode_flag
         self._safe_mode_flag = detected is True
 
     @property
@@ -537,6 +517,13 @@ class ClaudeCodeExecutor(CliAgentAdapter):
             {"CLAUDE_CODE_SAFE_MODE": "1"},
         )
         self.require_success(completed, self.capabilities.executor_id)
+        return self._parse_result(completed, request)
+
+    def _parse_result(
+        self,
+        completed: subprocess.CompletedProcess,
+        request: AgentRequest,
+    ) -> AgentResult:
         try:
             envelope = json.loads(completed.stdout)
         except json.JSONDecodeError as error:
@@ -556,9 +543,7 @@ class ClaudeCodeExecutor(CliAgentAdapter):
             raise AgentProtocolError("Claude Code result has no structured output")
         usage = _mapping(envelope.get("usage"))
         input_tokens = _optional_non_negative_int(usage.get("input_tokens"))
-        cached_input_tokens = _optional_non_negative_int(
-            usage.get("cache_read_input_tokens")
-        )
+        cached_input_tokens = _optional_non_negative_int(usage.get("cache_read_input_tokens"))
         output_tokens = _optional_non_negative_int(usage.get("output_tokens"))
         reported_total = _optional_non_negative_int(usage.get("total_tokens"))
         legacy_parts = tuple(
@@ -570,17 +555,17 @@ class ClaudeCodeExecutor(CliAgentAdapter):
                 "cache_read_input_tokens",
             )
         )
-        tokens = reported_total if reported_total is not None else sum(
-            item for item in legacy_parts if item is not None
+        tokens = (
+            reported_total
+            if reported_total is not None
+            else sum(item for item in legacy_parts if item is not None)
         )
         total_complete = reported_total is not None or all(
             item is not None for item in legacy_parts
         )
         cost = envelope.get("total_cost_usd")
         normalized_cost = (
-            float(cost)
-            if isinstance(cost, (int, float)) and not isinstance(cost, bool)
-            else None
+            float(cost) if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None
         )
         normalized_usage = ModelUsage(
             input_tokens=input_tokens,
@@ -649,6 +634,13 @@ class PiAgentExecutor(CliAgentAdapter):
         arguments.append(compiled.body)
         completed = self.run_cli(arguments, request)
         self.require_success(completed, self.capabilities.executor_id)
+        return self._parse_result(completed, request)
+
+    def _parse_result(
+        self,
+        completed: subprocess.CompletedProcess,
+        request: AgentRequest,
+    ) -> AgentResult:
         final_message: Optional[Mapping[str, Any]] = None
         for line in completed.stdout.splitlines():
             if not line.strip():
@@ -677,7 +669,9 @@ class PiAgentExecutor(CliAgentAdapter):
         text = "\n".join(
             item["text"]
             for item in content
-            if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str)
+            if isinstance(item, dict)
+            and item.get("type") == "text"
+            and isinstance(item.get("text"), str)
         )
         outputs = _json_object(text)
         usage = _mapping(final_message.get("usage"))
@@ -704,9 +698,7 @@ class PiAgentExecutor(CliAgentAdapter):
         cost_data = _mapping(usage.get("cost"))
         cost = cost_data.get("total")
         normalized_cost = (
-            float(cost)
-            if isinstance(cost, (int, float)) and not isinstance(cost, bool)
-            else None
+            float(cost) if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None
         )
         normalized_usage = ModelUsage(
             input_tokens=input_tokens,
@@ -733,6 +725,7 @@ class PiAgentExecutor(CliAgentAdapter):
 
 class CodexExecutor(CliAgentAdapter):
     native_output_schema = True
+
     @property
     def capabilities(self) -> ExecutorCapabilities:
         return ExecutorCapabilities(
@@ -779,7 +772,10 @@ class CodexExecutor(CliAgentAdapter):
                 arguments.extend(
                     ("--config", f'model_reasoning_effort="{request.reasoning_effort}"')
                 )
-            if not any((parent / ".git").exists() for parent in (request.workspace, *request.workspace.parents)):
+            if not any(
+                (parent / ".git").exists()
+                for parent in (request.workspace, *request.workspace.parents)
+            ):
                 arguments.append("--skip-git-repo-check")
             arguments.append(compiled.body)
             completed = self.run_cli(arguments, request)
@@ -788,6 +784,13 @@ class CodexExecutor(CliAgentAdapter):
                 schema_path.unlink(missing_ok=True)
 
         self.require_success(completed, self.capabilities.executor_id)
+        return self._parse_result(completed, request)
+
+    def _parse_result(
+        self,
+        completed: subprocess.CompletedProcess,
+        request: AgentRequest,
+    ) -> AgentResult:
         final_text: Optional[str] = None
         session_id: Optional[str] = None
         usage: Mapping[str, Any] = {}
@@ -815,9 +818,7 @@ class CodexExecutor(CliAgentAdapter):
         if final_text is None:
             raise AgentProtocolError("Codex event stream has no final agent message")
         input_tokens = _optional_non_negative_int(usage.get("input_tokens"))
-        cached_input_tokens = _optional_non_negative_int(
-            usage.get("cached_input_tokens")
-        )
+        cached_input_tokens = _optional_non_negative_int(usage.get("cached_input_tokens"))
         output_tokens = _optional_non_negative_int(usage.get("output_tokens"))
         reported_total = _optional_non_negative_int(usage.get("total_tokens"))
         if reported_total is not None:
@@ -863,9 +864,7 @@ class OpenCodeExecutor(CliAgentAdapter):
         allowed = set(tools)
         unknown = allowed - set(CANONICAL_TOOLS)
         if unknown:
-            raise ContractViolation(
-                f"executor opencode does not map tool {sorted(unknown)[0]}"
-            )
+            raise ContractViolation(f"executor opencode does not map tool {sorted(unknown)[0]}")
         return {
             "*": "deny",
             "read": "allow" if "read" in allowed else "deny",
@@ -892,12 +891,9 @@ class OpenCodeExecutor(CliAgentAdapter):
         structured_kind: Optional[str] = None
         if isinstance(detail, Mapping):
             marker = " ".join(
-                str(detail.get(key, ""))
-                for key in ("name", "code", "type", "status")
+                str(detail.get(key, "")) for key in ("name", "code", "type", "status")
             ).lower()
-            if "429" in marker or "ratelimit" in marker.replace("_", "").replace(
-                " ", ""
-            ):
+            if "429" in marker or "ratelimit" in marker.replace("_", "").replace(" ", ""):
                 structured_kind = "rate_limit"
             elif "timeout" in marker:
                 structured_kind = "timeout"
@@ -910,9 +906,7 @@ class OpenCodeExecutor(CliAgentAdapter):
                 text = repr(detail)
         bounded = _bounded_detail(text)
         if structured_kind is not None:
-            FailureClassification(structured_kind, "structured", bounded).raise_for(
-                executor_id
-            )
+            FailureClassification(structured_kind, "structured", bounded).raise_for(executor_id)
         heuristic = _heuristic_kind(bounded)
         FailureClassification(
             heuristic or "execution", "heuristic" if heuristic else "structured", bounded
@@ -939,7 +933,13 @@ class OpenCodeExecutor(CliAgentAdapter):
             },
         )
         self.require_success(completed, self.capabilities.executor_id)
+        return self._parse_result(completed, request)
 
+    def _parse_result(
+        self,
+        completed: subprocess.CompletedProcess,
+        request: AgentRequest,
+    ) -> AgentResult:
         final_text: Optional[str] = None
         session_id: Optional[str] = None
         step_usages = []
@@ -949,9 +949,7 @@ class OpenCodeExecutor(CliAgentAdapter):
             try:
                 event = json.loads(line)
             except json.JSONDecodeError as error:
-                raise AgentProtocolError(
-                    f"invalid OpenCode JSONL event: {error}"
-                ) from error
+                raise AgentProtocolError(f"invalid OpenCode JSONL event: {error}") from error
             if not isinstance(event, dict) or not isinstance(event.get("type"), str):
                 raise AgentProtocolError("invalid OpenCode JSONL event envelope")
             if event.get("sessionID"):
@@ -972,9 +970,7 @@ class OpenCodeExecutor(CliAgentAdapter):
                     total_complete = True
                 else:
                     legacy_parts = (input_tokens, output_tokens, reasoning_tokens)
-                    step_tokens = sum(
-                        item for item in legacy_parts if item is not None
-                    )
+                    step_tokens = sum(item for item in legacy_parts if item is not None)
                     total_complete = all(item is not None for item in legacy_parts)
                 step_cost = part.get("cost")
                 normalized_cost = (
@@ -997,15 +993,11 @@ class OpenCodeExecutor(CliAgentAdapter):
                     )
                 )
             elif event_type == "error":
-                self._event_error(
-                    self.capabilities.executor_id, event.get("error", event)
-                )
+                self._event_error(self.capabilities.executor_id, event.get("error", event))
         if final_text is None:
             raise AgentProtocolError("OpenCode event stream has no final text result")
         normalized_usage = (
-            ModelUsage.combine(step_usages)
-            if step_usages
-            else ModelUsage(total_tokens=0)
+            ModelUsage.combine(step_usages) if step_usages else ModelUsage(total_tokens=0)
         )
         tokens = normalized_usage.total_tokens or 0
         return AgentResult(
@@ -1069,9 +1061,7 @@ def discover_local_executors(
     if claude:
         safe_mode_flag = _claude_safe_mode_flag((claude,))
         if safe_mode_flag is not None:
-            registry.register(
-                ClaudeCodeExecutor((claude,), safe_mode_flag=safe_mode_flag)
-            )
+            registry.register(ClaudeCodeExecutor((claude,), safe_mode_flag=safe_mode_flag))
     pi = certified.get("pi-agent")
     if pi:
         registry.register(PiAgentExecutor((pi,)))

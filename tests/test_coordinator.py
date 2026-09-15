@@ -1,21 +1,26 @@
 import hashlib
+import io
 import json
 import subprocess
 import tempfile
 import threading
 import unittest
+from contextlib import redirect_stdout
 from dataclasses import asdict
 from pathlib import Path
+from unittest.mock import patch
 
 from grapheng import (
     AllowListGatePolicy,
     ContractViolation,
+    EffectIndeterminateError,
     GraphSpec,
     GraphValidationError,
     OrcaCoordinator,
     OrcaMaterializedRun,
     VerifiedArtifactCache,
 )
+from grapheng.cli import main
 
 
 def node(
@@ -217,6 +222,258 @@ class OrcaCoordinatorTests(unittest.TestCase):
         return OrcaCoordinator(
             value, backend, root / "coordinator", workspace, **kwargs
         )
+
+    def test_effect_recovery_inspect_and_audited_reset_are_idempotent(self):
+        class SimulatedProcessCrash(BaseException):
+            pass
+
+        class CrashingReplyBackend(FakeBackend):
+            def reply(self, message_id, body):
+                result = super().reply(message_id, body)
+                raise SimulatedProcessCrash(result)
+
+        value = graph([node("work")])
+        question = {
+            "id": "question-recovery",
+            "type": "question",
+            "taskId": "task-work",
+            "dispatchId": "dispatch-work-1",
+            "body": "choose",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = CrashingReplyBackend()
+            coordinator = self.coordinator(root, value, backend)
+            coordinator.start()
+            backend.enqueue("delivery-recovery", question)
+            coordinator.advance(timeout_ms=10)
+            with self.assertRaises(SimulatedProcessCrash):
+                coordinator.answer_question("question-recovery", "A")
+            reply = next(
+                item
+                for item in coordinator.inspect_effects()
+                if item.action == "reply"
+            )
+
+            self.assertEqual("started", reply.status)
+            self.assertEqual("question-recovery", reply.identity)
+            self.assertEqual("reset", reply.next_action)
+            self.assertFalse(reply.automatic_reconcile)
+
+            with self.assertRaises(EffectIndeterminateError):
+                coordinator.reconcile_effect(reply.effect_id, actor="operator")
+            reset = coordinator.reset_effect(
+                reply.effect_id,
+                actor="operator",
+                reason="Orca has no reply query API; operator verified no reply",
+                receipt_digest=reply.receipt_digest,
+            )
+            repeated = coordinator.reset_effect(
+                reply.effect_id,
+                actor="operator",
+                reason="Orca has no reply query API; operator verified no reply",
+                receipt_digest=reply.receipt_digest,
+            )
+            reset_events = [
+                event
+                for event in coordinator.events().events
+                if event["event"] == "orca_effect_reset"
+            ]
+            completed = next(
+                item
+                for item in coordinator.inspect_effects()
+                if item.action == "dispatch"
+            )
+
+            self.assertEqual("reset", reset.status)
+            self.assertEqual("retry", reset.next_action)
+            self.assertEqual(reset, repeated)
+            self.assertEqual(1, len(reset.recovery_history))
+            self.assertEqual(reply.receipt_digest, reset.recovery_history[0]["old_receipt_digest"])
+            self.assertEqual(1, len(reset_events))
+            with self.assertRaisesRegex(ContractViolation, "cannot be reset"):
+                coordinator.reset_effect(
+                    completed.effect_id,
+                    actor="operator",
+                    reason="must not overwrite completion",
+                    receipt_digest=completed.receipt_digest,
+                )
+
+    def test_orca_effect_cli_projects_recovery_state(self):
+        value = graph([node("work")])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = FakeBackend()
+            coordinator = self.coordinator(root, value, backend)
+            coordinator.start()
+            spec_path = root / "graph.json"
+            spec_path.write_text(
+                json.dumps(asdict(value)), encoding="utf-8"
+            )
+            output = io.StringIO()
+            with redirect_stdout(output):
+                status = main(
+                    [
+                        "orca-effect",
+                        "inspect",
+                        str(spec_path),
+                        "--root",
+                        str(root / "coordinator"),
+                        "--workspace",
+                        str(root / "workspace"),
+                    ]
+                )
+            projected = json.loads(output.getvalue())
+
+        self.assertEqual(0, status)
+        self.assertEqual(
+            {"materialize", "dispatch"},
+            {item["action"] for item in projected["effects"]},
+        )
+
+    def test_queryable_dispatch_reconciles_without_second_start(self):
+        class SimulatedProcessCrash(BaseException):
+            pass
+
+        class QueryableDispatchBackend(FakeBackend):
+            def __init__(self):
+                super().__init__()
+                self.crash = True
+                self.reconciliations = 0
+
+            def start_worker(self, *args, **kwargs):
+                result = super().start_worker(*args, **kwargs)
+                if self.crash:
+                    raise SimulatedProcessCrash()
+                return result
+
+            def reconcile_effect(self, action, identity, _payload_digest):
+                if action != "dispatch":
+                    return None
+                self.reconciliations += 1
+                _, node_id, attempt = identity.rsplit(":", 2)
+                return {
+                    "dispatch": {"id": f"dispatch-{node_id}-{attempt}"}
+                }
+
+        value = graph([node("work")])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = QueryableDispatchBackend()
+            coordinator = self.coordinator(root, value, backend)
+            with self.assertRaises(SimulatedProcessCrash):
+                coordinator.start()
+            dispatch = next(
+                item
+                for item in coordinator.inspect_effects()
+                if item.action == "dispatch"
+            )
+            recovered = coordinator.reconcile_effect(
+                dispatch.effect_id, actor="operator"
+            )
+            repeated = coordinator.reconcile_effect(
+                dispatch.effect_id, actor="operator"
+            )
+            backend.crash = False
+            resumed = coordinator.start()
+
+        self.assertEqual("completed", recovered.status)
+        self.assertEqual(recovered, repeated)
+        self.assertEqual("running", resumed.statuses["work"])
+        self.assertEqual(1, len(backend.starts))
+        self.assertEqual(1, backend.reconciliations)
+
+    def test_public_reconcile_recovers_merge_after_response_loss(self):
+        class SimulatedProcessCrash(BaseException):
+            pass
+
+        value = graph(
+            [
+                node(
+                    "change",
+                    writes=("change_result",),
+                    workspace={"mode": "isolated", "retain": "on_failure"},
+                    controlled_merge={
+                        "verifier": "verify",
+                        "target_branch": "main",
+                    },
+                ),
+                node(
+                    "verify",
+                    deps=("change",),
+                    reads=("change_result",),
+                    writes=("verification",),
+                    gate="merge-approval",
+                    verifier_for="change",
+                    reality_anchor=True,
+                    verified_reuse={
+                        "decision_artifact": "verification",
+                        "passed_path": ["passed"],
+                        "quality_path": ["quality"],
+                        "minimum_quality_score": 0.9,
+                    },
+                ),
+            ],
+            require_anchor=True,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository, source, base, head = merge_repository(root)
+            backend = FakeBackend()
+            coordinator = OrcaCoordinator(
+                value,
+                backend,
+                root / "coordinator",
+                repository,
+                gate_policy=AllowListGatePolicy({"merge-approval"}),
+            )
+            coordinator.start()
+            change_done = done(
+                "change", outputs={"change_result": {"summary": "changed"}}
+            )
+            change_done["payload"]["changes"] = {
+                "workspace_id": f"repo::{source}",
+                "base_ref": base,
+                "head_ref": head,
+                "files_modified": ["value.txt"],
+                "conflicts": [],
+            }
+            backend.enqueue("delivery-change", change_done)
+            coordinator.advance(timeout_ms=10)
+            backend.enqueue(
+                "delivery-verify-recovery",
+                done(
+                    "verify",
+                    outputs={"verification": {"passed": True, "quality": 0.98}},
+                ),
+            )
+            original_write = coordinator._effects._write
+
+            def lose_merge_response(path, receipt):
+                if receipt.key.startswith("orca-merge-") and receipt.status == "completed":
+                    raise SimulatedProcessCrash()
+                original_write(path, receipt)
+
+            with patch.object(
+                coordinator._effects, "_write", side_effect=lose_merge_response
+            ):
+                with self.assertRaises(SimulatedProcessCrash):
+                    coordinator.advance(timeout_ms=10)
+            interrupted = next(
+                item
+                for item in coordinator.inspect_effects()
+                if item.action == "merge"
+            )
+            recovered = coordinator.reconcile_effect(
+                interrupted.effect_id, actor="operator"
+            )
+            snapshot = coordinator.inspect()
+
+        self.assertEqual("started", interrupted.status)
+        self.assertTrue(interrupted.automatic_reconcile)
+        self.assertEqual("reconcile", interrupted.next_action)
+        self.assertEqual("completed", recovered.status)
+        self.assertEqual("merged", next(iter(snapshot.merges.values()))["status"])
 
     def test_parallel_wave_and_restart_do_not_repeat_external_effects(self):
         value = graph(

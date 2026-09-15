@@ -1022,6 +1022,38 @@ class RunEconomicsTests(unittest.TestCase):
         self.assertEqual(2.0, snapshot["nodes"][0]["queue_wait_seconds"])
         self.assertEqual(3.0, snapshot["nodes"][0]["execution_seconds"])
 
+    def test_node_metric_boundaries_reject_duplicates_unknown_nodes_and_gaps(self):
+        graph = GraphSpec.from_dict(
+            {
+                "id": "metric-boundaries",
+                "require_reality_anchor": False,
+                "nodes": [{"id": "work", "kind": "test"}],
+            }
+        )
+        started = {
+            "event": "node_started",
+            "node_id": "work",
+            "attempt": 1,
+            "time": "2027-01-15T08:00:01Z",
+        }
+        failed = {
+            "event": "node_failed",
+            "node_id": "work",
+            "attempt": 1,
+            "time": "2027-01-15T08:00:02Z",
+        }
+
+        with self.assertRaisesRegex(ContractViolation, "duplicate boundaries"):
+            RunEconomics._node_metrics(graph, [started, dict(started), failed], 0)
+        with self.assertRaisesRegex(ContractViolation, "unknown node_id"):
+            RunEconomics._node_metrics(
+                graph,
+                [{**started, "node_id": "unknown"}],
+                0,
+            )
+        with self.assertRaisesRegex(ContractViolation, "incomplete boundaries"):
+            RunEconomics._node_metrics(graph, [started], 0)
+
     def test_artifact_record_rejects_usage_disagreement(self):
         graph, run_dir, _ = completed_control_run(self.root)
         state_path = run_dir / "state.json"

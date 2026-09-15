@@ -1,5 +1,6 @@
 """Stable user task actions over the bounded engineering workflow."""
 
+import hashlib
 import os
 import re
 import shutil
@@ -15,15 +16,17 @@ from ._store import (
 )
 from .adapters import discover_local_executors
 from .agents import ModelUsage
+from .durable_outbox import DurableOutbox
 from .engineering import EngineeringPlan, EngineeringWorkflow, ProjectPolicy
 from .errors import ContractViolation
 from .intents import IntentCompiler, TaskIntent
 from .learning import RSILoop
 from .os import AgentOS, state_root_for_home
+from .schemas import UserTaskMetadataDocumentV1
+from .state_machine import TERMINAL_PHASES as _TERMINAL_PHASES
 
 USER_TASK_SCHEMA_VERSION = 1
 _TASK_ID = re.compile(r"^task-[0-9a-f]{16}$")
-_TERMINAL_PHASES = {"succeeded", "failed", "cancelled"}
 
 
 def default_agent_os_home() -> Path:
@@ -114,17 +117,15 @@ class UserTaskModule:
         )
         task_id, task_dir = self._allocate_task_dir()
         try:
-            atomic_json_write(
-                task_dir / "task.json",
-                {
-                    "schema_version": USER_TASK_SCHEMA_VERSION,
-                    "task_id": task_id,
-                    "kind": "engineering",
-                    "workspace": str(workspace),
-                    "policy": str(resolved_policy),
-                    "created_at": self._clock(),
-                },
-            )
+            metadata: UserTaskMetadataDocumentV1 = {
+                "schema_version": USER_TASK_SCHEMA_VERSION,
+                "task_id": task_id,
+                "kind": "engineering",
+                "workspace": str(workspace),
+                "policy": str(resolved_policy),
+                "created_at": self._clock(),
+            }
+            atomic_json_write(task_dir / "task.json", metadata)
             workflow = self._workflow(task_dir, policy)
             workflow.prepare(objective.strip(), intent.to_dict())
         except Exception as error:
@@ -142,6 +143,9 @@ class UserTaskModule:
 
     def status(self, task_id: str) -> Mapping[str, Any]:
         task_dir, metadata = self._task(task_id)
+        resident = self._resident_if_initialized()
+        if resident is not None:
+            self.reconcile_outbox(task_id, resident=resident)
         state = self._state(task_dir)
         phase = str(state.get("phase", "preparing"))
         value = {
@@ -243,7 +247,6 @@ class UserTaskModule:
             raise ContractViolation("task plan has no approval digest")
         if background:
             approved_at = self._clock()
-            approval_path = task_dir / "approval.json"
             approval = {
                 "schema_version": USER_TASK_SCHEMA_VERSION,
                 "task_id": task_id,
@@ -260,18 +263,25 @@ class UserTaskModule:
                     "updated_at": approved_at,
                 }
             )
+            intent_id = "enqueue-" + hashlib.sha256(
+                f"{task_id}:{digest}".encode()
+            ).hexdigest()[:32]
+            DurableOutbox(task_dir, self._clock).publish(
+                intent_id,
+                task_id,
+                "enqueue",
+                {
+                    "approval": approval,
+                    "queued_state": queued_state,
+                    "priority": priority,
+                },
+            )
             resident = self._resident()
-            # Start the idle coordinator before publishing approval. If startup
-            # fails, no durable task or queue transition has happened yet.
+            self.reconcile_outbox(task_id, resident=resident)
+            # Queue state and its acknowledgment are durable before the daemon
+            # is launched. A launch failure leaves recoverable work, not a
+            # compensating rollback that can erase a committed transition.
             resident.start_background()
-            try:
-                atomic_json_write(approval_path, approval)
-                atomic_json_write(task_dir / "status.json", queued_state)
-                resident.submit(task_id, priority)
-            except Exception:
-                atomic_json_write(task_dir / "status.json", state)
-                approval_path.unlink(missing_ok=True)
-                raise
             return self.status(task_id)
         self._workflow(task_dir).execute(actor.strip(), digest)
         return self.status(task_id)
@@ -308,40 +318,149 @@ class UserTaskModule:
             raise ContractViolation(
                 f"task {task_id} cannot be controlled from phase {phase or 'preparing'}"
             )
-        updated = resident.request(task_id, action, priority)
         changed_at = self._clock()
-        if updated["state"] == "cancelled":
+        intent_id = f"control-{uuid.uuid4().hex}"
+        DurableOutbox(task_dir, self._clock).publish(
+            intent_id,
+            task_id,
+            "control",
+            {
+                "action": action,
+                "actor": actor.strip(),
+                "priority": priority,
+                "changed_at": changed_at,
+            },
+        )
+        self.reconcile_outbox(task_id, resident=resident)
+        resident.ensure_running()
+        return self.status(task_id)
+
+    def reconcile_outbox(
+        self,
+        task_id: Optional[str] = None,
+        *,
+        resident: Optional[Any] = None,
+    ) -> None:
+        """Idempotently deliver pending task-owner intents to the Resident."""
+
+        if task_id is None:
+            task_ids = tuple(
+                path.name
+                for path in sorted(self.tasks_root.iterdir())
+                if path.is_dir()
+                and not path.is_symlink()
+                and _TASK_ID.fullmatch(path.name) is not None
+            )
+        else:
+            self._validate_task_id(task_id)
+            task_ids = (task_id,)
+        consumer = resident or self._resident_if_initialized()
+        if consumer is None:
+            return
+        for current_task_id in task_ids:
+            task_dir, _ = self._task(current_task_id)
+            outbox = DurableOutbox(task_dir, self._clock)
+            with outbox.delivery():
+                for intent in outbox.pending():
+                    if intent["task_id"] != current_task_id:
+                        raise ContractViolation("outbox intent belongs to another task")
+                    if intent["kind"] == "enqueue":
+                        acknowledgment = self._deliver_enqueue_intent(
+                            task_dir, intent, consumer
+                        )
+                    else:
+                        acknowledgment = self._deliver_control_intent(
+                            task_dir, intent, consumer
+                        )
+                    outbox.acknowledge(intent["intent_id"], acknowledgment)
+
+    def _deliver_enqueue_intent(
+        self, task_dir: Path, intent: Mapping[str, Any], resident: Any
+    ) -> Mapping[str, Any]:
+        payload = intent["payload"]
+        if set(payload) != {"approval", "queued_state", "priority"}:
+            raise ContractViolation("enqueue intent has an invalid contract")
+        approval = payload["approval"]
+        queued_state = payload["queued_state"]
+        priority = payload["priority"]
+        if not isinstance(approval, dict) or not isinstance(queued_state, dict):
+            raise ContractViolation("enqueue intent state must be an object")
+        task_id = str(intent["task_id"])
+        if approval.get("task_id") != task_id:
+            raise ContractViolation("enqueue approval task does not match intent")
+        approval_path = task_dir / "approval.json"
+        if approval_path.exists():
+            if dict(read_json_object(approval_path, label="task approval")) != approval:
+                raise ContractViolation("task approval conflicts with enqueue intent")
+        else:
+            atomic_json_write(approval_path, approval, label="task approval")
+        current = dict(self._state(task_dir))
+        if current.get("phase") not in _TERMINAL_PHASES | {"running", "paused"}:
+            atomic_json_write(
+                task_dir / "status.json", queued_state, label="task status"
+            )
+        scheduled = resident.submit(
+            task_id,
+            priority,
+            intent_id=str(intent["intent_id"]),
+        )
+        if not isinstance(scheduled, Mapping):
+            raise ContractViolation("resident enqueue acknowledgment must be an object")
+        return dict(scheduled)
+
+    def _deliver_control_intent(
+        self, task_dir: Path, intent: Mapping[str, Any], resident: Any
+    ) -> Mapping[str, Any]:
+        payload = intent["payload"]
+        if set(payload) != {"action", "actor", "priority", "changed_at"}:
+            raise ContractViolation("control intent has an invalid contract")
+        action = payload["action"]
+        actor = payload["actor"]
+        changed_at = payload["changed_at"]
+        if action not in ("pause", "resume", "cancel", "reprioritize"):
+            raise ContractViolation("control intent action is invalid")
+        if not isinstance(actor, str) or not actor:
+            raise ContractViolation("control intent actor is invalid")
+        updated = resident.request(
+            str(intent["task_id"]),
+            action,
+            payload["priority"],
+            intent_id=str(intent["intent_id"]),
+        )
+        if not isinstance(updated, Mapping):
+            raise ContractViolation("resident control acknowledgment must be an object")
+        state = dict(self._state(task_dir))
+        if updated.get("state") == "cancelled":
             state.update(
                 {
                     "phase": "cancelled",
-                    "cancelled_by": actor.strip(),
+                    "cancelled_by": actor,
                     "cancelled_at": changed_at,
                     "updated_at": changed_at,
                 }
             )
-            atomic_json_write(task_dir / "status.json", state)
-        elif updated["state"] == "paused":
+            atomic_json_write(task_dir / "status.json", state, label="task status")
+        elif updated.get("state") == "paused":
             state.update(
                 {
                     "phase": "paused",
-                    "paused_by": actor.strip(),
+                    "paused_by": actor,
                     "paused_at": changed_at,
                     "updated_at": changed_at,
                 }
             )
-            atomic_json_write(task_dir / "status.json", state)
+            atomic_json_write(task_dir / "status.json", state, label="task status")
         elif action == "resume":
             state.update(
                 {
                     "phase": "queued",
-                    "resumed_by": actor.strip(),
+                    "resumed_by": actor,
                     "resumed_at": changed_at,
                     "updated_at": changed_at,
                 }
             )
-            atomic_json_write(task_dir / "status.json", state)
-        resident.ensure_running()
-        return self.status(task_id)
+            atomic_json_write(task_dir / "status.json", state, label="task status")
+        return dict(updated)
 
     def execute_queued(
         self,

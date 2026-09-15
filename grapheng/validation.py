@@ -100,6 +100,15 @@ def validation_issues(graph: GraphSpec) -> Tuple[str, ...]:
                     f"agent node {node.id} uses unsupported canonical tools: "
                     f"{', '.join(unsupported_tools)}"
                 )
+            mutating_tools = set(node.agent.tools) & {"edit", "shell", "write"}
+            if (
+                node.agent.workspace.mode == "shared"
+                and mutating_tools
+                and node.effect == "read_only"
+            ):
+                issues.append(
+                    f"shared mutating agent node {node.id} requires an explicit effect contract"
+                )
             if not node.writes:
                 issues.append(f"agent node {node.id} must declare at least one output")
             if (

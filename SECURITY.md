@@ -1,13 +1,26 @@
-# 安全策略
+# Security Policy
 
-## 支持范围
+## Supported versions
 
-当前仅支持最新公开版本。`0.0.x` 属于预览阶段，接口可能调整。
+| Version | Support |
+| --- | --- |
+| Latest `0.0.x` release | Best-effort security fixes during the controlled pilot |
+| Older releases and unreleased commits | Unsupported; reproduce on the latest release before reporting |
 
-## 报告漏洞
+Agent OS is pre-alpha. Security support does not imply production, multi-tenant, sandbox or credential-vault guarantees. See the [threat model](docs/threat-model.md) for trust boundaries and residual risk.
 
-请不要在公开 Issue 中披露未修复漏洞。请通过 GitHub 仓库的 Security Advisories 私密报告，
-并附上影响范围、复现步骤和建议缓解方案。维护者确认前请避免公开细节。
+## Reporting a vulnerability
 
-Agent OS 不保存供应商凭据；调用外部 Agent 时仍应使用各工具自身的安全凭据机制，并在真实项目
-接入前审阅工作区权限、数据分级、预算和人工审批策略。
+Use [GitHub private vulnerability reporting](https://github.com/Feahter/agent-OS/security/advisories/new). Do not open a public issue containing exploit steps, credentials, private repository content or unredacted Agent/Orca output.
+
+Include the affected version/commit, operating system, Adapter and version, minimum reproduction, impact, whether a model or external service was called, and redacted logs. Use synthetic repositories and credentials whenever possible.
+
+The project handles reports on a best-effort basis. The target is an initial acknowledgment within five business days, followed by scope confirmation, remediation or a documented residual-risk decision. There is no guaranteed SLA or bug bounty. Please coordinate public disclosure until a fix or mitigation is available.
+
+## Out of scope
+
+- Damage caused by granting an Agent broader OS, network, cloud or repository permissions than the documented policy.
+- A malicious actor who already controls the same OS user and can modify both runtime code and state.
+- Unsupported Adapter versions/platforms, cross-host filesystems and multi-tenant deployments.
+- Model quality issues without a security boundary violation.
+- Denial of service that only consumes the reporting user's explicitly authorized local resources or model budget.

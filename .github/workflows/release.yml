@@ -1,0 +1,105 @@
+name: Signed release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions: {}
+
+env:
+  UV_PYTHON_DOWNLOADS: never
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.17"
+      - name: Verify lockfile and tag version
+        run: |
+          uv lock --check
+          python - <<'PY'
+          import os
+          import pathlib
+          import re
+
+          text = pathlib.Path("pyproject.toml").read_text(encoding="utf-8")
+          version = re.search(r'^version = "([^"]+)"$', text, re.MULTILINE).group(1)
+          if os.environ["GITHUB_REF_NAME"] != f"v{version}":
+              raise SystemExit("release tag does not match pyproject version")
+          pathlib.Path(os.environ["GITHUB_OUTPUT"]).write_text(
+              f"version={version}\n", encoding="utf-8"
+          )
+          PY
+        id: version
+      - name: Install frozen build and test environment
+        run: uv sync --frozen --group build --python 3.12
+      - name: Verify release source
+        run: uv run --frozen --python 3.12 python -m pytest -q
+      - name: Build wheel and source distribution
+        run: uv build --no-build-isolation --python .venv/bin/python
+      - name: Generate commit-bound SBOM and checksums
+        run: |
+          python scripts/generate_sbom.py \
+            --lock uv.lock \
+            --dist dist \
+            --output dist/agent-os.cdx.json \
+            --checksums dist/SHA256SUMS \
+            --project-name graph-engineering-agent-os \
+            --project-version "${{ steps.version.outputs.version }}" \
+            --source-commit "$GITHUB_SHA" \
+            --source-repository "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+      - name: Upload immutable release inputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-dist
+          path: dist/
+          if-no-files-found: error
+
+  attest:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    steps:
+      - name: Download immutable release inputs
+        uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: dist
+      - name: Sign build provenance with GitHub OIDC
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/agent-os.cdx.json
+            dist/SHA256SUMS
+
+  publish:
+    needs: attest
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Download attested release inputs
+        uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: dist
+      - name: Publish GitHub release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes

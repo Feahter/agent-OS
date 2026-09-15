@@ -22,6 +22,15 @@ class AgentNodeHandler:
         self._workspace = workspace.resolve()
         self._reasoning_effort = reasoning_effort
 
+    @property
+    def workspace_identity(self):
+        stat = self._workspace.stat()
+        return {
+            "path": str(self._workspace),
+            "device": stat.st_dev,
+            "inode": stat.st_ino,
+        }
+
     def __call__(self, context: NodeContext) -> NodeOutcome:
         node = self._nodes[context.node_id]
         spec = node.agent
@@ -33,7 +42,7 @@ class AgentNodeHandler:
                 "use the Orca orchestration backend"
             )
         request = AgentRequest(
-            task_id=f"{context.run_id}:{node.id}:{context.attempt}",
+            task_id=context.effect_id or f"{context.run_id}:{node.id}:{context.attempt}",
             prompt=spec.prompt,
             inputs=context.inputs(),
             output_keys=node.writes,

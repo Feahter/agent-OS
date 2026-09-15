@@ -13,7 +13,7 @@ Agent OS is a local-first runtime for coordinating Codex, Claude Code, Pi and Or
 
 The runtime has no third-party dependencies. Python 3.9+ and a POSIX-compatible system are required.
 
-> **Status:** `0.0.1` is a pre-alpha release. The core contracts are tested, but public APIs may still change.
+> **Status:** `0.0.1` is a pre-alpha release. The core contracts are tested. Only the persisted schemas and minimal Python/CLI surface listed in [Schema and minimal public API compatibility](docs/schema-compatibility.md) are frozen; other interfaces may still change.
 
 ## Why Agent OS
 
@@ -45,7 +45,7 @@ objective
   → prompt-free learning signal
 ```
 
-Every transition produces structured evidence. A changed workspace, policy or plan invalidates the prior approval. Mutating calls use effect receipts so an uncertain crash cannot silently replay the same side effect.
+Every transition produces structured evidence. A changed workspace, policy or plan invalidates the prior approval. Engineering, Orca and explicitly declared Graph mutations recover completed receipt-covered calls without replay; an indeterminate receipt fails closed until it is reconciled or an operator authorizes a digest-bound reset.
 
 ## What is included
 
@@ -56,7 +56,7 @@ Every transition produces structured evidence. A changed workspace, policy or pl
 | Policy routing | Selects an executor by capability, data class, quality, cost, latency, rate limit and circuit state. |
 | Engineering workflow | Runs exploration, planning, approval, implementation, checks, independent review and bounded repair. |
 | Orca coordination | Compiles graphs into Run/Task/Dispatch contracts and coordinates isolated workers and controlled merges. |
-| Recovery | Persists checkpoints, effect receipts, leases and event cursors for crash-safe continuation. |
+| Recovery | Persists checkpoints, Effect Receipts, leases and event cursors for continuation of checkpointed and receipt-covered steps. |
 | RSI | Learns from prompt-free telemetry and quality feedback with evaluation, approval, canary rollout and rollback. |
 | Verified reuse | Deduplicates concurrent work and persists only explicitly verified, policy-compatible results. |
 | Operations | Provides local status, approvals, lineage, cost views, diagnostics, migration and release verification. |
@@ -81,6 +81,13 @@ uses only help/version probes and makes zero model calls. Add `--json` for the
 versioned diagnostic contract or `--home /path/to/agent-os-home` to choose another
 home. Operational state stays directly under that home; portable state is initialized
 under `<home>/state`.
+
+For reproducible development, use uv `0.8.17`, run `uv lock --check`, then install
+with `uv sync --frozen --only-group dev`. After changing dependency declarations in
+`pyproject.toml`, regenerate `uv.lock` with `uv lock` and review both files; never edit
+the lockfile by hand. Release builds first sync the locked `build` group and then run
+`uv build --no-build-isolation`, while package smoke tests still install the resulting
+wheel and source distribution in environments outside the checkout.
 
 ### Daily task interface
 
@@ -116,7 +123,9 @@ agent-os center
 agent-os center --json
 ```
 
-Pause and cancellation take effect at the next safe checkpoint between Agent calls or verification steps. An in-flight Agent process is allowed to reach that checkpoint; Agent OS does not claim arbitrary mid-call suspension. After restart or resume, completed mutating calls are recovered from Effect Receipts instead of being replayed.
+Pause and cancellation take effect at the next safe checkpoint between Agent calls or verification steps. An in-flight Agent process is allowed to reach that checkpoint; Agent OS does not claim arbitrary mid-call suspension. After restart or resume, completed receipt-covered mutations are recovered from Effect Receipts instead of being replayed. An indeterminate receipt is not retried automatically.
+
+Ordinary Graph nodes declare `effect: read_only`, `verified_idempotent`, or `reconcilable`. Agent nodes with `shell`, `edit`, or `write` default to an isolated workspace; using those tools in a shared workspace requires an explicit non-read-only effect contract. Write effects persist their stable effect ID, input digest, lease identity and workspace identity before execution. `verified_idempotent` handlers receive the same effect ID on retry; `reconcilable` handlers must prove the external outcome after an interrupted execution or the receipt becomes `indeterminate`. A completed receipt is committed before Artifact output and the terminal checkpoint, so recovery restores the recorded outcome rather than calling the handler again.
 
 `center` is the one-glance task view for engineering tasks, advanced Graph runs and Orca jobs. Items that need approval, an answer or recovery are shown first, followed by active and completed work; totals are not truncated by the display limit. The resident uses the host's native notification command on macOS or Linux for waiting, paused and terminal events. Delivery is best-effort and durably deduplicated: a notification failure never changes the task result. Notification history stays in `runtime/resident` and is excluded from portable RSI state.
 
@@ -201,6 +210,14 @@ resident.schedule_graph(graph, Path("/path/to/project"), priority=10)
 resident.start_background()
 ```
 
+Orca effects expose a uniform recovery projection for materialization, dispatch, gates, replies, delivery acknowledgments, cleanup and controlled merges. `inspect` reports the receipt digest and whether the backend can reconcile it automatically. A reset requires an actor, reason and the exact old digest; it is audited and cannot replace a completed receipt.
+
+```bash
+agent-os orca-effect inspect graph.json --root /path/to/orca-run --workspace /path/to/project
+agent-os orca-effect reconcile graph.json --root /path/to/orca-run --workspace /path/to/project --effect-id EFFECT --actor operator
+agent-os orca-effect reset graph.json --root /path/to/orca-run --workspace /path/to/project --effect-id EFFECT --actor operator --reason "verified external state" --receipt-digest SHA256
+```
+
 ## Graph contract
 
 ```json
@@ -224,7 +241,7 @@ resident.start_background()
 }
 ```
 
-A node can read only declared artifacts and must produce exactly its declared outputs. Graph validation rejects cycles, missing producers, unordered writes, unsafe shared workspaces and ungrounded terminal paths before execution starts.
+A node can read only declared artifacts and must produce exactly its declared outputs. Graph validation rejects cycles, missing producers, unordered writes, unsafe shared workspaces and ungrounded terminal paths before execution starts. External effects use `effect: read_only`, `verified_idempotent`, or `reconcilable`; controlled merges default to `reconcilable`.
 
 `estimated_tokens` is an admission estimate. For Agent nodes, `max_tokens` is a hard execution contract: Agent OS forwards it to the request, requires an executor with the `token_budget` capability, and refuses to start an unbounded executor. A graph-level `max_tokens` therefore requires every Agent node to declare its own `max_tokens`; concurrent admission conservatively reserves those hard limits. The bundled CLI adapters currently report token usage but do not claim a native hard token limit, so token-capped Agent graphs fail before a model call. Use an executor that explicitly implements `token_budget`, or use Claude Code's `agent.max_cost_usd` hard dollar limit and treat `estimated_tokens` plus observed usage as measurements. Orca also rejects token- or dollar-capped nodes until its worker protocol can enforce them during execution.
 
@@ -232,8 +249,8 @@ A node can read only declared artifacts and must produce exactly its declared ou
 
 | Tool | Verified version (Darwin arm64) | Protocol | Integration |
 | --- | --- | --- | --- |
-| Codex | `0.148.0-alpha.9`, `0.149.0-alpha.4.1` | `exec-jsonl-v1` | Local CLI adapter |
-| Claude Code | `2.1.234`, `2.1.241`, `2.1.266` | `json-envelope-v1` | Local CLI adapter |
+| Codex | `0.148.0-alpha.9`, `0.149.0-alpha.4.1`, `0.154.0-alpha.6.2` | `exec-jsonl-v1` | Local CLI adapter |
+| Claude Code | `2.1.234`, `2.1.241`, `2.1.266`, `2.1.270`, `2.1.272` | `json-envelope-v1` | Local CLI adapter |
 | Pi | `0.84.1`, `0.85.1` | `message-end-jsonl-v1` | Local CLI adapter |
 | [OpenCode](https://opencode.ai/) | `1.18.18` | `run-jsonl-v1` | Local CLI adapter |
 | Orca | `1.4.180`, `1.4.192` | `orca-json-command-v1` | Graph compiler, backend and coordinator |
@@ -275,13 +292,16 @@ Learned policy never overrides data permissions, budgets, provider rate limits, 
 ## Safety and recovery
 
 - Graph, policy and workspace fingerprints bind approvals to the reviewed state.
-- Effect receipts prevent blind replay of uncertain external writes.
+- Effect Receipts prevent blind replay for mutations routed through the receipt contract; indeterminate receipts fail closed pending reconciliation.
+- Ordinary shared-workspace Graph Agent writes require the explicit receipt protocol above; unknown, missing or unreconcilable write contracts fail closed.
 - Checkpoints verify graph identity before resuming completed nodes.
+- A run appends each event before its corresponding checkpoint. The checkpoint is authoritative for recovery: a missing event does not replay completed nodes, an incomplete final JSONL frame is ignored, and a malformed committed frame fails closed.
 - Provider rate limits and circuit breakers are shared safely across processes.
 - Persistent reuse requires exact request identity, compatible scope and explicit verification.
 - `confidential` and `restricted` requests bypass persistent reuse by default.
 - Agent OS bundles exclude credentials, prompts, raw responses, worktrees and active leases.
 - Controlled Git merge requires an isolated source, exact verification, a named gate and an unchanged target branch.
+- The [threat model](docs/threat-model.md) defines trust boundaries and residual risk; official tag artifacts include a commit-bound SBOM and GitHub OIDC provenance described in [release verification](docs/release-verification.md).
 
 The project fails closed when state is damaged, a future schema is encountered or an external protocol drifts.
 
@@ -313,7 +333,8 @@ tests/        contract, recovery and cross-process integration tests
 - Data classification is enforced as policy metadata; credential lifecycle remains the responsibility of each tool.
 - Compatibility certification is currently exact-versioned to the table above; run `doctor` and add protocol evidence after upgrading a tool.
 - Real-project and real-Orca rollout still needs a small, monitored pilot.
-- Cross-host state, multi-tenant isolation and signed releases are not implemented yet.
+- High-value repositories should use isolated workspaces by default; unattended shared-workspace writes are supported only through LocalControlPlane fencing plus an explicit verified-idempotent or reconcilable handler.
+- Cross-host state and multi-tenant isolation are not implemented. Local release directories are checksum-protected but not independently signed; only official tag artifacts carry GitHub OIDC provenance.
 
 ## Contributing
 

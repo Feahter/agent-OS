@@ -13,7 +13,7 @@ Agent OS 是一个本地优先的运行时，把 Codex、Claude Code、Pi、Open
 
 运行时没有第三方依赖，需要 Python 3.9+ 和兼容 POSIX 的系统。
 
-> **当前状态：** `0.0.1` 是预览版本。核心契约已有测试覆盖，公开 API 仍可能调整。
+> **当前状态：** `0.0.1` 是预览版本。核心契约已有测试覆盖；只有 [Schema 与最小公共 API 兼容性](docs/schema-compatibility.md) 中列出的持久化格式和最小 Python/CLI 边界已冻结，其他接口仍可能调整。
 
 ## 为什么需要 Agent OS
 
@@ -45,7 +45,7 @@ Agent OS 把这些判断收进一个小而可审计的运行时：
   → 不含 prompt 的学习信号
 ```
 
-每次状态转换都有结构化证据。工作区、策略或计划一旦变化，原有批准立即失效。写操作由 Effect Receipt 保护，进程在结果不确定时崩溃，也不会静默重放同一副作用。
+每次状态转换都有结构化证据。工作区、策略或计划一旦变化，原有批准立即失效。Engineering、Orca 和显式声明的 Graph 写操作会直接恢复 receipt 已完成的调用；indeterminate receipt 在自动协调成功，或操作者批准绑定旧摘要的 reset 前保持 fail-closed。
 
 ## 已包含的能力
 
@@ -56,7 +56,7 @@ Agent OS 把这些判断收进一个小而可审计的运行时：
 | 策略路由 | 按能力、数据级别、质量、费用、延迟、限流和熔断状态选择执行器。 |
 | 工程工作流 | 执行探索、计划、批准、实现、检查、独立审查和有限修复。 |
 | Orca 协调 | 把图编译为 Run/Task/Dispatch 契约，协调隔离 worker 和受控合并。 |
-| 恢复机制 | 持久化 checkpoint、Effect Receipt、lease 和事件游标，支持崩溃续跑。 |
+| 恢复机制 | 持久化 checkpoint、Effect Receipt、lease 和事件游标，支持 checkpoint 与 receipt 已覆盖步骤的续跑。 |
 | RSI | 基于脱敏遥测和质量反馈学习，候选需评估、批准、灰度和可回滚。 |
 | 安全复用 | 合并并发重复任务，只持久化经过明确验证且策略兼容的结果。 |
 | 本地运维 | 提供状态、审批、血缘、费用、自诊断、迁移和发行校验。 |
@@ -80,6 +80,12 @@ Agent 工具，再按优先级给出修复步骤。它只执行 help/version 探
 需要版本化诊断数据时使用 `--json`，需要更换本地主目录时使用
 `--home /path/to/agent-os-home`。运行态直接保存在该目录下，可迁移状态固定保存在
 `<home>/state`。
+
+需要可复现的开发环境时，使用 uv `0.8.17`，先运行 `uv lock --check`，再用
+`uv sync --frozen --only-group dev` 安装。修改 `pyproject.toml` 中的依赖声明后，必须
+运行 `uv lock` 重新生成并同时审阅 `uv.lock`，不要手工编辑 lockfile。发布构建会
+先同步锁定的 `build` group，再执行 `uv build --no-build-isolation`；包烟测仍会在
+源码 checkout 之外的环境安装生成的 wheel 和 sdist。
 
 ### 日常任务入口
 
@@ -115,7 +121,9 @@ agent-os center
 agent-os center --json
 ```
 
-暂停和取消会在 Agent 调用或验证步骤之间的下一个安全检查点生效；已经开始的单次 Agent 调用会先运行到该检查点，系统不会假装支持任意时刻强行挂起。进程重启或任务继续后，已完成的写操作会从 Effect Receipt 恢复，不会静默重放。
+暂停和取消会在 Agent 调用或验证步骤之间的下一个安全检查点生效；已经开始的单次 Agent 调用会先运行到该检查点，系统不会假装支持任意时刻强行挂起。进程重启或任务继续后，receipt 已覆盖且已完成的写操作会从 Effect Receipt 恢复，不会静默重放；indeterminate receipt 不会自动重试。
+
+普通 Graph 节点必须声明 `effect: read_only`、`verified_idempotent` 或 `reconcilable`。带 `shell`、`edit`、`write` 的 Agent 节点默认使用隔离工作区；若要在 shared workspace 中使用这些工具，必须显式声明非只读 effect 契约。写 effect 会在执行前持久化稳定 effect ID、输入摘要、lease 身份和工作区身份。`verified_idempotent` 重试时复用同一 effect ID；`reconcilable` 在执行中断后必须证明外部结果，否则 receipt 进入 `indeterminate`。completed receipt 先于 Artifact 输出和终态 checkpoint 提交，因此恢复会使用已记录结果，不会再次调用 handler。
 
 `center` 是工程任务、高级 Graph 和 Orca 作业共用的一屏任务中心。需要审批、回答或恢复的事项优先显示，其后是运行中与已完成任务；显示条数限制不会截断总数统计。常驻协调器在 macOS 或 Linux 上调用系统原生通知能力，提示等待、暂停和任务终态。通知采用尽力投递和持久去重，通知失败不会改变任务结果；通知记录只保存在 `runtime/resident`，不会进入可迁移 RSI 状态。
 
@@ -200,6 +208,14 @@ resident.schedule_graph(graph, Path("/path/to/project"), priority=10)
 resident.start_background()
 ```
 
+Orca 的物化、dispatch、gate、reply、delivery acknowledgment、cleanup 和受控 merge 共用统一恢复投影。`inspect` 会显示 receipt 摘要以及后端能否自动协调。reset 必须同时绑定 actor、原因和旧 receipt 的精确摘要；操作会留下审计记录，且不能覆盖 completed receipt。
+
+```bash
+agent-os orca-effect inspect graph.json --root /path/to/orca-run --workspace /path/to/project
+agent-os orca-effect reconcile graph.json --root /path/to/orca-run --workspace /path/to/project --effect-id EFFECT --actor operator
+agent-os orca-effect reset graph.json --root /path/to/orca-run --workspace /path/to/project --effect-id EFFECT --actor operator --reason "已核对外部状态" --receipt-digest SHA256
+```
+
 ## GraphSpec 契约
 
 ```json
@@ -223,7 +239,7 @@ resident.start_background()
 }
 ```
 
-节点只能读取声明过的 Artifact，返回值必须精确匹配 `writes`。执行前的图校验会拒绝环、缺失生产者、无序写入、不安全的共享工作区和没有 Reality Anchor 的终点路径。
+节点只能读取声明过的 Artifact，返回值必须精确匹配 `writes`。执行前的图校验会拒绝环、缺失生产者、无序写入、不安全的共享工作区和没有 Reality Anchor 的终点路径。外部副作用通过 `effect: read_only`、`verified_idempotent` 或 `reconcilable` 声明；受控 merge 默认使用 `reconcilable`。
 
 `estimated_tokens` 是准入估算。对于 Agent 节点，`max_tokens` 是硬执行契约：Agent OS 会把它传入请求，要求执行器声明 `token_budget` 能力；无法执行硬上限时，会在启动进程和调用模型前拒绝。图级 `max_tokens` 因此要求每个 Agent 节点都声明自己的 `max_tokens`，并发准入会保守预留这些硬上限。当前内置 CLI Adapter 只能上报 Token 用量，尚未宣称具备原生硬 Token 上限，因此带 Token 上限的 Agent 图会在模型调用前失败关闭。此时应使用明确实现 `token_budget` 的执行器，或使用 Claude Code 的 `agent.max_cost_usd` 硬美元上限，把 `estimated_tokens` 和实际用量作为计量数据。Orca 在 worker 协议能于执行中落实预算之前，也会拒绝带 Token 或美元上限的节点。
 
@@ -231,8 +247,8 @@ resident.start_background()
 
 | 工具 | 已验证版本（Darwin arm64） | 协议 | 接入方式 |
 | --- | --- | --- | --- |
-| Codex | `0.148.0-alpha.9`、`0.149.0-alpha.4.1` | `exec-jsonl-v1` | 本地 CLI Adapter |
-| Claude Code | `2.1.234`、`2.1.241`、`2.1.266` | `json-envelope-v1` | 本地 CLI Adapter |
+| Codex | `0.148.0-alpha.9`、`0.149.0-alpha.4.1`、`0.154.0-alpha.6.2` | `exec-jsonl-v1` | 本地 CLI Adapter |
+| Claude Code | `2.1.234`、`2.1.241`、`2.1.266`、`2.1.270`、`2.1.272` | `json-envelope-v1` | 本地 CLI Adapter |
 | Pi | `0.84.1`、`0.85.1` | `message-end-jsonl-v1` | 本地 CLI Adapter |
 | [OpenCode](https://opencode.ai/) | `1.18.18` | `run-jsonl-v1` | 本地 CLI Adapter |
 | Orca | `1.4.180`、`1.4.192` | `orca-json-command-v1` | 图编译器、后端与协调器 |
@@ -274,13 +290,16 @@ Setup 还会识别下列工具，但不会把它们误当成可执行 Adapter：
 ## 安全与恢复
 
 - 图、策略和工作区指纹把批准绑定到审阅时的状态。
-- Effect Receipt 阻止结果不确定的外部写入被盲目重放。
+- Effect Receipt 阻止纳入该契约的写操作被盲目重放；indeterminate receipt 在协调完成前保持 fail-closed。
+- 普通 shared-workspace Graph Agent 写操作必须使用上述显式 receipt 协议；未知、缺失或无法协调的写契约一律 fail-closed。
 - checkpoint 会先核对图身份，再恢复已完成节点。
+- 每个 run 会先追加事件，再提交对应 checkpoint；恢复以 checkpoint 为准：事件缺失不会导致已完成节点重放，JSONL 尾部未完成帧会被忽略，已提交但损坏的帧则 fail-closed。
 - 多个进程共享供应商限流和熔断状态时使用原子协调。
 - 持久复用要求请求身份、作用域和验证结果完全匹配。
 - `confidential` 和 `restricted` 请求默认跳过持久复用。
 - Agent OS 导出包不包含凭据、prompt、原始响应、worktree 和活动 lease。
 - 受控 Git 合并要求隔离来源、精确验证、命名 gate 和未漂移的目标分支。
+- [威胁模型](docs/threat-model.md) 记录信任边界与剩余风险；正式 tag 产物包含与源提交绑定的 SBOM，以及按[发布验证](docs/release-verification.md)说明生成的 GitHub OIDC 来源证明。
 
 遇到状态损坏、未来 schema 或外部协议漂移时，系统会停止执行，而不是猜测恢复。
 
@@ -312,7 +331,8 @@ tests/        契约、恢复和跨进程集成测试
 - 数据分级是策略约束，各工具仍需自行管理凭据生命周期。
 - 当前兼容认证精确绑定上表版本；升级工具后应先运行 `doctor` 并补充新的协议证据。
 - 真实项目和真实 Orca 接入需要先做小流量、可观察的灰度。
-- 跨主机状态、多租户隔离和带信任根的发行签名尚未实现。
+- 高价值仓库默认应使用隔离工作区；只有同时经过 LocalControlPlane fencing，并提供显式 verified-idempotent 或 reconcilable handler 时，才支持无人值守的 shared-workspace 写操作。
+- 跨主机状态和多租户隔离尚未实现。本地 release 目录只有校验和，不带独立外部签名；只有正式 tag 产物包含 GitHub OIDC 来源证明。
 
 ## 参与贡献
 

@@ -12,6 +12,7 @@ from .agent_nodes import AgentNodeHandler
 from .console import ApprovalInbox, OperationsConsole
 from .console_server import OperationsServer
 from .control import LocalControlPlane
+from .coordinator import OrcaCoordinator
 from .distribution import AgentOSDistribution
 from .economics import (
     BenchmarkProtocol,
@@ -32,7 +33,7 @@ from .optimization import (
     RegressionMeasurement,
     RSIOptimizationLab,
 )
-from .orca import OrcaGraphCompiler
+from .orca import OrcaBackend, OrcaClient, OrcaGraphCompiler
 from .os import AgentOS
 from .policy import AllowListGatePolicy
 from .publication import VerifiedResultPublisher
@@ -771,6 +772,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 def _dispatch(argv: Optional[Sequence[str]] = None) -> int:
+    parser = _command_parser()
+    return _dispatch_parsed(parser.parse_args(argv), parser)
+
+
+def _command_parser() -> argparse.ArgumentParser:
+    """Build the CLI grammar independently from command execution."""
+
     parser = argparse.ArgumentParser(prog="agent-os")
     subparsers = parser.add_subparsers(dest="command", required=True)
     setup_parser = subparsers.add_parser("setup")
@@ -836,6 +844,17 @@ def _dispatch(argv: Optional[Sequence[str]] = None) -> int:
     orca_plan_parser.add_argument("--optimization-root", type=Path)
     orca_plan_parser.add_argument("--agent-os-root", type=Path)
     orca_plan_parser.add_argument("--optimization-rollout-key")
+    orca_effect_parser = subparsers.add_parser("orca-effect")
+    orca_effect_parser.add_argument(
+        "action", choices=("inspect", "reconcile", "reset")
+    )
+    orca_effect_parser.add_argument("spec", type=Path)
+    orca_effect_parser.add_argument("--root", type=Path, required=True)
+    orca_effect_parser.add_argument("--workspace", type=Path, required=True)
+    orca_effect_parser.add_argument("--effect-id")
+    orca_effect_parser.add_argument("--actor")
+    orca_effect_parser.add_argument("--reason")
+    orca_effect_parser.add_argument("--receipt-digest")
     subparsers.add_parser("executors")
     console_parser = subparsers.add_parser("console")
     console_parser.add_argument("--control-root", type=Path, required=True)
@@ -1010,7 +1029,195 @@ def _dispatch(argv: Optional[Sequence[str]] = None) -> int:
     benchmark_parser.add_argument("--micro-protocol", type=Path)
     benchmark_parser.add_argument("--engineering-protocol", type=Path)
     benchmark_parser.add_argument("--recovery-protocol", type=Path)
-    args = parser.parse_args(argv)
+    return parser
+
+
+def _run_distribution_command(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+) -> int:
+    distribution = AgentOSDistribution(source_root=args.source_root)
+    if args.action == "compatibility":
+        value = distribution.compatibility_matrix()
+    elif args.action == "verify-release":
+        if args.release is None:
+            parser.error("agent-os verify-release requires --release")
+        value = distribution.verify_release(args.release)
+    else:
+        if args.root is None:
+            parser.error(f"agent-os {args.action} requires --root")
+        if args.action == "doctor":
+            value = distribution.doctor(args.root)
+        elif args.action == "rehearse":
+            value = distribution.rehearse(args.root, bundle=args.bundle)
+        elif args.action == "release":
+            if args.release is None:
+                parser.error("agent-os release requires --release")
+            value = distribution.create_release(args.root, args.release)
+        else:
+            os_state = AgentOS(args.root)
+            if args.action == "status":
+                value = os_state.status()
+            elif args.action == "export":
+                if args.bundle is None:
+                    parser.error("agent-os export requires --bundle")
+                value = {"bundle": str(os_state.export_bundle(args.bundle))}
+            else:
+                if args.bundle is None:
+                    parser.error("agent-os import requires --bundle")
+                value = os_state.import_bundle(args.bundle)
+    print(json.dumps(value, ensure_ascii=False, sort_keys=True))
+    if args.action == "doctor" and not value["healthy"]:
+        return 2
+    return 0
+
+
+def _run_executors_command() -> int:
+    registry = discover_local_executors()
+    profiles = registry.profiles()
+    print(
+        json.dumps(
+            [
+                {
+                    "executor_id": item.executor_id,
+                    "features": list(item.features),
+                    "tools": list(item.tools),
+                    "provider": profiles[item.executor_id].provider,
+                    "estimated_cost_usd": profiles[item.executor_id].estimated_cost_usd,
+                    "estimated_latency_seconds": profiles[
+                        item.executor_id
+                    ].estimated_latency_seconds,
+                    "data_classifications": list(
+                        profiles[item.executor_id].data_classifications
+                    ),
+                }
+                for item in registry.capabilities()
+            ],
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def _run_rsi_command(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    agent_os: Optional[AgentOS],
+) -> int:
+    learning_root = agent_os.learning_root if agent_os else args.learning_root
+    if learning_root is None:
+        parser.error("rsi requires --agent-os-root or --learning-root")
+    loop = RSILoop(learning_root)
+    if args.action == "status":
+        active = loop.active_policy()
+        value = {
+            "active_policy": active.to_dict() if active is not None else None,
+            "candidates": [item.to_dict() for item in loop.candidates()],
+            "observations": len(loop.journal.read()),
+            "quality_feedback": len(loop.feedback_journal.read()),
+        }
+    elif args.action == "feedback":
+        if not args.task_id or args.score is None or not args.source:
+            parser.error("rsi feedback requires --task-id, --score, and --source")
+        value = loop.feedback(args.task_id, args.score, args.source).to_dict()
+    elif args.action == "propose":
+        value = loop.propose(
+            min_observations=args.min_observations,
+            min_samples=args.min_samples,
+            min_success_rate=args.min_success_rate,
+            min_quality_score=args.min_quality_score,
+            min_quality_samples=args.min_quality_samples,
+            rollout_percent=args.rollout_percent,
+        ).to_dict()
+    else:
+        if not args.candidate_id and args.action != "rollback":
+            parser.error(f"rsi {args.action} requires --candidate-id")
+        if args.action == "evaluate":
+            value = loop.evaluate(args.candidate_id).to_dict()
+        elif args.action == "approve":
+            if not args.actor:
+                parser.error("rsi approve requires --actor")
+            value = loop.approve(args.candidate_id, args.actor).to_dict()
+        elif args.action == "activate":
+            value = loop.activate(args.candidate_id).to_dict()
+        else:
+            policy = loop.rollback()
+            value = {
+                "active_policy": policy.to_dict() if policy is not None else None
+            }
+    print(json.dumps(value, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def _operations_console(
+    args: argparse.Namespace,
+    agent_os: Optional[AgentOS],
+) -> OperationsConsole:
+    learning_root = agent_os.learning_root if agent_os else args.learning_root
+    optimization_root = (
+        agent_os.optimization_root if agent_os else args.optimization_root
+    )
+    return OperationsConsole(
+        args.control_root,
+        approval_inbox=(
+            agent_os.approval_inbox(args.control_root) if agent_os else None
+        ),
+        learning_root=learning_root,
+        optimization_root=optimization_root,
+        agent_os=agent_os,
+    )
+
+
+def _run_console_command(
+    args: argparse.Namespace,
+    agent_os: Optional[AgentOS],
+) -> int:
+    console = _operations_console(args, agent_os)
+    if args.command == "console":
+        output = console.render(args.run_id, args.output)
+        print(json.dumps({"run_id": args.run_id, "output": str(output)}))
+        return 0
+
+    server = OperationsServer(console, args.run_id, port=args.port)
+    print(
+        json.dumps(
+            {"run_id": args.run_id, "url": server.url},
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.shutdown()
+    return 0
+
+
+def _run_approval_command(
+    args: argparse.Namespace,
+    agent_os: Optional[AgentOS],
+) -> int:
+    inbox = (
+        agent_os.approval_inbox(args.control_root)
+        if agent_os
+        else ApprovalInbox(args.control_root)
+    )
+    item = inbox.decide(
+        args.run_id, args.gate, args.decision, args.actor, args.note
+    )
+    print(json.dumps(asdict(item), ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def _dispatch_parsed(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+) -> int:
+    """Execute one already-parsed command without rebuilding CLI syntax."""
 
     if args.command == "setup":
         value = AgentOSDistribution(source_root=args.source_root).setup(
@@ -1070,170 +1277,19 @@ def _dispatch(argv: Optional[Sequence[str]] = None) -> int:
         return _run_engineering_command(args, parser, agent_os)
 
     if args.command == "agent-os":
-        distribution = AgentOSDistribution(source_root=args.source_root)
-        if args.action == "compatibility":
-            value = distribution.compatibility_matrix()
-        elif args.action == "verify-release":
-            if args.release is None:
-                parser.error("agent-os verify-release requires --release")
-            value = distribution.verify_release(args.release)
-        else:
-            if args.root is None:
-                parser.error(f"agent-os {args.action} requires --root")
-            if args.action == "doctor":
-                value = distribution.doctor(args.root)
-            elif args.action == "rehearse":
-                value = distribution.rehearse(args.root, bundle=args.bundle)
-            elif args.action == "release":
-                if args.release is None:
-                    parser.error("agent-os release requires --release")
-                value = distribution.create_release(args.root, args.release)
-            else:
-                os_state = AgentOS(args.root)
-                if args.action == "status":
-                    value = os_state.status()
-                elif args.action == "export":
-                    if args.bundle is None:
-                        parser.error("agent-os export requires --bundle")
-                    value = {"bundle": str(os_state.export_bundle(args.bundle))}
-                else:
-                    if args.bundle is None:
-                        parser.error("agent-os import requires --bundle")
-                    value = os_state.import_bundle(args.bundle)
-        print(json.dumps(value, ensure_ascii=False, sort_keys=True))
-        if args.action == "doctor" and not value["healthy"]:
-            return 2
-        return 0
+        return _run_distribution_command(args, parser)
 
     if args.command == "executors":
-        registry = discover_local_executors()
-        profiles = registry.profiles()
-        print(
-            json.dumps(
-                [
-                    {
-                        "executor_id": item.executor_id,
-                        "features": list(item.features),
-                        "tools": list(item.tools),
-                        "provider": profiles[item.executor_id].provider,
-                        "estimated_cost_usd": profiles[item.executor_id].estimated_cost_usd,
-                        "estimated_latency_seconds": profiles[
-                            item.executor_id
-                        ].estimated_latency_seconds,
-                        "data_classifications": list(
-                            profiles[item.executor_id].data_classifications
-                        ),
-                    }
-                    for item in registry.capabilities()
-                ],
-                ensure_ascii=False,
-                sort_keys=True,
-            )
-        )
-        return 0
+        return _run_executors_command()
 
-    if args.command == "console":
-        learning_root = agent_os.learning_root if agent_os else args.learning_root
-        optimization_root = (
-            agent_os.optimization_root if agent_os else args.optimization_root
-        )
-        output = OperationsConsole(
-            args.control_root,
-            approval_inbox=(
-                agent_os.approval_inbox(args.control_root) if agent_os else None
-            ),
-            learning_root=learning_root,
-            optimization_root=optimization_root,
-            agent_os=agent_os,
-        ).render(args.run_id, args.output)
-        print(json.dumps({"run_id": args.run_id, "output": str(output)}))
-        return 0
-
-    if args.command == "console-serve":
-        learning_root = agent_os.learning_root if agent_os else args.learning_root
-        optimization_root = (
-            agent_os.optimization_root if agent_os else args.optimization_root
-        )
-        console = OperationsConsole(
-            args.control_root,
-            approval_inbox=(
-                agent_os.approval_inbox(args.control_root) if agent_os else None
-            ),
-            learning_root=learning_root,
-            optimization_root=optimization_root,
-            agent_os=agent_os,
-        )
-        server = OperationsServer(console, args.run_id, port=args.port)
-        print(
-            json.dumps(
-                {"run_id": args.run_id, "url": server.url},
-                ensure_ascii=False,
-                sort_keys=True,
-            ),
-            flush=True,
-        )
-        try:
-            server.serve_forever()
-        except KeyboardInterrupt:
-            pass
-        finally:
-            server.shutdown()
-        return 0
+    if args.command in ("console", "console-serve"):
+        return _run_console_command(args, agent_os)
 
     if args.command == "approval":
-        inbox = (
-            agent_os.approval_inbox(args.control_root)
-            if agent_os
-            else ApprovalInbox(args.control_root)
-        )
-        item = inbox.decide(
-            args.run_id, args.gate, args.decision, args.actor, args.note
-        )
-        print(json.dumps(asdict(item), ensure_ascii=False, sort_keys=True))
-        return 0
+        return _run_approval_command(args, agent_os)
 
     if args.command == "rsi":
-        learning_root = agent_os.learning_root if agent_os else args.learning_root
-        if learning_root is None:
-            parser.error("rsi requires --agent-os-root or --learning-root")
-        loop = RSILoop(learning_root)
-        if args.action == "status":
-            active = loop.active_policy()
-            value = {
-                "active_policy": active.to_dict() if active is not None else None,
-                "candidates": [item.to_dict() for item in loop.candidates()],
-                "observations": len(loop.journal.read()),
-                "quality_feedback": len(loop.feedback_journal.read()),
-            }
-        elif args.action == "feedback":
-            if not args.task_id or args.score is None or not args.source:
-                parser.error("rsi feedback requires --task-id, --score, and --source")
-            value = loop.feedback(args.task_id, args.score, args.source).to_dict()
-        elif args.action == "propose":
-            value = loop.propose(
-                min_observations=args.min_observations,
-                min_samples=args.min_samples,
-                min_success_rate=args.min_success_rate,
-                min_quality_score=args.min_quality_score,
-                min_quality_samples=args.min_quality_samples,
-                rollout_percent=args.rollout_percent,
-            ).to_dict()
-        else:
-            if not args.candidate_id and args.action != "rollback":
-                parser.error(f"rsi {args.action} requires --candidate-id")
-            if args.action == "evaluate":
-                value = loop.evaluate(args.candidate_id).to_dict()
-            elif args.action == "approve":
-                if not args.actor:
-                    parser.error("rsi approve requires --actor")
-                value = loop.approve(args.candidate_id, args.actor).to_dict()
-            elif args.action == "activate":
-                value = loop.activate(args.candidate_id).to_dict()
-            else:
-                policy = loop.rollback()
-                value = {"active_policy": policy.to_dict() if policy is not None else None}
-        print(json.dumps(value, ensure_ascii=False, sort_keys=True))
-        return 0
+        return _run_rsi_command(args, parser, agent_os)
 
     if args.command == "rsi-opt":
         if agent_os is not None:
@@ -1242,6 +1298,14 @@ def _dispatch(argv: Optional[Sequence[str]] = None) -> int:
             parser.error("rsi-opt requires --agent-os-root or --optimization-root")
         return _run_optimization_command(args, parser)
 
+    return _run_graph_command(args, parser, agent_os)
+
+
+def _run_graph_command(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    agent_os: Optional[AgentOS],
+) -> int:
     graph = GraphSpec.from_json(args.spec)
     optimization_root = (
         agent_os.optimization_root
@@ -1264,6 +1328,50 @@ def _dispatch(argv: Optional[Sequence[str]] = None) -> int:
     if args.command == "orca-plan":
         plan = OrcaGraphCompiler().compile(graph, args.objective)
         print(json.dumps(plan.to_dict(), ensure_ascii=False, sort_keys=True))
+        return 0
+
+    if args.command == "orca-effect":
+        coordinator = OrcaCoordinator(
+            graph,
+            OrcaBackend(OrcaClient(cwd=args.workspace)),
+            args.root,
+            args.workspace,
+        )
+        value: Mapping[str, Any]
+        if args.action == "inspect":
+            value = {
+                "effects": [
+                    effect.to_dict() for effect in coordinator.inspect_effects()
+                ]
+            }
+        elif args.action == "reconcile":
+            if args.effect_id is None or args.actor is None:
+                parser.error(
+                    "orca-effect reconcile requires --effect-id and --actor"
+                )
+            value = coordinator.reconcile_effect(
+                args.effect_id, actor=args.actor
+            ).to_dict()
+        else:
+            if any(
+                item is None
+                for item in (
+                    args.effect_id,
+                    args.actor,
+                    args.reason,
+                    args.receipt_digest,
+                )
+            ):
+                parser.error(
+                    "orca-effect reset requires --effect-id, --actor, --reason, and --receipt-digest"
+                )
+            value = coordinator.reset_effect(
+                args.effect_id,
+                actor=args.actor,
+                reason=args.reason,
+                receipt_digest=args.receipt_digest,
+            ).to_dict()
+        print(json.dumps(value, ensure_ascii=False, sort_keys=True))
         return 0
 
     if args.command == "agent-run":

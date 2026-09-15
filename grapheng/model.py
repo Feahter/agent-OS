@@ -195,13 +195,20 @@ class AgentSpec:
         if value is None:
             return None
         data = _mapping(value, field)
+        tools = _string_value_tuple(data.get("tools"), f"{field}.tools")
+        workspace = (
+            WorkspaceSpec(mode="isolated")
+            if data.get("workspace") is None
+            and bool(set(tools) & {"edit", "shell", "write"})
+            else WorkspaceSpec.from_dict(data.get("workspace"), f"{field}.workspace")
+        )
         return cls(
             prompt=_required_string(data.get("prompt"), f"{field}.prompt"),
             executor=_optional_identifier(data.get("executor"), f"{field}.executor"),
             required_capabilities=_string_tuple(
                 data.get("required_capabilities"), f"{field}.required_capabilities"
             ),
-            tools=_string_value_tuple(data.get("tools"), f"{field}.tools"),
+            tools=tools,
             model=_optional_string(data.get("model"), f"{field}.model"),
             timeout_seconds=_positive_int(
                 data.get("timeout_seconds"), f"{field}.timeout_seconds", 300
@@ -222,7 +229,7 @@ class AgentSpec:
             reuse_scope=_identifier(
                 data.get("reuse_scope", "local"), f"{field}.reuse_scope"
             ),
-            workspace=WorkspaceSpec.from_dict(data.get("workspace"), f"{field}.workspace"),
+            workspace=workspace,
         )
 
 
@@ -291,11 +298,15 @@ class NodeSpec:
     agent: Optional[AgentSpec] = None
     verified_reuse: Optional[VerifiedReuseSpec] = None
     controlled_merge: Optional[ControlledMergeSpec] = None
+    effect: str = "read_only"
 
     @classmethod
     def from_dict(cls, value: Any, index: int) -> "NodeSpec":
         field = f"nodes[{index}]"
         data = _mapping(value, field)
+        controlled_merge = ControlledMergeSpec.from_dict(
+            data.get("controlled_merge"), f"{field}.controlled_merge"
+        )
         estimated_tokens = data.get("estimated_tokens", 0)
         if isinstance(estimated_tokens, bool) or not isinstance(estimated_tokens, int) or estimated_tokens < 0:
             raise GraphValidationError((f"{field}.estimated_tokens must be a non-negative integer",))
@@ -321,8 +332,12 @@ class NodeSpec:
             verified_reuse=VerifiedReuseSpec.from_dict(
                 data.get("verified_reuse"), f"{field}.verified_reuse"
             ),
-            controlled_merge=ControlledMergeSpec.from_dict(
-                data.get("controlled_merge"), f"{field}.controlled_merge"
+            controlled_merge=controlled_merge,
+            effect=_choice(
+                data.get("effect"),
+                f"{field}.effect",
+                ("read_only", "verified_idempotent", "reconcilable"),
+                "reconcilable" if controlled_merge is not None else "read_only",
             ),
         )
 

@@ -9,7 +9,7 @@ from . import orca_protocol
 from ._store import file_lock
 from .artifacts import ArtifactRecord, ArtifactStore
 from .control import EffectJournal, EventPage
-from .errors import ContractViolation, MergeRejectedError
+from .errors import ContractViolation, EffectIndeterminateError, MergeRejectedError
 from .events import GraphEvent, JsonlEventSink
 from .merge import ControlledGitMerger, MergeCandidate, MergeReceipt
 from .model import GraphSpec, NodeSpec
@@ -27,10 +27,21 @@ from .orca_state import OrcaRunStore
 from .policy import DenyNamedGatesPolicy, GateDecision, GatePolicy
 from .publication import VerifiedResultPublisher
 from .reuse import VerifiedArtifactCache
+from .state_machine import TERMINAL_PHASES as _TERMINAL_PHASES
 
 _TERMINAL_NODE_STATES = {"completed", "failed", "blocked", "cancelled"}
-_TERMINAL_PHASES = {"succeeded", "failed", "cancelled"}
 _EXECUTOR_IDS = {value: key for key, value in ORCA_AGENT_IDS.items()}
+_ORCA_EFFECT_ACTIONS = (
+    "merge-cleanup",
+    "materialize",
+    "dispatch",
+    "cleanup",
+    "reply",
+    "stop",
+    "gate",
+    "ack",
+    "merge",
+)
 
 
 @dataclass(frozen=True)
@@ -48,6 +59,23 @@ class OrcaCoordinatorSnapshot:
     artifacts: Mapping[str, Any]
     merges: Mapping[str, Any]
     next_cursor: int
+
+
+@dataclass(frozen=True)
+class OrcaEffectRecovery:
+    effect_id: str
+    action: str
+    identity: Optional[str]
+    status: str
+    payload_digest: str
+    receipt_digest: str
+    automatic_reconcile: bool
+    next_action: str
+    error: Optional[str]
+    recovery_history: Tuple[Mapping[str, Any], ...]
+
+    def to_dict(self) -> Mapping[str, Any]:
+        return asdict(self)
 
 
 class OrcaCoordinator:
@@ -185,6 +213,115 @@ class OrcaCoordinator:
     def inspect(self) -> OrcaCoordinatorSnapshot:
         with self._locked():
             return self._snapshot(self._store.read())
+
+    def inspect_effects(self) -> Tuple[OrcaEffectRecovery, ...]:
+        with self._locked():
+            if self._store.exists():
+                self._store.read()
+            return tuple(
+                self._effect_recovery(receipt)
+                for receipt in self._effects.inspect_all()
+            )
+
+    def reconcile_effect(
+        self, effect_id: str, *, actor: str
+    ) -> OrcaEffectRecovery:
+        if not isinstance(actor, str) or not actor.strip() or len(actor) > 128:
+            raise ContractViolation("Orca effect reconcile actor cannot be empty")
+        with self._locked():
+            state = self._store.read()
+            receipt = self._effects.inspect(effect_id)
+            if receipt is None:
+                raise ContractViolation(f"Orca effect does not exist: {effect_id}")
+            recovery = self._effect_recovery(receipt)
+            if recovery.status == "completed":
+                return recovery
+            if not recovery.automatic_reconcile:
+                raise EffectIndeterminateError(
+                    f"Orca {recovery.action} effect cannot be queried; inspect and reset it explicitly"
+                )
+
+            def reconcile(_receipt):
+                if recovery.action == "merge":
+                    return self._reconcile_merge(
+                        state, recovery.identity, _receipt
+                    )
+                backend_reconcile = getattr(self.backend, "reconcile_effect", None)
+                if not callable(backend_reconcile):
+                    return None
+                return backend_reconcile(
+                    recovery.action,
+                    recovery.identity,
+                    receipt.payload_digest,
+                )
+
+            try:
+                result = self._effects.reconcile(effect_id, reconcile)
+            except Exception as error:
+                self._emit(
+                    state,
+                    "orca_effect_reconcile_failed",
+                    payload={
+                        "effect_id": effect_id,
+                        "action": recovery.action,
+                        "actor": actor.strip(),
+                        "reason": f"{type(error).__name__}: {error}",
+                    },
+                )
+                self._save(state)
+                raise
+            if recovery.action == "merge":
+                self._apply_reconciled_merge(state, recovery.identity, result)
+                self._save(state)
+            self._emit(
+                state,
+                "orca_effect_reconciled",
+                payload={
+                    "effect_id": effect_id,
+                    "action": recovery.action,
+                    "actor": actor.strip(),
+                },
+            )
+            self._save(state)
+            refreshed = self._effects.inspect(effect_id)
+            assert refreshed is not None
+            return self._effect_recovery(refreshed)
+
+    def reset_effect(
+        self,
+        effect_id: str,
+        *,
+        actor: str,
+        reason: str,
+        receipt_digest: str,
+    ) -> OrcaEffectRecovery:
+        with self._locked():
+            state = self._store.read()
+            existing = self._effects.inspect(effect_id)
+            if existing is None:
+                raise ContractViolation(f"Orca effect does not exist: {effect_id}")
+            recovery = self._effect_recovery(existing)
+            reset = self._effects.reset(
+                effect_id,
+                actor=actor,
+                reason=reason,
+                expected_receipt_digest=receipt_digest,
+            )
+            if reset == existing:
+                return self._effect_recovery(reset)
+            self._emit(
+                state,
+                "orca_effect_reset",
+                payload={
+                    "effect_id": effect_id,
+                    "action": recovery.action,
+                    "actor": actor.strip(),
+                    "reason": reason.strip(),
+                    "old_receipt_digest": receipt_digest,
+                },
+            )
+            self._save(state)
+            return self._effect_recovery(reset)
 
     def cancel(self) -> OrcaCoordinatorSnapshot:
         with self._locked():
@@ -1137,7 +1274,10 @@ class OrcaCoordinator:
             raise ContractViolation(f"Orca {action} effect identity cannot be empty")
         digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
         return self._effects.execute(
-            f"orca-{action}-{digest[:32]}", payload, effect
+            f"orca-{action}-{digest[:32]}",
+            payload,
+            effect,
+            recovery_context={"action": action, "identity": identity},
         )
 
     def _reconcilable_effect(
@@ -1147,8 +1287,145 @@ class OrcaCoordinator:
             raise ContractViolation(f"Orca {action} effect identity cannot be empty")
         digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
         return self._effects.execute_reconcilable(
-            f"orca-{action}-{digest[:32]}", payload, effect, reconcile
+            f"orca-{action}-{digest[:32]}",
+            payload,
+            effect,
+            reconcile,
+            recovery_context={
+                "action": action,
+                "identity": identity,
+                "payload": payload,
+            },
         )
+
+    def _effect_recovery(self, receipt) -> OrcaEffectRecovery:
+        context = receipt.recovery_context
+        action = None
+        identity = None
+        if isinstance(context, dict):
+            raw_action = context.get("action")
+            raw_identity = context.get("identity")
+            if raw_action in _ORCA_EFFECT_ACTIONS:
+                action = raw_action
+            if isinstance(raw_identity, str) and raw_identity:
+                identity = raw_identity
+        if action is None:
+            action = next(
+                (
+                    candidate
+                    for candidate in _ORCA_EFFECT_ACTIONS
+                    if receipt.key.startswith(f"orca-{candidate}-")
+                ),
+                "unknown",
+            )
+        backend_reconcile = callable(getattr(self.backend, "reconcile_effect", None))
+        automatic = action == "merge" or backend_reconcile
+        if receipt.status == "completed":
+            next_action = "none"
+        elif receipt.status == "reset":
+            next_action = "retry"
+        elif automatic:
+            next_action = "reconcile"
+        else:
+            next_action = "reset"
+        return OrcaEffectRecovery(
+            receipt.key,
+            action,
+            identity,
+            receipt.status,
+            receipt.payload_digest,
+            self._effects.receipt_digest(receipt),
+            automatic,
+            next_action,
+            receipt.error,
+            receipt.recovery_history,
+        )
+
+    def _reconcile_merge(
+        self,
+        state: Mapping[str, Any],
+        identity: Optional[str],
+        effect_receipt,
+    ) -> Optional[Mapping[str, Any]]:
+        if identity is None or self._merger is None:
+            return None
+        item = state["merge_candidates"].get(identity)
+        if not isinstance(item, dict):
+            return None
+        candidate = MergeCandidate.from_dict(item["candidate"])
+        verifier = self.graph.node_map()[candidate.verifier_node_id]
+        context = effect_receipt.recovery_context
+        payload = context.get("payload") if isinstance(context, dict) else None
+        if not isinstance(payload, dict):
+            return None
+        try:
+            input_records = tuple(
+                ArtifactRecord.from_dict(value)
+                for value in payload["verifier_inputs"]
+            )
+            output_records = tuple(
+                ArtifactRecord.from_dict(value)
+                for value in payload["verifier_outputs"]
+            )
+            attempt = int(payload["verifier_attempt"])
+        except (KeyError, TypeError, ValueError, ContractViolation):
+            return None
+        if (
+            payload.get("candidate") != candidate.to_dict()
+            or payload.get("verifier_node_id") != verifier.id
+        ):
+            return None
+        receipt = self._merger.reconcile(
+            candidate,
+            verifier,
+            attempt,
+            payload.get("gate_resolution"),
+            input_records,
+            output_records,
+        )
+        return None if receipt is None else receipt.to_dict()
+
+    def _apply_reconciled_merge(
+        self,
+        state: Dict[str, Any],
+        identity: Optional[str],
+        value: Any,
+    ) -> None:
+        if identity is None or not isinstance(value, dict):
+            raise ContractViolation("reconciled merge returned no audit receipt")
+        item = state["merge_candidates"].get(identity)
+        if not isinstance(item, dict):
+            raise ContractViolation("reconciled merge candidate is missing")
+        candidate = MergeCandidate.from_dict(item["candidate"])
+        receipt = MergeReceipt.from_dict(value)
+        if receipt.candidate_id != candidate.candidate_id:
+            raise ContractViolation("reconciled merge receipt identity mismatch")
+        item["status"] = receipt.status
+        item["receipt"] = receipt.to_dict()
+        self._emit(
+            state,
+            (
+                "change_set_merged"
+                if receipt.status == "merged"
+                else "change_set_merge_rejected"
+            ),
+            candidate.verifier_node_id,
+            int(state["attempts"][candidate.verifier_node_id]),
+            {
+                "candidate_id": candidate.candidate_id,
+                "source_node_id": candidate.source_node_id,
+                "target_branch": candidate.target_branch,
+                "target_before": receipt.target_before,
+                "target_after": receipt.target_after,
+                "merge_commit": receipt.merge_commit,
+                "verification_id": receipt.authorization.get("verification_id"),
+                "gate": receipt.authorization.get("gate"),
+                "reason": receipt.reason,
+            },
+        )
+        if receipt.status == "merged":
+            self._save(state)
+            self._release_merged_workspace(item, candidate)
 
     def _emit(
         self,

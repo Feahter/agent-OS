@@ -5,6 +5,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Protocol
 
+from ._store import append_jsonl
+from .errors import ContractViolation
+
 
 @dataclass(frozen=True)
 class GraphEvent:
@@ -50,13 +53,26 @@ class JsonlEventSink:
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def emit(self, event: GraphEvent) -> None:
-        line = json.dumps(event.to_dict(), ensure_ascii=False, sort_keys=True)
         with self._lock:
-            with self.path.open("a", encoding="utf-8") as handle:
-                handle.write(line + "\n")
+            append_jsonl(self.path, event.to_dict(), label="graph event")
 
     def read(self) -> Iterable[Mapping[str, Any]]:
         if not self.path.exists():
             return ()
-        with self.path.open(encoding="utf-8") as handle:
-            return tuple(json.loads(line) for line in handle if line.strip())
+        try:
+            lines = self.path.read_text(encoding="utf-8").splitlines(keepends=True)
+        except (OSError, UnicodeError) as error:
+            raise ContractViolation(f"invalid graph event log: {error}") from error
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            lines.pop()
+        records = []
+        for line_number, line in enumerate(lines, start=1):
+            if not line.strip():
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError as error:
+                raise ContractViolation(
+                    f"invalid graph event log at line {line_number}: {error}"
+                ) from error
+        return tuple(records)

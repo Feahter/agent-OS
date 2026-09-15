@@ -370,6 +370,23 @@ class EngineeringTests(unittest.TestCase):
             workflow.execute("operator", plan.digest)
         self.assertEqual("failed", workflow.status()["phase"])
 
+    def test_recovery_cannot_accept_a_previously_modified_protected_path(self):
+        protected = self.workspace / "guard.txt"
+        protected.write_text("rules", encoding="utf-8")
+
+        def modify(_request):
+            protected.write_text("changed", encoding="utf-8")
+
+        workflow, _, plan = self.prepared(
+            scripts={"implement": [modify]},
+            policy=self.policy(protected_paths=("guard.txt",)),
+        )
+        with self.assertRaisesRegex(ContractViolation, "protected paths changed"):
+            workflow.execute("operator", plan.digest)
+
+        with self.assertRaises(EffectIndeterminateError):
+            workflow.execute("operator", plan.digest)
+
     def test_linked_worktree_git_metadata_and_pointer_are_protected(self):
         repository = self.root / "repository"
         linked = self.root / "linked"

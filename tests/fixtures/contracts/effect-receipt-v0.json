@@ -1,0 +1,11 @@
+{
+  "error": null,
+  "key": "legacy-effect",
+  "payload_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "recovery_context": null,
+  "recovery_history": [],
+  "result": {
+    "ok": true
+  },
+  "status": "completed"
+}

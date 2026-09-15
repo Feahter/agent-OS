@@ -1,0 +1,14 @@
+{
+  "cancel_requested": false,
+  "error": null,
+  "generation": 1,
+  "graph_id": "legacy-graph",
+  "heartbeat_at": null,
+  "lease_expires_at": null,
+  "lease_token_digest": null,
+  "owner_id": null,
+  "phase": "queued",
+  "result": null,
+  "run_id": "legacy-run",
+  "submitted_at": 100.0
+}

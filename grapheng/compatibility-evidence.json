@@ -46,6 +46,13 @@
         "validated_at": "2026-09-14T03:39:21Z",
         "version": "2.1.270",
         "version_source": "installed claude --version"
+      },
+      {
+        "inspection": "installed Darwin arm64 CLI --version and --help only; all required non-interactive flags including --effort and --safe-mode present; no model call",
+        "protocol": "json-envelope-v1",
+        "validated_at": "2026-09-15T02:54:10Z",
+        "version": "2.1.272",
+        "version_source": "installed claude --version"
       }
     ],
     "codex": [

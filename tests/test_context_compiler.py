@@ -162,6 +162,58 @@ class ContextCompilerTests(unittest.TestCase):
                 fingerprints.add(compiled.fingerprint)
         self.assertEqual(3, len(fingerprints))
 
+    def test_reads_projection_omits_undeclared_large_artifacts_before_budgeting(self):
+        graph = GraphSpec.from_dict(
+            {
+                "id": "context-reads-projection",
+                "require_reality_anchor": False,
+                "nodes": [
+                    {
+                        "id": "seed",
+                        "kind": "seed",
+                        "writes": ["question", "unused"],
+                    },
+                    {
+                        "id": "answer",
+                        "kind": "agent",
+                        "deps": ["seed"],
+                        "reads": ["question"],
+                        "writes": ["answer"],
+                        "agent": {
+                            "executor": "memory",
+                            "prompt": "Answer the task",
+                        },
+                    },
+                ],
+            }
+        )
+        memory = MemoryExecutor()
+        executors = ExecutorRegistry()
+        executors.register(memory)
+        nodes = NodeRegistry()
+        nodes.register(
+            "seed",
+            lambda context: {
+                "question": "small",
+                "unused": "x" * 2048,
+            },
+        )
+        nodes.register("agent", AgentNodeHandler(graph, executors, self.workspace))
+
+        result = GraphRuntime(
+            graph,
+            nodes,
+            work_dir=self.workspace / "projection-state",
+        ).run()
+
+        self.assertTrue(result.success)
+        compiled = self.compiler.compile(
+            memory.requests[0],
+            ContextPolicy(max_context_bytes=1024, output_contract="provider_schema"),
+        )
+        self.assertEqual({"question": "small"}, memory.requests[0].inputs)
+        self.assertLess(compiled.total_bytes, 1024)
+
     def test_budget_overflow_fails_without_truncating_or_starting_adapter(self):
         request = self.request(inputs={"payload": "x" * 2048})
         with self.assertRaises(ContextBudgetExceeded) as raised:

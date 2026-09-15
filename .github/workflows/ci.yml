@@ -7,6 +7,9 @@ on:
 permissions:
   contents: read
 
+env:
+  UV_PYTHON_DOWNLOADS: never
+
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -15,14 +18,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install
-        run: python -m pip install . ruff mypy pytest
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.17"
+      - name: Verify lockfile
+        run: uv lock --check
+      - name: Install locked development environment
+        run: uv sync --frozen --only-group dev --python 3.12
       - name: Ruff
-        run: python -m ruff check .
+        run: uv run --frozen --python 3.12 python -m ruff check .
       - name: Mypy
-        run: python -m mypy
+        run: uv run --frozen --python 3.12 python -m mypy
       - name: Shared durable-state primitives are not re-implemented
-        run: python scripts/check_shared_primitives.py
+        run: uv run --frozen --python 3.12 python scripts/check_shared_primitives.py
 
   package:
     runs-on: ubuntu-latest
@@ -31,10 +39,26 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.17"
+      - name: Verify lockfile
+        run: uv lock --check
+      - name: Install locked build environment
+        run: uv sync --frozen --only-group build --no-install-project --python 3.12
       - name: Build wheel and source distribution
+        run: uv build --no-build-isolation --python .venv/bin/python
+      - name: Generate SBOM and release checksums
         run: |
-          python -m pip install build
-          python -m build
+          python scripts/generate_sbom.py \
+            --lock uv.lock \
+            --dist dist \
+            --output dist/agent-os.cdx.json \
+            --checksums dist/SHA256SUMS \
+            --project-name graph-engineering-agent-os \
+            --project-version 0.0.1 \
+            --source-commit "$GITHUB_SHA" \
+            --source-repository "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
       - name: Verify source distribution contents
         run: |
           python - <<'PY'
@@ -98,6 +122,12 @@ jobs:
           agent-os demo "$GITHUB_WORKSPACE/examples/minimal_graph.json" \
             --work-dir "$RUNNER_TEMP/agent-os-demo"
           agent-os agent-os rehearse --root "$RUNNER_TEMP/agent-os-home/state"
+      - name: Preserve package and supply-chain evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-evidence
+          path: dist/
+          if-no-files-found: error
 
   test:
     runs-on: ${{ matrix.os }}
@@ -111,9 +141,35 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install
-        run: python -m pip install . pytest
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.17"
+      - name: Install locked development environment
+        run: uv sync --frozen --only-group dev --python "${{ matrix.python-version }}"
       - name: Test
-        run: python -m pytest -q
+        run: uv run --frozen --python "${{ matrix.python-version }}" python -m pytest -q
       - name: Compile
-        run: python -m compileall -q grapheng tests
+        run: uv run --frozen --python "${{ matrix.python-version }}" python -m compileall -q grapheng tests
+
+  safety-evidence:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.17"
+      - name: Install locked development environment
+        run: uv sync --frozen --only-group dev --python 3.12
+      - name: Collect branch coverage
+        run: uv run --frozen --python 3.12 python -m coverage run -m pytest -q
+      - name: Enforce high-risk branch floors
+        run: |
+          uv run --frozen --python 3.12 python -m coverage report \
+            --include='grapheng/control.py,grapheng/runtime.py,grapheng/engineering.py,grapheng/resident.py,grapheng/coordinator.py'
+          uv run --frozen --python 3.12 python -m coverage json -o coverage.json
+          uv run --frozen --python 3.12 python scripts/check_high_risk_coverage.py coverage.json
+      - name: Critical safety mutations are killed
+        run: uv run --frozen --python 3.12 python scripts/check_safety_mutations.py

@@ -1,13 +1,13 @@
 import json
-import os
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Mapping, Optional, Tuple
 
+from ._store import atomic_json_write
 from .agents import ModelUsage
 from .artifacts import ArtifactRecord
 from .errors import ContractViolation
+from .schemas import CHECKPOINT_SCHEMA_VERSION, CheckpointDocumentV1
 
 
 @dataclass(frozen=True)
@@ -22,8 +22,9 @@ class Checkpoint:
     artifacts: Tuple[ArtifactRecord, ...]
     usage: ModelUsage = field(default_factory=ModelUsage.no_call)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> CheckpointDocumentV1:
         return {
+            "schema_version": CHECKPOINT_SCHEMA_VERSION,
             "graph_id": self.graph_id,
             "graph_fingerprint": self.graph_fingerprint,
             "run_id": self.run_id,
@@ -37,6 +38,12 @@ class Checkpoint:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "Checkpoint":
+        schema_version = value.get("schema_version", 0)
+        if (
+            isinstance(schema_version, bool)
+            or schema_version not in (0, CHECKPOINT_SCHEMA_VERSION)
+        ):
+            raise ContractViolation("unsupported checkpoint schema")
         tokens_used = int(value["tokens_used"])
         cost_usd = float(value.get("cost_usd", 0.0))
         usage = ModelUsage.from_persisted(
@@ -74,14 +81,4 @@ class CheckpointStore:
             raise ContractViolation(f"invalid checkpoint: {error}") from error
 
     def save(self, checkpoint: Checkpoint) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, temporary = tempfile.mkstemp(prefix=f".{self.path.name}.", dir=str(self.path.parent))
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                json.dump(checkpoint.to_dict(), handle, ensure_ascii=False, sort_keys=True)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, self.path)
-        finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
+        atomic_json_write(self.path, checkpoint.to_dict(), label="checkpoint")

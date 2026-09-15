@@ -81,14 +81,9 @@ def json_digest(value: Any, *, label: str = "value") -> Tuple[Any, str]:
 
 
 def _fsync_directory(directory: Path) -> None:
-    try:
-        descriptor = os.open(str(directory), os.O_RDONLY)
-    except OSError:
-        return
+    descriptor = os.open(str(directory), os.O_RDONLY)
     try:
         os.fsync(descriptor)
-    except OSError:
-        pass
     finally:
         os.close(descriptor)
 
@@ -153,15 +148,22 @@ def exclusive_json_write(path: Path, value: Any, *, label: str = "value") -> Non
 
 
 def append_jsonl(path: Path, value: Any, *, label: str = "event") -> None:
-    """Append one canonical JSON line to ``path`` and flush it to disk."""
+    """Durably append one canonical JSON line to ``path``.
+
+    A file ``fsync`` commits the line. When this call creates the file, a
+    directory ``fsync`` also commits the new directory entry.
+    """
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    line = encode_json(value, label=label) + "\n"
-    with path.open("a", encoding="utf-8") as handle:
+    created = not path.exists()
+    line = (encode_json(value, label=label) + "\n").encode("utf-8")
+    with path.open("ab") as handle:
         handle.write(line)
         handle.flush()
         os.fsync(handle.fileno())
+    if created:
+        _fsync_directory(path.parent)
 
 
 def read_json(

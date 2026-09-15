@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import grapheng.tasks as tasks_module
 from grapheng import (
     AgentExecutionError,
     AgentOS,
@@ -21,6 +22,7 @@ from grapheng import (
     UserTaskModule,
 )
 from grapheng.cli import _print_user_task, main
+from grapheng.durable_outbox import DurableOutbox
 
 
 class TaskExecutor:
@@ -410,10 +412,14 @@ class UserTaskModuleTests(unittest.TestCase):
         )
         self.assertIn("priority 12", output.getvalue())
 
-    def test_background_start_failure_rolls_back_approval_before_queueing(self):
+    def test_background_start_failure_preserves_durable_queued_work(self):
         task_id = "task-2222222222222222"
         resident = Mock()
         resident.inspect.return_value = None
+        resident.submit.return_value = {
+            "job_id": f"engineering:{task_id}",
+            "state": "queued",
+        }
         resident.start_background.side_effect = ContractViolation(
             "resident coordinator did not start"
         )
@@ -423,9 +429,164 @@ class UserTaskModuleTests(unittest.TestCase):
         with self.assertRaisesRegex(ContractViolation, "did not start"):
             tasks.approve(task_id, "operator", background=True)
 
-        self.assertEqual("awaiting_approval", tasks.status(task_id)["phase"])
-        self.assertFalse((tasks.tasks_root / task_id / "approval.json").exists())
-        resident.submit.assert_not_called()
+        self.assertEqual("queued", tasks.status(task_id)["phase"])
+        self.assertTrue((tasks.tasks_root / task_id / "approval.json").exists())
+        resident.submit.assert_called_once()
+
+    def test_background_enqueue_recovers_when_ack_is_lost(self):
+        task_id = "task-3333333333333333"
+        holder = {}
+        home = self.root / "outbox-home"
+        resident = ResidentCoordinator(
+            home,
+            task_module_factory=lambda: holder["tasks"],
+            clock=lambda: 100.0,
+        )
+        resident.start_background = Mock()
+        tasks = UserTaskModule(
+            home,
+            workflow_factory=self.module()._workflow_factory,
+            resident_factory=lambda: resident,
+            clock=lambda: 100.0,
+            id_factory=lambda: task_id,
+        )
+        holder["tasks"] = tasks
+        tasks.do("Prepare a safe change", self.workspace)
+
+        with patch.object(
+            DurableOutbox,
+            "acknowledge",
+            side_effect=RuntimeError("crash after queue commit"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "queue commit"):
+                tasks.approve(task_id, "operator", background=True, priority=9)
+
+        scheduled = resident.inspect(task_id)
+        pending = DurableOutbox(tasks.tasks_root / task_id).pending()
+        self.assertEqual("queued", scheduled["state"])
+        self.assertEqual(1, len(pending))
+        self.assertEqual("queued", tasks.execution_phase(task_id))
+
+        tasks.reconcile_outbox(task_id, resident=resident)
+        queue = json.loads(resident.queue_path.read_text(encoding="utf-8"))
+        self.assertEqual(1, len(queue["items"]))
+        self.assertEqual((), DurableOutbox(tasks.tasks_root / task_id).pending())
+        resident.start_background.assert_not_called()
+
+    def test_background_enqueue_recovers_at_each_delivery_boundary(self):
+        for index, boundary in enumerate(("approval.json", "status.json", "queue")):
+            with self.subTest(boundary=boundary):
+                task_id = f"task-444444444444444{index}"
+                holder = {}
+                home = self.root / f"boundary-home-{index}"
+                resident = ResidentCoordinator(
+                    home,
+                    task_module_factory=lambda holder=holder: holder["tasks"],
+                    clock=lambda: 100.0,
+                )
+                resident.start_background = Mock()
+                tasks = UserTaskModule(
+                    home,
+                    workflow_factory=self.module()._workflow_factory,
+                    resident_factory=lambda resident=resident: resident,
+                    clock=lambda: 100.0,
+                    id_factory=lambda task_id=task_id: task_id,
+                )
+                holder["tasks"] = tasks
+                tasks.do("Prepare a safe change", self.workspace)
+
+                if boundary == "queue":
+                    failure = patch.object(
+                        resident,
+                        "submit",
+                        side_effect=RuntimeError("crash at queue"),
+                    )
+                else:
+                    original_write = tasks_module.atomic_json_write
+                    failed = False
+
+                    def fail_once(
+                        path,
+                        value,
+                        boundary=boundary,
+                        original_write=original_write,
+                        **kwargs,
+                    ):
+                        nonlocal failed
+                        if Path(path).name == boundary and not failed:
+                            failed = True
+                            raise RuntimeError(f"crash at {boundary}")
+                        return original_write(path, value, **kwargs)
+
+                    failure = patch.object(
+                        tasks_module, "atomic_json_write", side_effect=fail_once
+                    )
+                with failure:
+                    with self.assertRaisesRegex(RuntimeError, "crash at"):
+                        tasks.approve(
+                            task_id,
+                            "operator",
+                            background=True,
+                            priority=3,
+                        )
+
+                self.assertEqual(
+                    1, len(DurableOutbox(tasks.tasks_root / task_id).pending())
+                )
+                tasks.reconcile_outbox(task_id, resident=resident)
+
+                queue = json.loads(resident.queue_path.read_text(encoding="utf-8"))
+                self.assertEqual(1, len(queue["items"]))
+                self.assertEqual("queued", resident.inspect(task_id)["state"])
+                self.assertEqual("queued", tasks.execution_phase(task_id))
+                self.assertTrue(
+                    (tasks.tasks_root / task_id / "approval.json").is_file()
+                )
+                self.assertEqual(
+                    (), DurableOutbox(tasks.tasks_root / task_id).pending()
+                )
+
+    def test_pause_and_cancel_intents_resume_after_ack_loss(self):
+        task_id = "task-5555555555555555"
+        holder = {}
+        home = self.root / "control-outbox-home"
+        resident = ResidentCoordinator(
+            home,
+            task_module_factory=lambda: holder["tasks"],
+            clock=lambda: 100.0,
+        )
+        resident.start_background = Mock()
+        tasks = UserTaskModule(
+            home,
+            workflow_factory=self.module()._workflow_factory,
+            resident_factory=lambda: resident,
+            clock=lambda: 100.0,
+            id_factory=lambda: task_id,
+        )
+        holder["tasks"] = tasks
+        tasks.do("Prepare a safe change", self.workspace)
+        tasks.approve(task_id, "operator", background=True)
+
+        for action, expected in (("pause", "paused"), ("cancel", "cancelled")):
+            if action == "cancel":
+                tasks.control(task_id, "resume", "operator")
+            with patch.object(
+                DurableOutbox,
+                "acknowledge",
+                side_effect=RuntimeError(f"crash after {action} acknowledgment"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "acknowledgment"):
+                    tasks.control(task_id, action, "operator")
+
+            self.assertEqual(expected, resident.inspect(task_id)["state"])
+            self.assertEqual(
+                1, len(DurableOutbox(tasks.tasks_root / task_id).pending())
+            )
+            tasks.reconcile_outbox(task_id, resident=resident)
+            self.assertEqual(expected, tasks.execution_phase(task_id))
+            self.assertEqual(
+                (), DurableOutbox(tasks.tasks_root / task_id).pending()
+            )
 
     def test_background_task_pauses_and_resumes_without_repeating_mutation(self):
         task_id = "task-fedcba9876543210"

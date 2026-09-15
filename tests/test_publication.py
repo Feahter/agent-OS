@@ -61,7 +61,9 @@ def publication_graph(with_overwrite=False, mutating=False):
                 "prompt": "Answer precisely",
                 "reuse_scope": "tenant-a",
                 "tools": ["write"] if mutating else [],
+                "workspace": {"mode": "shared"},
             },
+            "effect": "verified_idempotent" if mutating else "read_only",
         },
     ]
     dependency = "answer"
@@ -260,6 +262,12 @@ class PublicationTests(unittest.TestCase):
                 graph,
                 registry,
                 work_dir=work_dir,
+                effect_lease={
+                    "run_id": "run-mutating",
+                    "owner_id": "test-owner",
+                    "generation": 1,
+                    "token_digest": "a" * 64,
+                },
                 verified_result_publisher=VerifiedResultPublisher(
                     cache, work_dir / "verified-publications.json"
                 ),

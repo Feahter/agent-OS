@@ -1,6 +1,7 @@
 import json
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -190,6 +191,37 @@ class ResidentCoordinatorTests(unittest.TestCase):
         self.assertEqual([high, low], self.tasks.executed)
         self.assertEqual("succeeded", restored.inspect(high)["state"])
         self.assertEqual(1, restored.inspect(high)["attempts"])
+
+    def test_enqueue_intent_is_idempotent_after_ack_is_lost(self):
+        task_id = "task-0000000000000014"
+
+        first = self.coordinator.submit(
+            task_id, priority=7, intent_id="enqueue-0000000000000014"
+        )
+        replayed = self.coordinator.submit(
+            task_id, priority=7, intent_id="enqueue-0000000000000014"
+        )
+
+        self.assertEqual(first, replayed)
+        self.assertEqual(1, first["sequence"])
+        queue = json.loads(self.coordinator.queue_path.read_text(encoding="utf-8"))
+        self.assertEqual(1, len(queue["items"]))
+
+    def test_control_intent_replay_returns_the_existing_acknowledgment(self):
+        task_id = "task-0000000000000015"
+        self.coordinator.submit(
+            task_id, intent_id="enqueue-0000000000000015"
+        )
+
+        first = self.coordinator.request(
+            task_id, "pause", intent_id="control-0000000000000015"
+        )
+        replayed = self.coordinator.request(
+            task_id, "pause", intent_id="control-0000000000000015"
+        )
+
+        self.assertEqual(first, replayed)
+        self.assertEqual("paused", replayed["state"])
 
     def test_queued_jobs_gain_priority_while_waiting(self):
         clock = [0.0]
@@ -390,6 +422,147 @@ class ResidentCoordinatorTests(unittest.TestCase):
         self.assertFalse(coordinator.serve_once())
         self.assertEqual(calls_after_failure + 1, len(handler.inspections))
 
+    def test_successful_waiting_probes_do_not_rewrite_queue(self):
+        clock = [0.0]
+        handler = FakeJob()
+        handler.phases["waiting"] = "waiting"
+        coordinator = ResidentCoordinator(
+            self.root,
+            task_module_factory=lambda: self.tasks,
+            job_handlers={"graph": handler},
+            clock=lambda: clock[0],
+        )
+        coordinator.schedule("graph", "waiting")
+        self.assertTrue(coordinator.serve_once())
+        writes_after_settlement = coordinator._hot_path_snapshot()["counters"][
+            "queue_writes"
+        ]
+
+        for second in range(1, 6):
+            clock[0] = float(second)
+            self.assertFalse(coordinator.serve_once())
+
+        snapshot = coordinator._hot_path_snapshot()
+        self.assertEqual(
+            writes_after_settlement,
+            snapshot["counters"]["queue_writes"],
+        )
+        self.assertEqual(6, len(handler.inspections))
+
+    def test_continuously_failing_waiting_probe_is_bounded_per_minute(self):
+        clock = [0.0]
+        handler = FaultInjectingJob()
+        handler.phases["broken"] = "waiting"
+        coordinator = ResidentCoordinator(
+            self.root,
+            task_module_factory=lambda: self.tasks,
+            job_handlers={"graph": handler},
+            clock=lambda: clock[0],
+        )
+        coordinator.schedule("graph", "broken")
+        self.assertTrue(coordinator.serve_once())
+        handler.probe_failures.add("broken")
+        failures = 0
+        clock[0] = 1.0
+
+        while clock[0] <= 60.0:
+            before = len(handler.inspections)
+            self.assertFalse(coordinator.serve_once())
+            failures += len(handler.inspections) - before
+            item = coordinator.inspect_job("graph", "broken")
+            next_probe_at = item["next_probe_at"]
+            if next_probe_at is None or next_probe_at > 60.0:
+                break
+            clock[0] = next_probe_at
+
+        self.assertLessEqual(failures, 4)
+
+    def test_idle_resident_does_not_rewrite_queue(self):
+        writes = self.coordinator._hot_path_snapshot()["counters"]["queue_writes"]
+
+        for _ in range(100):
+            self.assertFalse(self.coordinator.serve_once())
+
+        snapshot = self.coordinator._hot_path_snapshot()
+        self.assertEqual(writes, snapshot["counters"]["queue_writes"])
+
+    def test_event_driven_idle_timeout_uses_next_recovery_sweep(self):
+        monotonic_now = time.monotonic()
+        self.coordinator._metrics_flush_at = monotonic_now + 60.0
+        self.coordinator._archive_sweep_at = monotonic_now + 3600.0
+        self.coordinator._outbox_sweep_at = monotonic_now + 5.0
+
+        event_driven = self.coordinator._next_wake_timeout(event_driven=True)
+        polling_fallback = self.coordinator._next_wake_timeout(
+            event_driven=False
+        )
+
+        self.assertGreater(event_driven, self.coordinator._poll_seconds * 10)
+        self.assertLessEqual(event_driven, 5.0)
+        self.assertLessEqual(polling_fallback, self.coordinator._poll_seconds)
+
+    def test_event_driven_timeout_uses_nearest_waiting_probe(self):
+        clock = [0.0]
+        handler = FakeJob()
+        handler.phases["waiting"] = "waiting"
+        coordinator = ResidentCoordinator(
+            self.root,
+            task_module_factory=lambda: self.tasks,
+            job_handlers={"graph": handler},
+            clock=lambda: clock[0],
+        )
+        coordinator.schedule("graph", "waiting")
+        self.assertTrue(coordinator.serve_once())
+
+        timeout = coordinator._next_wake_timeout(event_driven=True)
+
+        self.assertAlmostEqual(1.0, timeout, delta=0.05)
+
+    def test_schedule_notifies_cross_instance_wakeup_channel(self):
+        with (
+            patch.object(Path, "is_socket", return_value=True),
+            patch("grapheng.resident.socket.socket") as socket_factory,
+        ):
+            client = socket_factory.return_value.__enter__.return_value
+
+            self.coordinator.submit("task-0000000000000016")
+
+        client.sendto.assert_called_once_with(
+            b"wake", str(self.coordinator.wakeup_path)
+        )
+
+    def test_control_notifies_cross_instance_wakeup_channel(self):
+        task_id = "task-0000000000000017"
+        self.coordinator.submit(task_id)
+        with (
+            patch.object(Path, "is_socket", return_value=True),
+            patch("grapheng.resident.socket.socket") as socket_factory,
+        ):
+            client = socket_factory.return_value.__enter__.return_value
+
+            self.coordinator.request(task_id, "reprioritize", priority=10)
+
+        client.sendto.assert_called_once_with(
+            b"wake", str(self.coordinator.wakeup_path)
+        )
+
+    def test_unavailable_wakeup_channel_falls_back_without_failing_daemon(self):
+        with (
+            patch("grapheng.resident.socket.socket", side_effect=OSError("blocked")),
+            patch("grapheng.resident.telemetry.emit") as emit,
+        ):
+            with self.coordinator._wakeup_channel() as wakeup_socket:
+                self.assertIsNone(wakeup_socket)
+
+        emit.assert_called_once()
+
+    def test_wakeup_channel_rejects_non_socket_path(self):
+        self.coordinator.wakeup_path.write_text("not a socket", encoding="utf-8")
+
+        with self.assertRaisesRegex(ContractViolation, "must be a Unix socket"):
+            with self.coordinator._wakeup_channel():
+                pass
+
     def test_failure_recording_error_does_not_escape_daemon_loop(self):
         handler = FaultInjectingJob()
         handler.execute_failures.add("broken")
@@ -439,6 +612,60 @@ class ResidentCoordinatorTests(unittest.TestCase):
             release_telemetry.set()
             settling.join(timeout=1)
             reading.join(timeout=1)
+
+    def test_concurrent_cancel_and_status_complete_without_control_lock_stall(self):
+        task_id = "task-0000000000000015"
+        self.coordinator.submit(task_id)
+        start = threading.Barrier(3)
+        finished = []
+        failures = []
+
+        def cancel():
+            try:
+                start.wait(timeout=1)
+                self.coordinator.request(task_id, "cancel")
+                finished.append("cancel")
+            except Exception as error:
+                failures.append(error)
+
+        def status():
+            try:
+                start.wait(timeout=1)
+                item = self.coordinator.inspect(task_id)
+                self.assertIn(
+                    item["state"], {"queued", "cancel_requested", "cancelled"}
+                )
+                finished.append("status")
+            except Exception as error:
+                failures.append(error)
+
+        cancel_thread = threading.Thread(target=cancel)
+        status_thread = threading.Thread(target=status)
+        cancel_thread.start()
+        status_thread.start()
+        started = time.monotonic()
+        start.wait(timeout=1)
+        cancel_thread.join(timeout=1)
+        status_thread.join(timeout=1)
+
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertFalse(cancel_thread.is_alive())
+        self.assertFalse(status_thread.is_alive())
+        self.assertEqual([], failures)
+        self.assertCountEqual(["cancel", "status"], finished)
+
+    def test_late_nonterminal_projection_cannot_replace_terminal_settlement(self):
+        task_id = "task-0000000000000014"
+        scheduled = self.coordinator.submit(task_id)
+        job_id = scheduled["job_id"]
+
+        self.coordinator._settle(job_id, "succeeded", None)
+        self.coordinator._settle(job_id, "paused", "late pause projection")
+
+        item = self.coordinator.inspect(task_id)
+        self.assertEqual("succeeded", item["state"])
+        self.assertIsNone(item["requested_action"])
+        self.assertIsNone(item["error"])
 
     def test_v1_task_queue_migrates_without_losing_control_state(self):
         task_id = "task-0000000000000007"
@@ -551,6 +778,64 @@ class ResidentCoordinatorTests(unittest.TestCase):
 
         self.assertEqual("succeeded", coordinator.inspect_job("graph", run_id)["state"])
         self.assertEqual(["prepare", "release"], calls)
+
+    def test_graph_terminal_phase_wins_race_with_unacknowledged_pause(self):
+        def run_race(outcome):
+            home = self.root / f"graph-{outcome}"
+            workspace = home / "workspace"
+            workspace.mkdir(parents=True)
+            entered = threading.Event()
+            release = threading.Event()
+            probes = 0
+            graph = GraphSpec.from_dict(
+                {
+                    "id": f"resident-graph-{outcome}",
+                    "require_reality_anchor": False,
+                    "nodes": [
+                        {
+                            "id": "work",
+                            "kind": "agent",
+                            "writes": ["answer"],
+                            "agent": {"prompt": "work"},
+                        }
+                    ],
+                }
+            )
+
+            def registry_factory(value, root):
+                registry = NodeRegistry()
+
+                def execute(context):
+                    entered.set()
+                    if not release.wait(timeout=2):
+                        raise TimeoutError("test did not release graph node")
+                    if outcome == "failed":
+                        raise RuntimeError("expected graph failure")
+                    return {"answer": 42}
+
+                registry.register("agent", execute)
+                return registry
+
+            def control_probe():
+                nonlocal probes
+                probes += 1
+                self.assertTrue(entered.is_set())
+                if outcome == "cancelled" and probes == 1:
+                    return "cancel"
+                release.set()
+                return "pause"
+
+            catalog = ResidentJobCatalog(home, graph_registry_factory=registry_factory)
+            run_id = catalog.graph.prepare(graph, workspace)
+
+            return catalog.graph.execute(run_id, control_probe)
+
+        for outcome in ("succeeded", "failed", "cancelled"):
+            with self.subTest(outcome=outcome):
+                self.assertEqual(
+                    {"phase": outcome, "run_phase": outcome},
+                    run_race(outcome),
+                )
 
     def test_orca_completion_is_reconciled_after_queue_settlement_crash(self):
         workspace = self.root / "orca-workspace"

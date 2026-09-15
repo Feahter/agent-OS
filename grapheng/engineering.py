@@ -24,9 +24,7 @@ _ROLES = ("explore", "plan", "implement", "review", "repair")
 
 
 def _canonical_digest(value: Any) -> str:
-    encoded = json.dumps(
-        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    )
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
@@ -45,9 +43,7 @@ def _positive_int(value: Any, field: str) -> int:
     return value
 
 
-def _validated_usage(
-    value: Any, field: str, require_details: bool = False
-) -> Dict[str, Any]:
+def _validated_usage(value: Any, field: str, require_details: bool = False) -> Dict[str, Any]:
     required = {
         "agent_calls",
         "tokens_used",
@@ -79,9 +75,7 @@ def _validated_usage(
         or not math.isfinite(elapsed)
         or elapsed < 0
     ):
-        raise ContractViolation(
-            f"{field}.elapsed_seconds must be finite and non-negative"
-        )
+        raise ContractViolation(f"{field}.elapsed_seconds must be finite and non-negative")
     normalized = {
         "agent_calls": value["agent_calls"],
         "tokens_used": value["tokens_used"],
@@ -104,15 +98,11 @@ def _usage_from_record(value: Mapping[str, Any]) -> ModelUsage:
         value.get("usage"),
         int(value.get("tokens_used", 0)),
         float(value.get("cost_usd", 0.0)),
-        value.get("cost_complete")
-        if isinstance(value.get("cost_complete"), bool)
-        else None,
+        value.get("cost_complete") if isinstance(value.get("cost_complete"), bool) else None,
     )
 
 
-def _usage_record(
-    agent_calls: int, usage: ModelUsage, elapsed_seconds: float
-) -> Dict[str, Any]:
+def _usage_record(agent_calls: int, usage: ModelUsage, elapsed_seconds: float) -> Dict[str, Any]:
     return {
         "agent_calls": agent_calls,
         "tokens_used": usage.total_tokens or 0,
@@ -177,8 +167,7 @@ class ProjectPolicy:
         executors = self.role_executors or {}
         unknown = set(executors) - set(_ROLES)
         if unknown or any(
-            not isinstance(value, str) or not value.strip()
-            for value in executors.values()
+            not isinstance(value, str) or not value.strip() for value in executors.values()
         ):
             raise ContractViolation("engineering role_executors is invalid")
         object.__setattr__(self, "role_executors", dict(executors))
@@ -202,9 +191,7 @@ class ProjectPolicy:
         }
         unknown = set(value) - allowed
         if unknown:
-            raise ContractViolation(
-                f"engineering policy has unknown fields: {sorted(unknown)}"
-            )
+            raise ContractViolation(f"engineering policy has unknown fields: {sorted(unknown)}")
         if value.get("schema_version") != ENGINEERING_POLICY_SCHEMA_VERSION:
             raise ContractViolation("unsupported engineering policy schema_version")
         commands = value.get("check_commands")
@@ -407,6 +394,22 @@ class CheckResult:
         return {**asdict(self), "command": list(self.command), "passed": self.passed}
 
 
+@dataclass
+class _ExecutionSession:
+    plan: EngineeringPlan
+    intent: TaskIntent
+    instructions: Mapping[str, str]
+    started: float
+    protected: Mapping[str, str]
+    workspace_digest: str
+    state: Dict[str, Any]
+    last_execution_task: str = ""
+
+    @property
+    def mutation_allowed(self) -> bool:
+        return self.intent.mutation_allowed
+
+
 class _EngineeringPaused(Exception):
     pass
 
@@ -445,9 +448,7 @@ class EngineeringWorkflow:
         except ValueError:
             pass
         else:
-            raise ContractViolation(
-                "engineering task_dir must not contain the workspace"
-            )
+            raise ContractViolation("engineering task_dir must not contain the workspace")
         if agent_os_root is not None:
             resolved_agent_os_root = agent_os_root.resolve()
             try:
@@ -455,17 +456,13 @@ class EngineeringWorkflow:
             except ValueError:
                 pass
             else:
-                raise ContractViolation(
-                    "engineering task_dir must be outside the Agent OS root"
-                )
+                raise ContractViolation("engineering task_dir must be outside the Agent OS root")
             try:
                 resolved_agent_os_root.relative_to(self.task_dir)
             except ValueError:
                 pass
             else:
-                raise ContractViolation(
-                    "engineering task_dir must not contain the Agent OS root"
-                )
+                raise ContractViolation("engineering task_dir must not contain the Agent OS root")
         self.task_dir.mkdir(parents=True, exist_ok=True)
         self.executors = executors
         self.policy = policy
@@ -503,9 +500,7 @@ class EngineeringWorkflow:
             compiled_intent.project_kinds != ("legacy",)
             and compiled_intent.verification_commands != self.policy.check_commands
         ):
-            raise ContractViolation(
-                "task intent verification does not match engineering policy"
-            )
+            raise ContractViolation("task intent verification does not match engineering policy")
         self._require_uninitialized_task()
         if self.policy.max_agent_calls < 2:
             raise ContractViolation(
@@ -525,9 +520,7 @@ class EngineeringWorkflow:
             },
             ("exploration",),
             tools=("read",),
-            timeout_seconds=self._remaining_timeout(
-                started, self.policy.agent_timeout_seconds
-            ),
+            timeout_seconds=self._remaining_timeout(started, self.policy.agent_timeout_seconds),
         )
         proposal = self._agent_call(
             "plan",
@@ -540,18 +533,13 @@ class EngineeringWorkflow:
             },
             ("plan",),
             tools=("read",),
-            timeout_seconds=self._remaining_timeout(
-                started, self.policy.agent_timeout_seconds
-            ),
+            timeout_seconds=self._remaining_timeout(started, self.policy.agent_timeout_seconds),
         )
         self._require_time(started)
         preparation_results = (exploration, proposal)
         normalized_usage = ModelUsage.combine(
             tuple(
-                item.usage
-                or ModelUsage.from_legacy_constructor(
-                    item.tokens_used, item.cost_usd
-                )
+                item.usage or ModelUsage.from_legacy_constructor(item.tokens_used, item.cost_usd)
                 for item in preparation_results
             )
         )
@@ -587,12 +575,11 @@ class EngineeringWorkflow:
         )
         return plan
 
-    def execute(
+    def _start_execution(
         self,
         approved_by: str,
-        plan_digest: Optional[str] = None,
-        control_probe: Optional[Callable[[], Optional[str]]] = None,
-    ) -> Mapping[str, Any]:
+        plan_digest: Optional[str],
+    ) -> _ExecutionSession:
         if not isinstance(approved_by, str) or not approved_by.strip():
             raise ContractViolation("engineering execution requires approved_by")
         if not isinstance(plan_digest, str) or not plan_digest.strip():
@@ -607,9 +594,7 @@ class EngineeringWorkflow:
             compiled_intent.project_kinds != ("legacy",)
             and compiled_intent.verification_commands != self.policy.check_commands
         ):
-            raise ContractViolation(
-                "task intent verification does not match engineering policy"
-            )
+            raise ContractViolation("task intent verification does not match engineering policy")
         instructions = self._instructions()
         if plan.instructions_digest != _canonical_digest(instructions):
             raise ContractViolation("project instructions changed after planning")
@@ -621,7 +606,6 @@ class EngineeringWorkflow:
         started = self._monotonic()
         protected = self._protected_snapshot()
         execution_workspace_digest = self._workspace_fingerprint()
-        mutation_allowed = compiled_intent.mutation_allowed
         preparation_usage = _validated_usage(
             plan.preparation_usage,
             "engineering preparation_usage",
@@ -651,168 +635,228 @@ class EngineeringWorkflow:
             "reality_anchor": {"passed": False},
             "failure": None,
         }
-        last_execution_task = ""
         self._write_running_state(state)
-        try:
-            self._control_checkpoint(control_probe)
-            result = self._bounded_agent_call(
-                state,
-                started,
-                "implement",
-                (
-                    "Carry out the approved read-only research plan and return evidence-backed findings. Do not modify the workspace."
-                    if not mutation_allowed
-                    else "Implement the approved plan in small, reviewable changes. Obey project instructions and do not touch protected paths."
-                ),
-                {
-                    "task_intent": compiled_intent.to_dict(),
-                    "approved_plan": plan.plan,
-                    "exploration": plan.exploration,
-                    "project_instructions": instructions,
-                    "workspace_fingerprint": plan.workspace_digest,
-                },
-                ("implementation_summary",),
-                tools=(
-                    ("read", "shell", "edit", "write")
-                    if mutation_allowed
-                    else ("read", "shell")
-                ),
-                mutating=mutation_allowed,
-                effect_index=0,
+        return _ExecutionSession(
+            plan=plan,
+            intent=compiled_intent,
+            instructions=instructions,
+            started=started,
+            protected=protected,
+            workspace_digest=execution_workspace_digest,
+            state=state,
+        )
+
+    def execute(
+        self,
+        approved_by: str,
+        plan_digest: Optional[str] = None,
+        control_probe: Optional[Callable[[], Optional[str]]] = None,
+    ) -> Mapping[str, Any]:
+        session = self._start_execution(approved_by, plan_digest)
+        return self._run_execution_session(session, control_probe)
+
+    def _implement_execution(
+        self,
+        session: _ExecutionSession,
+        control_probe: Optional[Callable[[], Optional[str]]],
+    ) -> None:
+        self._control_checkpoint(control_probe)
+        result = self._bounded_agent_call(
+            session.state,
+            session.started,
+            "implement",
+            (
+                "Carry out the approved read-only research plan and return evidence-backed findings. Do not modify the workspace."
+                if not session.mutation_allowed
+                else "Implement the approved plan in small, reviewable changes. Obey project instructions and do not touch protected paths."
+            ),
+            {
+                "task_intent": session.intent.to_dict(),
+                "approved_plan": session.plan.plan,
+                "exploration": session.plan.exploration,
+                "project_instructions": session.instructions,
+                "workspace_fingerprint": session.plan.workspace_digest,
+            },
+            ("implementation_summary",),
+            tools=(
+                ("read", "shell", "edit", "write")
+                if session.mutation_allowed
+                else ("read", "shell")
+            ),
+            mutating=session.mutation_allowed,
+            effect_index=0,
+            effect_postcondition=(
+                lambda _value: self._assert_protected_unchanged(session.protected)
             )
-            last_execution_task = result["task_id"]
-            state["implementation"] = {
-                "task_id": result["task_id"],
-                "summary": result["outputs"]["implementation_summary"],
+            if session.mutation_allowed
+            else None,
+            effect_recovery_context={
+                "plan_digest": session.plan.digest,
+                "workspace_fingerprint": session.workspace_digest,
+                "protected_snapshot": dict(session.protected),
+            },
+        )
+        session.last_execution_task = result["task_id"]
+        session.state["implementation"] = {
+            "task_id": result["task_id"],
+            "summary": result["outputs"]["implementation_summary"],
+        }
+        if (
+            not session.mutation_allowed
+            and session.workspace_digest != self._workspace_fingerprint()
+        ):
+            raise ContractViolation("read-only research changed the workspace")
+        self._control_checkpoint(control_probe)
+
+    def _evaluate_execution_cycle(
+        self,
+        session: _ExecutionSession,
+        control_probe: Optional[Callable[[], Optional[str]]],
+    ) -> Optional[Mapping[str, Any]]:
+        state = session.state
+        checks = self._run_checks(session.started)
+        state["checks"].append(
+            {
+                "cycle": state["review_cycles"],
+                "results": [item.to_dict() for item in checks],
+                "passed": all(item.passed for item in checks),
             }
-            self._assert_protected_unchanged(protected)
-            if (
-                not mutation_allowed
-                and execution_workspace_digest != self._workspace_fingerprint()
-            ):
-                raise ContractViolation("read-only research changed the workspace")
-            self._control_checkpoint(control_probe)
+        )
+        self._write_running_state(state)
+        self._control_checkpoint(control_probe)
+        if not all(item.passed for item in checks):
+            if not session.mutation_allowed:
+                state["phase"] = "failed"
+                state["failure"] = "read_only_verification_failed"
+                return None
+            return {
+                "kind": "check_failure",
+                "checks": [item.to_dict() for item in checks if not item.passed],
+            }
+
+        review = self._bounded_agent_call(
+            state,
+            session.started,
+            "review",
+            "Independently review the approved plan, current workspace, and check evidence. Do not modify anything. Approve only when the implementation is correct and complete.",
+            {
+                "task_intent": session.intent.to_dict(),
+                "approved_plan": session.plan.plan,
+                "checks": [item.to_dict() for item in checks],
+                "project_instructions": session.instructions,
+                "workspace_fingerprint": self._workspace_fingerprint(),
+            },
+            ("verdict", "findings", "score"),
+            tools=("read",),
+        )
+        review_value = review["outputs"]
+        verdict = review_value.get("verdict")
+        findings = review_value.get("findings")
+        score = review_value.get("score")
+        if verdict not in ("approve", "changes_requested"):
+            raise ContractViolation("engineering reviewer returned an invalid verdict")
+        if not isinstance(findings, list):
+            raise ContractViolation("engineering reviewer findings must be an array")
+        if isinstance(score, bool) or not isinstance(score, (int, float)) or not 0 <= score <= 1:
+            raise ContractViolation("engineering reviewer score must be between zero and one")
+        state["reviews"].append(
+            {
+                "cycle": state["review_cycles"],
+                "task_id": review["task_id"],
+                **review_value,
+            }
+        )
+        self._write_running_state(state)
+        if verdict == "approve" and not findings:
+            state["success"] = True
+            state["phase"] = "succeeded"
+            state["reality_anchor"] = {
+                "passed": True,
+                "checks_passed": True,
+                "review_approved": True,
+                "review_task_id": review["task_id"],
+            }
+            if self.rsi_loop is not None and session.last_execution_task:
+                self.rsi_loop.feedback(
+                    session.last_execution_task,
+                    float(score),
+                    "engineering-independent-review",
+                )
+            return None
+        self._control_checkpoint(control_probe)
+        if not session.mutation_allowed:
+            state["phase"] = "failed"
+            state["failure"] = "read_only_review_rejected"
+            return None
+        return {
+            "kind": "review_findings",
+            "review_task_id": review["task_id"],
+            "findings": findings,
+        }
+
+    def _repair_execution(
+        self,
+        session: _ExecutionSession,
+        repair_input: Mapping[str, Any],
+        control_probe: Optional[Callable[[], Optional[str]]],
+    ) -> None:
+        state = session.state
+        repair = self._bounded_agent_call(
+            state,
+            session.started,
+            "repair",
+            "Repair only the reported check failures or review findings. Preserve correct work and do not touch protected paths.",
+            {
+                "task_intent": session.intent.to_dict(),
+                "approved_plan": session.plan.plan,
+                "repair_input": repair_input,
+                "project_instructions": session.instructions,
+                "workspace_fingerprint": self._workspace_fingerprint(),
+            },
+            ("repair_summary",),
+            tools=("read", "shell", "edit", "write"),
+            mutating=True,
+            effect_index=state["review_cycles"],
+            effect_postcondition=lambda _value: self._assert_protected_unchanged(session.protected),
+            effect_recovery_context={
+                "plan_digest": session.plan.digest,
+                "workspace_fingerprint": self._workspace_fingerprint(),
+                "protected_snapshot": dict(session.protected),
+            },
+        )
+        session.last_execution_task = repair["task_id"]
+        state["repairs"].append(
+            {
+                "cycle": state["review_cycles"],
+                "task_id": repair["task_id"],
+                "reason": repair_input["kind"],
+                "summary": repair["outputs"]["repair_summary"],
+            }
+        )
+        self._write_running_state(state)
+        self._control_checkpoint(control_probe)
+
+    def _run_execution_session(
+        self,
+        session: _ExecutionSession,
+        control_probe: Optional[Callable[[], Optional[str]]] = None,
+    ) -> Mapping[str, Any]:
+        state = session.state
+        try:
+            self._implement_execution(session, control_probe)
 
             while True:
-                self._require_time(started)
-                checks = self._run_checks(started)
-                state["checks"].append(
-                    {
-                        "cycle": state["review_cycles"],
-                        "results": [item.to_dict() for item in checks],
-                        "passed": all(item.passed for item in checks),
-                    }
-                )
-                self._write_running_state(state)
-                self._control_checkpoint(control_probe)
-                if not all(item.passed for item in checks):
-                    if not mutation_allowed:
-                        state["phase"] = "failed"
-                        state["failure"] = "read_only_verification_failed"
-                        break
-                    repair_input = {
-                        "kind": "check_failure",
-                        "checks": [item.to_dict() for item in checks if not item.passed],
-                    }
-                else:
-                    review = self._bounded_agent_call(
-                        state,
-                        started,
-                        "review",
-                        "Independently review the approved plan, current workspace, and check evidence. Do not modify anything. Approve only when the implementation is correct and complete.",
-                        {
-                            "task_intent": compiled_intent.to_dict(),
-                            "approved_plan": plan.plan,
-                            "checks": [item.to_dict() for item in checks],
-                            "project_instructions": instructions,
-                            "workspace_fingerprint": self._workspace_fingerprint(),
-                        },
-                        ("verdict", "findings", "score"),
-                        tools=("read",),
-                    )
-                    review_value = review["outputs"]
-                    verdict = review_value.get("verdict")
-                    findings = review_value.get("findings")
-                    score = review_value.get("score")
-                    if verdict not in ("approve", "changes_requested"):
-                        raise ContractViolation("engineering reviewer returned an invalid verdict")
-                    if not isinstance(findings, list):
-                        raise ContractViolation("engineering reviewer findings must be an array")
-                    if (
-                        isinstance(score, bool)
-                        or not isinstance(score, (int, float))
-                        or not 0 <= score <= 1
-                    ):
-                        raise ContractViolation("engineering reviewer score must be between zero and one")
-                    state["reviews"].append(
-                        {
-                            "cycle": state["review_cycles"],
-                            "task_id": review["task_id"],
-                            **review_value,
-                        }
-                    )
-                    self._write_running_state(state)
-                    if verdict == "approve" and not findings:
-                        state["success"] = True
-                        state["phase"] = "succeeded"
-                        state["reality_anchor"] = {
-                            "passed": True,
-                            "checks_passed": True,
-                            "review_approved": True,
-                            "review_task_id": review["task_id"],
-                        }
-                        if self.rsi_loop is not None and last_execution_task:
-                            self.rsi_loop.feedback(
-                                last_execution_task,
-                                float(score),
-                                "engineering-independent-review",
-                            )
-                        break
-                    self._control_checkpoint(control_probe)
-                    if not mutation_allowed:
-                        state["phase"] = "failed"
-                        state["failure"] = "read_only_review_rejected"
-                        break
-                    repair_input = {
-                        "kind": "review_findings",
-                        "review_task_id": review["task_id"],
-                        "findings": findings,
-                    }
+                self._require_time(session.started)
+                repair_input = self._evaluate_execution_cycle(session, control_probe)
+                if repair_input is None:
+                    break
 
                 if state["review_cycles"] >= self.policy.max_review_cycles:
                     state["phase"] = "failed"
                     state["failure"] = "review_cycle_limit_exhausted"
                     break
                 state["review_cycles"] += 1
-                repair = self._bounded_agent_call(
-                    state,
-                    started,
-                    "repair",
-                    "Repair only the reported check failures or review findings. Preserve correct work and do not touch protected paths.",
-                    {
-                        "task_intent": compiled_intent.to_dict(),
-                        "approved_plan": plan.plan,
-                        "repair_input": repair_input,
-                        "project_instructions": instructions,
-                        "workspace_fingerprint": self._workspace_fingerprint(),
-                    },
-                    ("repair_summary",),
-                    tools=("read", "shell", "edit", "write"),
-                    mutating=True,
-                    effect_index=state["review_cycles"],
-                )
-                last_execution_task = repair["task_id"]
-                state["repairs"].append(
-                    {
-                        "cycle": state["review_cycles"],
-                        "task_id": repair["task_id"],
-                        "reason": repair_input["kind"],
-                        "summary": repair["outputs"]["repair_summary"],
-                    }
-                )
-                self._assert_protected_unchanged(protected)
-                self._write_running_state(state)
-                self._control_checkpoint(control_probe)
+                self._repair_execution(session, repair_input, control_probe)
         except _EngineeringPaused:
             state["phase"] = "paused"
             state["updated_at"] = self._clock()
@@ -839,9 +883,7 @@ class EngineeringWorkflow:
         return state
 
     @staticmethod
-    def _control_checkpoint(
-        control_probe: Optional[Callable[[], Optional[str]]]
-    ) -> None:
+    def _control_checkpoint(control_probe: Optional[Callable[[], Optional[str]]]) -> None:
         if control_probe is None:
             return
         action = control_probe()
@@ -893,9 +935,7 @@ class EngineeringWorkflow:
             workspace=self.workspace,
             tools=tools,
             timeout_seconds=(
-                self.policy.agent_timeout_seconds
-                if timeout_seconds is None
-                else timeout_seconds
+                self.policy.agent_timeout_seconds if timeout_seconds is None else timeout_seconds
             ),
             data_classification=self.policy.data_classification,
             task_type=f"engineering.{role}",
@@ -917,6 +957,8 @@ class EngineeringWorkflow:
         tools: Tuple[str, ...],
         mutating: bool = False,
         effect_index: int = 0,
+        effect_postcondition: Optional[Callable[[Mapping[str, Any]], None]] = None,
+        effect_recovery_context: Optional[Mapping[str, Any]] = None,
     ) -> Mapping[str, Any]:
         self._require_time(started)
         if state["agent_calls"] >= self.policy.max_agent_calls:
@@ -931,9 +973,7 @@ class EngineeringWorkflow:
                 output_keys,
                 tools,
                 reuse_allowed=not mutating,
-                timeout_seconds=self._remaining_timeout(
-                    started, self.policy.agent_timeout_seconds
-                ),
+                timeout_seconds=self._remaining_timeout(started, self.policy.agent_timeout_seconds),
             )
             return {
                 "task_id": task_id,
@@ -943,9 +983,7 @@ class EngineeringWorkflow:
                 "cost_usd": result.cost_usd,
                 "usage": (
                     result.usage
-                    or ModelUsage.from_legacy_constructor(
-                        result.tokens_used, result.cost_usd
-                    )
+                    or ModelUsage.from_legacy_constructor(result.tokens_used, result.cost_usd)
                 ).to_dict(),
             }
 
@@ -954,6 +992,8 @@ class EngineeringWorkflow:
                 f"{role}-{effect_index}",
                 {"role": role, "task_id": task_id, "inputs": inputs},
                 invoke,
+                effect_postcondition,
+                recovery_context=effect_recovery_context,
             )
         else:
             value = invoke()
@@ -998,12 +1038,13 @@ class EngineeringWorkflow:
         if completed.returncode != 0:
             raise ContractViolation("engineering workspace is not a Git worktree")
         if completed.stdout.strip():
-            raise ContractViolation("engineering workspace must be clean before planning or execution")
+            raise ContractViolation(
+                "engineering workspace must be clean before planning or execution"
+            )
 
     def _protected_snapshot(self) -> Mapping[str, str]:
         git_protected = any(
-            Path(relative).parts[0] == ".git"
-            for relative in self.policy.protected_paths
+            Path(relative).parts[0] == ".git" for relative in self.policy.protected_paths
         )
         git_dirs = self._git_storage_dirs() if git_protected else None
         values = {}
@@ -1014,9 +1055,7 @@ class EngineeringWorkflow:
                 git_dir, common_dir = git_dirs
                 suffix = Path(*parts[1:])
                 base = (
-                    common_dir
-                    if suffix.parts[0] in ("config", "packed-refs", "refs")
-                    else git_dir
+                    common_dir if suffix.parts[0] in ("config", "packed-refs", "refs") else git_dir
                 )
                 path = base / suffix
             values[relative] = self._path_digest(path)
@@ -1042,7 +1081,7 @@ class EngineeringWorkflow:
             prefix = "gitdir:"
             if not declaration.lower().startswith(prefix):
                 raise ContractViolation("Git worktree pointer has an invalid contract")
-            raw_git_dir = declaration[len(prefix):].strip()
+            raw_git_dir = declaration[len(prefix) :].strip()
             if not raw_git_dir:
                 raise ContractViolation("Git worktree pointer has an empty target")
             candidate = Path(raw_git_dir)
@@ -1062,9 +1101,7 @@ class EngineeringWorkflow:
         if not raw_common_dir:
             raise ContractViolation("Git common directory pointer is empty")
         candidate = Path(raw_common_dir)
-        common_dir = (
-            candidate if candidate.is_absolute() else git_dir / candidate
-        ).resolve()
+        common_dir = (candidate if candidate.is_absolute() else git_dir / candidate).resolve()
         return git_dir, common_dir
 
     def _workspace_fingerprint(self) -> str:
@@ -1072,7 +1109,9 @@ class EngineeringWorkflow:
         digest = hashlib.sha256()
         items = self._git_visible_files()
         if items is None:
-            items = tuple(item for item in self.workspace.rglob("*") if item.is_file() or item.is_symlink())
+            items = tuple(
+                item for item in self.workspace.rglob("*") if item.is_file() or item.is_symlink()
+            )
         for item in sorted(items):
             relative = item.relative_to(self.workspace)
             if relative.parts and relative.parts[0] == ".git":
@@ -1098,17 +1137,13 @@ class EngineeringWorkflow:
         if completed.returncode != 0:
             return None
         return tuple(
-            self.workspace / relative
-            for relative in completed.stdout.split("\0")
-            if relative
+            self.workspace / relative for relative in completed.stdout.split("\0") if relative
         )
 
     def _assert_protected_unchanged(self, before: Mapping[str, str]) -> None:
         after = self._protected_snapshot()
         changed = sorted(
-            key
-            for key in set(before) | set(after)
-            if before.get(key) != after.get(key)
+            key for key in set(before) | set(after) if before.get(key) != after.get(key)
         )
         if changed:
             raise ContractViolation(f"engineering protected paths changed: {changed}")
@@ -1162,12 +1197,8 @@ class EngineeringWorkflow:
         if self._monotonic() - started > self.policy.max_elapsed_seconds:
             raise ContractViolation("engineering max_elapsed_seconds exhausted")
 
-    def _remaining_timeout(
-        self, started: float, maximum: Optional[int] = None
-    ) -> int:
-        remaining = int(
-            self.policy.max_elapsed_seconds - (self._monotonic() - started)
-        )
+    def _remaining_timeout(self, started: float, maximum: Optional[int] = None) -> int:
+        remaining = int(self.policy.max_elapsed_seconds - (self._monotonic() - started))
         if remaining < 1:
             raise ContractViolation("engineering max_elapsed_seconds exhausted")
         return remaining if maximum is None else min(maximum, remaining)
@@ -1192,6 +1223,4 @@ class EngineeringWorkflow:
 
 
 def default_project_policy() -> ProjectPolicy:
-    return ProjectPolicy(
-        check_commands=(("python3", "-m", "unittest", "discover", "-s", "tests"),)
-    )
+    return ProjectPolicy(check_commands=(("python3", "-m", "unittest", "discover", "-s", "tests"),))

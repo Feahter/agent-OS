@@ -14,6 +14,44 @@ def graph(nodes, **overrides):
 
 
 class ValidationTests(unittest.TestCase):
+    def test_unknown_effect_type_fails_closed(self):
+        with self.assertRaisesRegex(GraphValidationError, "must be one of"):
+            graph(
+                [
+                    {
+                        "id": "work",
+                        "kind": "work",
+                        "writes": ["result"],
+                        "effect": "best_effort",
+                    }
+                ]
+            )
+
+    def test_shared_mutating_agent_requires_explicit_effect_contract(self):
+        with self.assertRaisesRegex(
+            GraphValidationError, "explicit effect contract"
+        ):
+            validate_graph(
+                GraphSpec.from_dict(
+                    {
+                    "id": "unsafe-shared-effect",
+                    "require_reality_anchor": False,
+                    "nodes": [
+                        {
+                            "id": "change",
+                            "kind": "agent",
+                            "writes": ["result"],
+                            "agent": {
+                                "prompt": "change it",
+                                "tools": ["write"],
+                                "workspace": {"mode": "shared"},
+                            },
+                        }
+                    ],
+                    }
+                )
+            )
+
     @staticmethod
     def controlled_merge_nodes(**overrides):
         source = {
@@ -218,6 +256,20 @@ class ValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(GraphValidationError, "unsupported canonical tools"):
             validate_graph(spec)
 
+    def test_mutating_agent_defaults_to_isolated_workspace(self):
+        spec = graph(
+            [
+                {
+                    "id": "writer",
+                    "kind": "agent",
+                    "writes": ["result"],
+                    "agent": {"prompt": "write", "tools": ["write"]},
+                }
+            ]
+        )
+
+        self.assertEqual("isolated", spec.nodes[0].agent.workspace.mode)
+
     def test_unordered_agents_cannot_share_mutable_workspace(self):
         spec = graph(
             [
@@ -225,7 +277,11 @@ class ValidationTests(unittest.TestCase):
                     "id": "writer",
                     "kind": "agent",
                     "writes": ["a"],
-                    "agent": {"prompt": "write", "tools": ["write"]},
+                    "agent": {
+                        "prompt": "write",
+                        "tools": ["write"],
+                        "workspace": {"mode": "shared"},
+                    },
                 },
                 {
                     "id": "reader",
@@ -306,6 +362,11 @@ class ValidationTests(unittest.TestCase):
 
         with self.assertRaisesRegex(GraphValidationError, "isolated agent workspace"):
             validate_graph(spec)
+
+    def test_controlled_merge_defaults_to_reconcilable_effect(self):
+        spec = graph(self.controlled_merge_nodes())
+
+        self.assertEqual("reconcilable", spec.node_map()["change"].effect)
 
     def test_controlled_merge_requires_existing_gate_on_exact_verifier(self):
         missing_gate = graph(

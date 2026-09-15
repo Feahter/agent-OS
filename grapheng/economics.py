@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from ._store import exclusive_json_write, json_digest, read_json_object
 from .agents import ModelUsage
 from .errors import ContractViolation
-from .model import GraphSpec
+from .model import GraphSpec, NodeSpec
 
 BENCHMARK_PROTOCOL_SCHEMA_VERSION = 1
 BENCHMARK_SUITE_SCHEMA_VERSION = 1
@@ -783,6 +783,162 @@ class BenchmarkRun:
         return cls.from_dict(read_json_object(path, label="benchmark run"))
 
 
+@dataclass(frozen=True)
+class _NodeEventBoundaries:
+    starts: Mapping[Tuple[str, int], Mapping[str, Any]]
+    terminals: Mapping[Tuple[str, int], Mapping[str, Any]]
+    completion_times: Mapping[str, float]
+
+    @classmethod
+    def from_events(
+        cls,
+        graph: GraphSpec,
+        events: Sequence[Mapping[str, Any]],
+    ) -> _NodeEventBoundaries:
+        nodes = graph.node_map()
+        starts: Dict[Tuple[str, int], Mapping[str, Any]] = {}
+        terminals: Dict[Tuple[str, int], Mapping[str, Any]] = {}
+        completion_times: Dict[str, float] = {}
+        terminal_names = ("node_completed", "node_retry", "node_failed")
+        for event in events:
+            event_name = event.get("event")
+            if event_name not in ("node_started", *terminal_names):
+                continue
+            node_id = event.get("node_id")
+            if not isinstance(node_id, str) or node_id not in nodes:
+                raise ContractViolation("benchmark event contains an unknown node_id")
+            attempt = _positive_int(
+                event.get("attempt"), "benchmark node event attempt"
+            )
+            key = (node_id, attempt)
+            target = starts if event_name == "node_started" else terminals
+            if key in target:
+                raise ContractViolation(
+                    "benchmark node events contain duplicate boundaries"
+                )
+            target[key] = event
+            if event_name == "node_completed":
+                completion_times[node_id] = _event_seconds(event.get("time"))
+        if set(starts) != set(terminals):
+            raise ContractViolation("benchmark node events have incomplete boundaries")
+        return cls(starts, terminals, completion_times)
+
+    def attempts(self, node_id: str) -> Tuple[Tuple[str, int], ...]:
+        return tuple(
+            sorted(
+                (key for key in self.starts if key[0] == node_id),
+                key=lambda key: key[1],
+            )
+        )
+
+
+def _benchmark_node_metrics(
+    node: NodeSpec,
+    boundaries: _NodeEventBoundaries,
+    submitted_at: float,
+) -> BenchmarkNode:
+    keys = boundaries.attempts(node.id)
+    queue_waits: List[float] = []
+    durations: List[float] = []
+    usages: List[ModelUsage] = []
+    statuses: List[str] = []
+    saved_tokens: List[int] = []
+    saved_tokens_complete = True
+    model_durations: List[float] = []
+    model_seconds_complete = True
+    previous_terminal: Optional[float] = None
+    for index, key in enumerate(keys):
+        start_event = boundaries.starts[key]
+        terminal_event = boundaries.terminals[key]
+        start_time = _event_seconds(start_event.get("time"))
+        terminal_time = _event_seconds(terminal_event.get("time"))
+        if terminal_time < start_time:
+            raise ContractViolation("benchmark node execution cannot be negative")
+        duration = terminal_time - start_time
+        durations.append(duration)
+        if index == 0:
+            dependency_times = [
+                boundaries.completion_times.get(dependency)
+                for dependency in node.deps
+            ]
+            ready_time = (
+                max(time for time in dependency_times if time is not None)
+                if dependency_times
+                and all(time is not None for time in dependency_times)
+                else submitted_at
+                if not dependency_times
+                else None
+            )
+        else:
+            ready_time = previous_terminal
+        if ready_time is None:
+            queue_waits = []
+        elif start_time < ready_time:
+            raise ContractViolation("benchmark node queue wait cannot be negative")
+        elif queue_waits or index == 0:
+            queue_waits.append(start_time - ready_time)
+        previous_terminal = terminal_time
+
+        payload = terminal_event.get("payload")
+        if terminal_event.get("event") == "node_completed":
+            usages.append(_usage_from_artifact(payload, "benchmark node event"))
+        else:
+            usages.append(ModelUsage.unknown())
+
+        if node.agent is None:
+            continue
+        metadata = payload.get("metadata") if isinstance(payload, Mapping) else None
+        status = metadata.get("reuse_status") if isinstance(metadata, Mapping) else None
+        if status not in ("hit", "miss", "coalesced", "bypassed", "none"):
+            statuses.append("unknown")
+            saved_tokens_complete = False
+            model_seconds_complete = False
+            continue
+        statuses.append(status)
+        if status in ("hit", "coalesced"):
+            if not isinstance(metadata, Mapping):
+                saved_tokens_complete = False
+                continue
+            raw_saved_tokens = metadata.get("reuse_saved_tokens")
+            if raw_saved_tokens is None:
+                saved_tokens_complete = False
+            else:
+                saved_tokens.append(
+                    _non_negative_int(
+                        raw_saved_tokens,
+                        "benchmark node reuse_saved_tokens",
+                    )
+                )
+        else:
+            saved_tokens.append(0)
+            model_durations.append(duration)
+
+    usage = ModelUsage.combine(usages) if usages else ModelUsage.no_call()
+    queue_wait = sum(queue_waits) if len(queue_waits) == len(keys) else None
+    execution = sum(durations) if len(durations) == len(keys) else None
+    if node.agent is None:
+        node_reuse = ReuseMetrics.known_zero()
+        model_seconds_value = None
+    else:
+        node_reuse = ReuseMetrics.from_statuses(
+            statuses,
+            sum(saved_tokens) if saved_tokens_complete else None,
+        )
+        model_seconds_value = (
+            sum(model_durations) if model_seconds_complete else None
+        )
+    return BenchmarkNode(
+        node_id=node.id,
+        kind=node.kind,
+        attempts=len(keys),
+        usage=usage,
+        queue_wait_seconds=queue_wait,
+        execution_seconds=execution,
+        model_seconds=model_seconds_value,
+        reuse=node_reuse,
+    )
+
+
 class RunEconomics:
     """Builds and immutably stores one unambiguous economics snapshot per run."""
 
@@ -1028,136 +1184,11 @@ class RunEconomics:
         ReuseMetrics,
     ]:
         nodes = graph.node_map()
-        starts: Dict[Tuple[str, int], Mapping[str, Any]] = {}
-        terminals: Dict[Tuple[str, int], Mapping[str, Any]] = {}
-        completion_times: Dict[str, float] = {}
-        terminal_names = ("node_completed", "node_retry", "node_failed")
-        for event in events:
-            event_name = event.get("event")
-            if event_name not in ("node_started", *terminal_names):
-                continue
-            node_id = event.get("node_id")
-            if not isinstance(node_id, str) or node_id not in nodes:
-                raise ContractViolation("benchmark event contains an unknown node_id")
-            attempt = _positive_int(
-                event.get("attempt"), "benchmark node event attempt"
-            )
-            key = (node_id, attempt)
-            target = starts if event_name == "node_started" else terminals
-            if key in target:
-                raise ContractViolation("benchmark node events contain duplicate boundaries")
-            target[key] = event
-            if event_name == "node_completed":
-                completion_times[node_id] = _event_seconds(event.get("time"))
-        if set(starts) != set(terminals):
-            raise ContractViolation("benchmark node events have incomplete boundaries")
-
-        metrics: List[BenchmarkNode] = []
-        for node in graph.nodes:
-            keys = sorted(
-                (key for key in starts if key[0] == node.id),
-                key=lambda key: key[1],
-            )
-            queue_waits: List[float] = []
-            durations: List[float] = []
-            usages: List[ModelUsage] = []
-            statuses: List[str] = []
-            saved_tokens: List[int] = []
-            saved_tokens_complete = True
-            model_durations: List[float] = []
-            model_seconds_complete = True
-            previous_terminal: Optional[float] = None
-            for index, key in enumerate(keys):
-                start_event = starts[key]
-                terminal_event = terminals[key]
-                start_time = _event_seconds(start_event.get("time"))
-                terminal_time = _event_seconds(terminal_event.get("time"))
-                if terminal_time < start_time:
-                    raise ContractViolation("benchmark node execution cannot be negative")
-                duration = terminal_time - start_time
-                durations.append(duration)
-                if index == 0:
-                    dependency_times = [
-                        completion_times.get(dependency) for dependency in node.deps
-                    ]
-                    ready_time = (
-                        max(time for time in dependency_times if time is not None)
-                        if dependency_times
-                        and all(time is not None for time in dependency_times)
-                        else submitted_at
-                        if not dependency_times
-                        else None
-                    )
-                else:
-                    ready_time = previous_terminal
-                if ready_time is None:
-                    queue_waits = []
-                elif start_time < ready_time:
-                    raise ContractViolation("benchmark node queue wait cannot be negative")
-                elif queue_waits or index == 0:
-                    queue_waits.append(start_time - ready_time)
-                previous_terminal = terminal_time
-
-                payload = terminal_event.get("payload")
-                if terminal_event.get("event") == "node_completed":
-                    usages.append(_usage_from_artifact(payload, "benchmark node event"))
-                else:
-                    usages.append(ModelUsage.unknown())
-
-                if node.agent is None:
-                    continue
-                metadata = payload.get("metadata") if isinstance(payload, Mapping) else None
-                status = metadata.get("reuse_status") if isinstance(metadata, Mapping) else None
-                if status not in ("hit", "miss", "coalesced", "bypassed", "none"):
-                    statuses.append("unknown")
-                    saved_tokens_complete = False
-                    model_seconds_complete = False
-                    continue
-                statuses.append(status)
-                if status in ("hit", "coalesced"):
-                    if not isinstance(metadata, Mapping):
-                        saved_tokens_complete = False
-                        continue
-                    raw_saved_tokens = metadata.get("reuse_saved_tokens")
-                    if raw_saved_tokens is None:
-                        saved_tokens_complete = False
-                    else:
-                        saved_tokens.append(
-                            _non_negative_int(
-                                raw_saved_tokens,
-                                "benchmark node reuse_saved_tokens",
-                            )
-                        )
-                else:
-                    saved_tokens.append(0)
-                    model_durations.append(duration)
-
-            usage = ModelUsage.combine(usages) if usages else ModelUsage.no_call()
-            queue_wait = sum(queue_waits) if len(queue_waits) == len(keys) else None
-            execution = sum(durations) if len(durations) == len(keys) else None
-            if node.agent is None:
-                node_reuse = ReuseMetrics.known_zero()
-                model_seconds_value = None
-            else:
-                node_reuse = ReuseMetrics.from_statuses(
-                    statuses,
-                    sum(saved_tokens) if saved_tokens_complete else None,
-                )
-                model_seconds_value = (
-                    sum(model_durations) if model_seconds_complete else None
-                )
-            metrics.append(
-                BenchmarkNode(
-                    node_id=node.id,
-                    kind=node.kind,
-                    attempts=len(keys),
-                    usage=usage,
-                    queue_wait_seconds=queue_wait,
-                    execution_seconds=execution,
-                    model_seconds=model_seconds_value,
-                    reuse=node_reuse,
-                )
-            )
+        boundaries = _NodeEventBoundaries.from_events(graph, events)
+        metrics = [
+            _benchmark_node_metrics(node, boundaries, submitted_at)
+            for node in graph.nodes
+        ]
 
         queue_wait_seconds = (
             sum(item.queue_wait_seconds or 0.0 for item in metrics)
