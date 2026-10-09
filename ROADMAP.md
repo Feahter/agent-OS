@@ -120,8 +120,31 @@ Key outcomes:
 - Joint optimization of quality, latency, cost and human intervention.
 - Explanations for what was learned, why behavior changed and which tasks are affected.
 - Frozen regression suites, offline evaluation, human approval, canaries and automatic rollback.
+- Attempt relationships and batch feedback informed by AgentDiscover: trace candidate derivation, failure lessons and guidance versions, keeping agent claims separate from runtime evidence.
+- Bounded autonomous search for tasks with explicit scoring objectives; independent evaluation binds candidate, evaluator and data versions, while governed guidance takes effect at safe checkpoints.
 
 Preview status: prompt-free observations, governed candidates, regression evaluation, approval, canary and rollback primitives exist. Personal and project memory controls, real-task baselines and measurable cost improvements are still pending.
+
+AgentDiscover evidence now includes runtime candidate/executor and retry-parent bindings,
+bounded context retrieval with current certification and static capability/policy checks, verified
+replacement references for corrections, and withdrawal propagation. Local reuse controls and
+candidate-bound project check receipts remain in place. Summaries account for supplied execution
+sources and retain unknown usage; they do not establish ROI admission or a complete search ledger.
+Failure, retry and budget-rejection events preserve settled usage, including conservative reservations
+with incomplete measurement. Wall-clock summaries deduplicate by scope/run, retain withdrawn history,
+and distinguish resumed work from terminal checkpoint replay. Missing boundaries remain unknown;
+engineering spans include recorded preparation time and the plan-to-finish interval, including waits.
+Prompt/topology metric evaluations now bind the candidate, frozen suite, evaluator version, measurements,
+thresholds and fixed guardrails. Approval pins the result; approval, activation, application, canary checks
+and history restoration revalidate it. Invalid rollback history falls back to the fixed policy. Measurements
+remain caller-reported with independence false and unknown isolation/resource limits; local rollback logs
+are excluded from portable state.
+Independent frozen evaluation, batch guidance and adaptive policies remain pending.
+Integration points, tradeoffs and acceptance checks are in
+[ROI plan 5 (Chinese)](docs/roi-iteration-plans/05-adaptive-policy.md#agentdiscover-借鉴与取舍).
+The admission gate still requires at least 30 verified results across three task categories and at least
+10 comparable results from each of two certified executors. Existing local records should carry the
+evidence relationships first; Neo4j, multiple container backends and dynamic code tools are not prerequisites.
 
 Exit gates: quality holds on a fixed regression set; repeated-task cost and duration measurably improve; any learned behavior can be understood and reverted.
 

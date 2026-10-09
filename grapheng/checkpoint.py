@@ -1,4 +1,5 @@
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Optional, Tuple
@@ -21,6 +22,7 @@ class Checkpoint:
     cost_usd: float
     artifacts: Tuple[ArtifactRecord, ...]
     usage: ModelUsage = field(default_factory=ModelUsage.no_call)
+    in_flight: Optional[Mapping[str, Mapping[str, Any]]] = None
 
     def to_dict(self) -> CheckpointDocumentV1:
         return {
@@ -34,6 +36,7 @@ class Checkpoint:
             "cost_usd": self.cost_usd,
             "usage": self.usage.to_dict(),
             "artifacts": [record.to_dict() for record in self.artifacts],
+            "in_flight": dict(self.in_flight) if self.in_flight is not None else None,
         }
 
     @classmethod
@@ -54,6 +57,30 @@ class Checkpoint:
             if isinstance(value.get("cost_complete"), bool)
             else None,
         )
+        in_flight = value.get("in_flight")
+        if in_flight is not None:
+            if not isinstance(in_flight, dict):
+                raise ContractViolation("checkpoint in_flight must be an object")
+            if set(in_flight) != {key for key, status in value["statuses"].items() if status == "running"}:
+                raise ContractViolation("checkpoint running nodes must have reservations")
+            for node_id, reservation in in_flight.items():
+                if not isinstance(reservation, dict) or set(reservation) != {
+                    "attempt", "tokens", "cost_usd"
+                }:
+                    raise ContractViolation("invalid checkpoint reservation")
+                for key in ("attempt", "tokens"):
+                    item = reservation[key]
+                    minimum = 1 if key == "attempt" else 0
+                    if isinstance(item, bool) or not isinstance(item, int) or item < minimum:
+                        raise ContractViolation("invalid checkpoint reservation count")
+                cost = reservation["cost_usd"]
+                if (
+                    isinstance(cost, bool) or not isinstance(cost, (int, float))
+                    or not math.isfinite(cost) or cost < 0
+                    or value["statuses"].get(node_id) != "running"
+                    or reservation["attempt"] != value["attempts"].get(node_id)
+                ):
+                    raise ContractViolation("checkpoint reservation identity mismatch")
         return cls(
             graph_id=str(value["graph_id"]),
             graph_fingerprint=str(value["graph_fingerprint"]),
@@ -64,6 +91,7 @@ class Checkpoint:
             cost_usd=cost_usd,
             artifacts=tuple(ArtifactRecord.from_dict(item) for item in value["artifacts"]),
             usage=usage,
+            in_flight=in_flight,
         )
 
 

@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
-from typing import Any, Optional, Tuple
+from dataclasses import dataclass, replace
+from typing import Any, Optional, Sequence, Tuple
 
 from .agents import AgentRequest
 from .errors import ContractViolation
+from .evidence import EvidenceProjection
 
 CONTEXT_CONTRACT_VERSION = 1
 DEFAULT_MAX_CONTEXT_BYTES = 512 * 1024
@@ -115,6 +116,25 @@ class ContextBudgetExceeded(ContractViolation):
 
 class ContextCompiler:
     """Compile an :class:`AgentRequest` into a compact provider payload."""
+
+    def compile_with_evidence(
+        self, request: AgentRequest, policy: ContextPolicy, projection: EvidenceProjection,
+        *, scope: str, task_type: str, policy_digest: str,
+        max_items: int = 10, max_evidence_bytes: int = 8192,
+        required_features: Sequence[str] = (),
+    ) -> CompiledContext:
+        if "attempt_evidence" in request.inputs:
+            raise ContractViolation("attempt_evidence is reserved for host context injection")
+        selection = projection.search(
+            scope=scope, task_type=task_type, policy_digest=policy_digest,
+            max_items=max_items, max_bytes=max_evidence_bytes,
+            request=replace(request, task_type=task_type), required_features=required_features,
+        )
+        compiled = self.compile(
+            replace(request, inputs={**request.inputs, "attempt_evidence": selection}), policy
+        )
+        projection.record_injection(selection, compiled.fingerprint, compiled.total_bytes)
+        return compiled
 
     def compile(
         self, request: AgentRequest, policy: ContextPolicy

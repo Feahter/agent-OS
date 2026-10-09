@@ -4,13 +4,15 @@ import hashlib
 import json
 import math
 import os
+import re
 import subprocess
 import time
+import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
-from ._store import atomic_json_write
+from ._store import atomic_json_write, json_digest, read_json_object
 from .agents import AgentRequest, AgentResult, ExecutorRegistry, ModelUsage
 from .control import EffectJournal
 from .errors import ContractViolation
@@ -24,8 +26,13 @@ _ROLES = ("explore", "plan", "implement", "review", "repair")
 
 
 def _canonical_digest(value: Any) -> str:
-    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    return json_digest(value, label="engineering value")[1]
+
+
+def _hash_entry(digest: Any, relative: str, kind: str, content: bytes) -> None:
+    for part in (relative.encode("utf-8"), kind.encode("ascii"), content):
+        digest.update(len(part).to_bytes(8, "big"))
+        digest.update(part)
 
 
 def _safe_relative_path(value: str, field: str) -> Path:
@@ -394,6 +401,46 @@ class CheckResult:
         return {**asdict(self), "command": list(self.command), "passed": self.passed}
 
 
+def _validated_check_receipt(value: Mapping[str, Any]) -> Dict[str, Any]:
+    """Validate durable project checks without promoting them to independent evaluation."""
+    if (not isinstance(value, dict) or value.get("schema_version") != 1
+            or not isinstance(value.get("receipt_id"), str)
+            or re.fullmatch(r"check-[0-9a-f]{32}", value["receipt_id"]) is None
+            or value.get("status") not in (
+                "running", "passed", "failed", "timeout", "invalid", "harness_error", "interrupted"
+            )):
+        raise ContractViolation("invalid engineering check receipt")
+    binding = value.get("binding")
+    if not isinstance(binding, dict):
+        raise ContractViolation("invalid engineering check binding")
+    for key in ("plan_digest", "policy_digest", "suite_digest", "case_digest"):
+        digest = binding.get(key)
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise ContractViolation("invalid engineering check binding digest")
+    candidate = binding.get("candidate_digest")
+    if (not isinstance(candidate, str) or re.fullmatch(r"v2:[0-9a-f]{64}", candidate) is None
+            or binding.get("input_digest") != candidate
+            or binding.get("evaluator_version") != "engineering-project-check-v1"
+            or binding.get("independent") is not False):
+        raise ContractViolation("invalid engineering check candidate or evaluator binding")
+    resources = binding.get("resources")
+    timeout = resources.get("timeout_seconds") if isinstance(resources, dict) else None
+    if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout) or timeout <= 0):
+        raise ContractViolation("invalid engineering check resource binding")
+    if value["status"] in ("passed", "failed"):
+        result = value.get("result")
+        if (not isinstance(result, dict) or isinstance(result.get("returncode"), bool)
+                or not isinstance(result.get("returncode"), int)
+                or result.get("passed") is not (result["returncode"] == 0)
+                or (value["status"] == "passed") != result["passed"]
+                or not isinstance(result.get("command"), list)
+                or _canonical_digest(result["command"]) != binding["case_digest"]
+                or value.get("output_digest") != candidate):
+            raise ContractViolation("engineering check result binding mismatch")
+    return dict(value)
+
+
 @dataclass
 class _ExecutionSession:
     plan: EngineeringPlan
@@ -601,6 +648,8 @@ class EngineeringWorkflow:
         implementation_receipt = self.effects.inspect("implement-0")
         if implementation_receipt is None:
             self._require_clean_worktree()
+            if not plan.workspace_digest.startswith("v2:"):
+                raise ContractViolation("legacy workspace fingerprint requires a new approved plan")
             if plan.workspace_digest != self._workspace_fingerprint():
                 raise ContractViolation("engineering workspace changed after planning")
         started = self._monotonic()
@@ -612,6 +661,17 @@ class EngineeringWorkflow:
             require_details=plan.schema_version == ENGINEERING_PLAN_SCHEMA_VERSION,
         )
         preparation_model_usage = _usage_from_record(preparation_usage)
+        check_receipts = []
+        for path in sorted((self.task_dir / "checks").glob("*.json")):
+            receipt = _validated_check_receipt(read_json_object(path, label="engineering check receipt"))
+            if path.stem != receipt["receipt_id"]:
+                raise ContractViolation("engineering check receipt identity mismatch")
+            if receipt.get("binding", {}).get("plan_digest") != plan.digest:
+                raise ContractViolation("engineering check receipt belongs to a different plan")
+            if receipt.get("status") == "running":
+                receipt.update(status="interrupted", elapsed_seconds=None)
+                atomic_json_write(path, receipt, label="engineering interrupted check receipt")
+            check_receipts.append(receipt)
         state: Dict[str, Any] = {
             "schema_version": ENGINEERING_REPORT_SCHEMA_VERSION,
             "phase": "running",
@@ -630,6 +690,7 @@ class EngineeringWorkflow:
             "preparation_usage": preparation_usage,
             "implementation": None,
             "checks": [],
+            "check_receipts": check_receipts,
             "reviews": [],
             "repairs": [],
             "reality_anchor": {"passed": False},
@@ -714,7 +775,7 @@ class EngineeringWorkflow:
         control_probe: Optional[Callable[[], Optional[str]]],
     ) -> Optional[Mapping[str, Any]]:
         state = session.state
-        checks = self._run_checks(session.started)
+        checks = self._run_checks(session)
         state["checks"].append(
             {
                 "cycle": state["review_cycles"],
@@ -768,6 +829,10 @@ class EngineeringWorkflow:
         )
         self._write_running_state(state)
         if verdict == "approve" and not findings:
+            checked_digest = state["check_receipts"][-1]["binding"]["candidate_digest"]
+            if checked_digest != self._workspace_fingerprint():
+                raise ContractViolation("engineering candidate changed after verification")
+            self._assert_protected_unchanged(session.protected)
             state["success"] = True
             state["phase"] = "succeeded"
             state["reality_anchor"] = {
@@ -1107,6 +1172,7 @@ class EngineeringWorkflow:
     def _workspace_fingerprint(self) -> str:
         """Fingerprint visible project state while excluding Git and task receipts."""
         digest = hashlib.sha256()
+        digest.update(b"agent-os-workspace-v2\0")
         items = self._git_visible_files()
         if items is None:
             items = tuple(
@@ -1116,12 +1182,13 @@ class EngineeringWorkflow:
             relative = item.relative_to(self.workspace)
             if relative.parts and relative.parts[0] == ".git":
                 continue
-            digest.update(relative.as_posix().encode("utf-8") + b"\0")
             if item.is_symlink():
-                digest.update(b"symlink\0" + os.readlink(item).encode("utf-8"))
+                _hash_entry(digest, relative.as_posix(), "symlink", os.readlink(item).encode("utf-8"))
             elif item.is_file():
-                digest.update(item.read_bytes())
-        return digest.hexdigest()
+                _hash_entry(digest, relative.as_posix(), "file", item.read_bytes())
+            else:
+                _hash_entry(digest, relative.as_posix(), "missing", b"")
+        return "v2:" + digest.hexdigest()
 
     def _git_visible_files(self) -> Optional[Tuple[Path, ...]]:
         if not (self.workspace / ".git").exists():
@@ -1162,35 +1229,90 @@ class EngineeringWorkflow:
         digest.update(b"dir\0")
         for item in sorted(path.rglob("*")):
             relative = item.relative_to(path).as_posix()
-            digest.update(relative.encode("utf-8") + b"\0")
             if item.is_symlink():
-                digest.update(b"symlink\0" + os.readlink(item).encode("utf-8"))
+                _hash_entry(digest, relative, "symlink", os.readlink(item).encode("utf-8"))
             elif item.is_file():
-                digest.update(item.read_bytes())
+                _hash_entry(digest, relative, "file", item.read_bytes())
+            else:
+                _hash_entry(digest, relative, "directory", b"")
         return digest.hexdigest()
 
-    def _run_checks(self, started: float) -> Tuple[CheckResult, ...]:
+    def _run_checks(self, session: _ExecutionSession) -> Tuple[CheckResult, ...]:
         results = []
-        for command in self.policy.check_commands:
-            self._require_time(started)
+        state = session.state
+        candidate_digest = self._workspace_fingerprint()
+        state["candidate_digest"] = candidate_digest
+        suite_digest = _canonical_digest([list(command) for command in self.policy.check_commands])
+        for index, command in enumerate(self.policy.check_commands):
+            self._require_time(session.started)
+            timeout = self._remaining_timeout(session.started)
+            binding = {
+                "candidate_digest": candidate_digest,
+                "plan_digest": session.plan.digest,
+                "suite_digest": suite_digest,
+                "case_digest": _canonical_digest(list(command)),
+                "input_digest": candidate_digest,
+                "policy_digest": self.policy.digest,
+                "evaluator_version": "engineering-project-check-v1",
+                "resources": {"timeout_seconds": timeout},
+                # Project tests are implementation artifacts, not an independent
+                # frozen regression suite. Do not promote these receipts to one.
+                "independent": False,
+            }
+            receipt = {
+                "schema_version": 1,
+                "receipt_id": "check-" + uuid.uuid4().hex,
+                "cycle": state["review_cycles"],
+                "case_index": index,
+                "binding": binding,
+                "status": "running",
+                "result": None,
+                "started_at": self._clock(),
+            }
+            state.setdefault("check_receipts", []).append(receipt)
+            receipt_path = self.task_dir / "checks" / f"{receipt['receipt_id']}.json"
+            atomic_json_write(receipt_path, receipt, label="engineering check receipt")
+            self._write_running_state(state)
             check_started = self._monotonic()
-            completed = self._runner(
-                list(command),
-                cwd=str(self.workspace),
-                capture_output=True,
-                text=True,
-                timeout=self._remaining_timeout(started),
-                check=False,
-            )
-            results.append(
-                CheckResult(
+            try:
+                completed = self._runner(
+                    list(command),
+                    cwd=str(self.workspace),
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    check=False,
+                )
+                result = CheckResult(
                     command,
                     completed.returncode,
                     (completed.stdout or "")[-4000:],
                     (completed.stderr or "")[-4000:],
                     self._monotonic() - check_started,
                 )
-            )
+                after = self._workspace_fingerprint()
+                receipt.update(
+                    status=("passed" if result.passed else "failed"),
+                    result=result.to_dict(),
+                    output_digest=after,
+                )
+                if after != candidate_digest:
+                    receipt["status"] = "invalid"
+                    raise ContractViolation("engineering check changed the candidate workspace")
+                self._assert_protected_unchanged(session.protected)
+                results.append(result)
+            except subprocess.TimeoutExpired:
+                receipt["status"] = "timeout"
+                raise
+            except Exception as error:
+                if receipt["status"] != "invalid":
+                    receipt["status"] = "harness_error"
+                receipt["error_type"] = type(error).__name__
+                raise
+            finally:
+                receipt["elapsed_seconds"] = self._monotonic() - check_started
+                atomic_json_write(receipt_path, receipt, label="engineering check receipt")
+                self._write_running_state(state)
         return tuple(results)
 
     def _require_time(self, started: float) -> None:
@@ -1216,6 +1338,9 @@ class EngineeringWorkflow:
                 "cost_usd": state["cost_usd"],
                 "cost_complete": state["cost_complete"],
                 "usage": dict(state["usage"]),
+                "checks": state.get("checks", []),
+                "check_receipts": state.get("check_receipts", []),
+                "candidate_digest": state.get("candidate_digest"),
                 "failure": state["failure"],
                 "updated_at": self._clock(),
             },

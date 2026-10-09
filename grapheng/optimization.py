@@ -12,6 +12,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 from ._store import (
     append_jsonl,
     atomic_json_write,
+    json_digest,
     read_json,
 )
 from .errors import ContractViolation
@@ -20,6 +21,7 @@ from .validation import validate_graph
 
 IDENTIFIER = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
 OPTIMIZATION_KINDS = ("prompt_template", "graph_topology")
+REGRESSION_EVALUATOR_VERSION = "rsi-regression-metrics-v1"
 PROMPT_FAILURE_GUIDANCE = {
     "missing_evidence": "Cite the evidence used for every conclusion.",
     "format_mismatch": "Validate the final output against the declared output contract.",
@@ -214,6 +216,7 @@ class OptimizationCandidate:
     evaluation: Optional[Mapping[str, Any]] = None
     approved_by: Optional[str] = None
     approved_at: Optional[float] = None
+    approved_evaluation_digest: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -235,6 +238,7 @@ class OptimizationCandidate:
                 if value.get("approved_at") is None
                 else float(value["approved_at"])
             ),
+            approved_evaluation_digest=value.get("approved_evaluation_digest"),
         )
 
 
@@ -297,9 +301,8 @@ class RSIOptimizationLab:
         )
         path = self.root / "suites" / f"{suite.suite_id}.json"
         with self._lock:
-            existing = read_json(path, None)
-            if existing is not None:
-                restored = RegressionSuite.from_dict(existing)
+            if path.exists():
+                restored = self._read_suite(suite.suite_id)
                 if restored.digest != digest:
                     raise ContractViolation("frozen regression suite digest mismatch")
                 return restored
@@ -439,68 +442,11 @@ class RSIOptimizationLab:
                     f"optimization candidate {candidate_id} must be proposed before evaluation"
                 )
             suite = self._read_suite(suite_id)
-            by_case = {item.case_id: item for item in measurements}
-            expected = {item.case_id for item in suite.cases}
-            if len(by_case) != len(measurements) or set(by_case) != expected:
-                raise ContractViolation(
-                    "regression measurements must cover each frozen case exactly once"
-                )
-            failures = []
-            baseline_cost = 0.0
-            measured_cost = 0.0
-            baseline_latency = 0.0
-            measured_latency = 0.0
-            baseline_quality = 0.0
-            measured_quality = 0.0
-            for case in suite.cases:
-                item = by_case[case.case_id]
-                baseline_cost += case.baseline_cost_usd
-                measured_cost += item.cost_usd
-                baseline_latency += case.baseline_latency_seconds
-                measured_latency += item.latency_seconds
-                baseline_quality += case.baseline_quality
-                measured_quality += item.quality_score
-                if not item.reality_anchor_passed:
-                    failures.append(f"{case.case_id}:reality_anchor_failed")
-                if item.quality_score < (
-                    case.baseline_quality - max_quality_regression
-                ):
-                    failures.append(f"{case.case_id}:quality_regression")
-            cost_increase = _increase_percent(baseline_cost, measured_cost)
-            latency_increase = _increase_percent(
-                baseline_latency, measured_latency
+            evaluation = _regression_evaluation(
+                candidate, suite, measurements,
+                max_quality_regression, max_cost_increase_percent,
+                max_latency_increase_percent,
             )
-            if cost_increase > max_cost_increase_percent:
-                failures.append("suite:cost_budget_exceeded")
-            if latency_increase > max_latency_increase_percent:
-                failures.append("suite:latency_budget_exceeded")
-            count = len(suite.cases)
-            evaluation = {
-                "passed": not failures,
-                "suite_id": suite.suite_id,
-                "suite_digest": suite.digest,
-                "candidate_change_digest": _candidate_change_digest(candidate),
-                "cases": count,
-                "failures": failures,
-                "baseline_average_quality": baseline_quality / count,
-                "measured_average_quality": measured_quality / count,
-                "baseline_total_cost_usd": baseline_cost,
-                "measured_total_cost_usd": measured_cost,
-                "cost_increase_percent": cost_increase,
-                "baseline_total_latency_seconds": baseline_latency,
-                "measured_total_latency_seconds": measured_latency,
-                "latency_increase_percent": latency_increase,
-                "thresholds": {
-                    "max_quality_regression": max_quality_regression,
-                    "max_cost_increase_percent": max_cost_increase_percent,
-                    "max_latency_increase_percent": max_latency_increase_percent,
-                },
-                "guardrails": {
-                    "frozen_suite": True,
-                    "hard_constraints_mutable": False,
-                    "human_approval_required": True,
-                },
-            }
             updated = replace(
                 candidate, status="evaluated", evaluation=evaluation
             )
@@ -516,21 +462,13 @@ class RSIOptimizationLab:
                 raise ContractViolation(
                     f"optimization candidate {candidate_id} is not evaluated"
                 )
-            if not candidate.evaluation.get("passed"):
-                raise ContractViolation(
-                    f"optimization candidate {candidate_id} did not pass evaluation"
-                )
-            if candidate.evaluation.get(
-                "candidate_change_digest"
-            ) != _candidate_change_digest(candidate):
-                raise ContractViolation(
-                    f"optimization candidate {candidate_id} changed after evaluation"
-                )
+            evaluation = self._validate_evaluation(candidate)
             updated = replace(
                 candidate,
                 status="approved",
                 approved_by=actor.strip(),
                 approved_at=self._clock(),
+                approved_evaluation_digest=evaluation["binding_digest"],
             )
             self._write_candidate(updated)
             return updated
@@ -542,12 +480,7 @@ class RSIOptimizationLab:
                 raise ContractViolation(
                     f"optimization candidate {candidate_id} is not approved"
                 )
-            if not candidate.evaluation or candidate.evaluation.get(
-                "candidate_change_digest"
-            ) != _candidate_change_digest(candidate):
-                raise ContractViolation(
-                    f"optimization candidate {candidate_id} changed after evaluation"
-                )
+            self._validate_evaluation(candidate, require_approval=True)
             active = read_json(self.root / "active.json", {})
             history = read_json(self.root / "history.json", {})
             previous_id = active.get(candidate.kind)
@@ -571,30 +504,51 @@ class RSIOptimizationLab:
             if candidate_id is None:
                 raise ContractViolation(f"there is no active {kind} candidate")
             current = self._read_candidate(str(candidate_id))
-            self._write_candidate(replace(current, status="rolled_back"))
             history = read_json(self.root / "history.json", {})
             values = history.get(kind, [])
             previous_id = values.pop() if values else None
-            if previous_id is None:
+            restored = None
+            rejection_reason = None
+            if previous_id is not None:
+                try:
+                    previous = self._read_candidate(str(previous_id))
+                    if previous.kind != kind or previous.status != "superseded":
+                        raise ContractViolation("rollback candidate is not superseded for this kind")
+                    self._validate_evaluation(previous, require_approval=True)
+                    restored = replace(previous, status="active")
+                except ContractViolation as error:
+                    # Disable the current candidate even when history cannot safely be reused.
+                    rejection_reason = str(error)
+            if restored is None:
                 active.pop(kind, None)
             else:
-                active[kind] = previous_id
+                active[kind] = restored.candidate_id
             history[kind] = values
+            self._write_candidate(replace(current, status="rolled_back"))
+            if restored is not None:
+                self._write_candidate(restored)
             atomic_json_write(self.root / "active.json", active)
             atomic_json_write(self.root / "history.json", history)
-            if previous_id is None:
-                return None
-            previous = self._read_candidate(str(previous_id))
-            restored = replace(previous, status="active")
-            self._write_candidate(restored)
+            append_jsonl(self.root / "rollback.jsonl", {
+                "kind": kind,
+                "candidate_id": current.candidate_id,
+                "restored_candidate_id": None if restored is None else restored.candidate_id,
+                "rejected_previous_id": previous_id if rejection_reason is not None else None,
+                "rejection_reason": rejection_reason,
+                "rolled_back_at": self._clock(),
+            }, label="optimization rollback")
             return restored
 
     def active_candidates(self) -> Mapping[str, OptimizationCandidate]:
         active = read_json(self.root / "active.json", {})
-        return {
-            kind: self._read_candidate(str(candidate_id))
-            for kind, candidate_id in active.items()
-        }
+        candidates = {}
+        for kind, candidate_id in active.items():
+            candidate = self._read_candidate(str(candidate_id))
+            if candidate.kind != kind or candidate.status != "active":
+                raise ContractViolation("active optimization candidate identity or status mismatch")
+            self._validate_evaluation(candidate, require_approval=True)
+            candidates[kind] = candidate
+        return candidates
 
     def candidates(self) -> Tuple[OptimizationCandidate, ...]:
         directory = self.root / "candidates"
@@ -622,6 +576,7 @@ class RSIOptimizationLab:
         active = self.active_candidates().get(candidate.kind)
         if active is None or active.candidate_id != candidate.candidate_id:
             raise ContractViolation("canary candidate is not active")
+        candidate = active
         if not candidate.evaluation:
             raise ContractViolation("active candidate has no evaluation")
         thresholds = candidate.evaluation["thresholds"]
@@ -802,7 +757,13 @@ class RSIOptimizationLab:
         )
         if value is None:
             raise ContractViolation(f"regression suite {suite_id} does not exist")
-        suite = RegressionSuite.from_dict(value)
+        try:
+            suite = RegressionSuite.from_dict(value)
+        except (KeyError, TypeError, ValueError) as error:
+            raise ContractViolation("invalid frozen regression suite") from error
+        case_ids = [case.case_id for case in suite.cases]
+        if not case_ids or case_ids != sorted(set(case_ids)):
+            raise ContractViolation("frozen regression suite cases must be non-empty, unique and ordered")
         canonical = json.dumps(
             [item.to_dict() for item in suite.cases],
             ensure_ascii=False,
@@ -817,6 +778,46 @@ class RSIOptimizationLab:
         ):
             raise ContractViolation("frozen regression suite was modified")
         return suite
+
+    def _validate_evaluation(
+        self, candidate: OptimizationCandidate, *, require_approval: bool = False
+    ) -> Mapping[str, Any]:
+        evaluation = candidate.evaluation
+        if not isinstance(evaluation, dict) or not isinstance(evaluation.get("binding"), dict):
+            raise ContractViolation("optimization evaluation has no current binding; reevaluate a new candidate")
+        payload = {key: value for key, value in evaluation.items() if key != "binding_digest"}
+        if evaluation.get("binding_digest") != json_digest(payload)[1]:
+            raise ContractViolation("optimization evaluation binding was modified")
+        try:
+            suite_id = evaluation["suite_id"]
+            if not isinstance(suite_id, str):
+                raise ContractViolation("invalid evaluation suite id")
+            suite = self._read_suite(suite_id)
+            thresholds = evaluation["thresholds"]
+            measurements = tuple(
+                RegressionMeasurement.from_dict(item)
+                for item in evaluation["binding"]["measurements"]
+            )
+            expected = _regression_evaluation(
+                candidate, suite, measurements,
+                _quality(thresholds["max_quality_regression"], "max_quality_regression"),
+                _finite_non_negative(thresholds["max_cost_increase_percent"], "max_cost_increase_percent"),
+                _finite_non_negative(thresholds["max_latency_increase_percent"], "max_latency_increase_percent"),
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise ContractViolation("invalid optimization evaluation binding") from error
+        if evaluation != expected:
+            raise ContractViolation("optimization candidate or evaluation binding changed after evaluation")
+        if evaluation["passed"] is not True:
+            raise ContractViolation(f"optimization candidate {candidate.candidate_id} did not pass evaluation")
+        if require_approval and (
+            candidate.approved_evaluation_digest != evaluation["binding_digest"]
+            or not isinstance(candidate.approved_by, str)
+            or not candidate.approved_by.strip()
+            or candidate.approved_at is None
+        ):
+            raise ContractViolation("optimization evaluation no longer matches its human approval")
+        return evaluation
 
     def _candidate_path(self, candidate_id: str) -> Path:
         if not candidate_id.startswith("opt-") or "/" in candidate_id:
@@ -834,7 +835,12 @@ class RSIOptimizationLab:
             raise ContractViolation(
                 f"optimization candidate {candidate_id} does not exist"
             )
-        candidate = OptimizationCandidate.from_dict(value)
+        try:
+            candidate = OptimizationCandidate.from_dict(value)
+        except (KeyError, TypeError, ValueError) as error:
+            raise ContractViolation("invalid optimization candidate record") from error
+        if candidate.candidate_id != candidate_id:
+            raise ContractViolation("optimization candidate identity mismatch")
         normalized = self._validate_change(candidate.kind, candidate.change)
         if normalized != candidate.change:
             raise ContractViolation(
@@ -871,3 +877,103 @@ def _candidate_change_digest(candidate: OptimizationCandidate) -> str:
         separators=(",", ":"),
     )
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _regression_evaluation(
+    candidate: OptimizationCandidate,
+    suite: RegressionSuite,
+    measurements: Sequence[RegressionMeasurement],
+    max_quality_regression: float,
+    max_cost_increase_percent: float,
+    max_latency_increase_percent: float,
+) -> Dict[str, Any]:
+    by_case = {item.case_id: item for item in measurements}
+    expected = {item.case_id for item in suite.cases}
+    if len(by_case) != len(measurements) or set(by_case) != expected:
+        raise ContractViolation(
+            "regression measurements must cover each frozen case exactly once"
+        )
+    failures = []
+    baseline_cost = 0.0
+    measured_cost = 0.0
+    baseline_latency = 0.0
+    measured_latency = 0.0
+    baseline_quality = 0.0
+    measured_quality = 0.0
+    for case in suite.cases:
+        item = by_case[case.case_id]
+        baseline_cost += case.baseline_cost_usd
+        measured_cost += item.cost_usd
+        baseline_latency += case.baseline_latency_seconds
+        measured_latency += item.latency_seconds
+        baseline_quality += case.baseline_quality
+        measured_quality += item.quality_score
+        if not item.reality_anchor_passed:
+            failures.append(f"{case.case_id}:reality_anchor_failed")
+        if item.quality_score < (
+            case.baseline_quality - max_quality_regression
+        ):
+            failures.append(f"{case.case_id}:quality_regression")
+    cost_increase = _increase_percent(baseline_cost, measured_cost)
+    latency_increase = _increase_percent(
+        baseline_latency, measured_latency
+    )
+    if cost_increase > max_cost_increase_percent:
+        failures.append("suite:cost_budget_exceeded")
+    if latency_increase > max_latency_increase_percent:
+        failures.append("suite:latency_budget_exceeded")
+    count = len(suite.cases)
+    evaluation = {
+        "passed": not failures,
+        "suite_id": suite.suite_id,
+        "suite_digest": suite.digest,
+        "candidate_change_digest": _candidate_change_digest(candidate),
+        "cases": count,
+        "failures": failures,
+        "baseline_average_quality": baseline_quality / count,
+        "measured_average_quality": measured_quality / count,
+        "baseline_total_cost_usd": baseline_cost,
+        "measured_total_cost_usd": measured_cost,
+        "cost_increase_percent": cost_increase,
+        "baseline_total_latency_seconds": baseline_latency,
+        "measured_total_latency_seconds": measured_latency,
+        "latency_increase_percent": latency_increase,
+        "thresholds": {
+            "max_quality_regression": max_quality_regression,
+            "max_cost_increase_percent": max_cost_increase_percent,
+            "max_latency_increase_percent": max_latency_increase_percent,
+        },
+        "guardrails": {
+            "frozen_suite": True,
+            "hard_constraints_mutable": False,
+            "human_approval_required": True,
+        },
+    }
+    ordered = [
+        RegressionMeasurement.from_dict(by_case[case.case_id].to_dict()).to_dict()
+        for case in suite.cases
+    ]
+    evaluation["binding"] = {
+        "schema_version": 1,
+        "candidate_id": candidate.candidate_id,
+        "evaluator_version": REGRESSION_EVALUATOR_VERSION,
+        "measurements": ordered,
+        "measurements_digest": json_digest(ordered)[1],
+        "policy_digest": json_digest({
+            "thresholds": evaluation["thresholds"],
+            "guardrails": evaluation["guardrails"],
+        })[1],
+        # This evaluator compares supplied metrics; it does not execute candidates.
+        "measurement_source": "caller_reported",
+        "independent": False,
+        "resource_constraints": {
+            "candidate_execution": "not_performed",
+            "isolation": "unknown",
+            "cpu_seconds": None,
+            "memory_bytes": None,
+            "wall_clock_seconds": None,
+            "output_bytes": None,
+        },
+    }
+    evaluation["binding_digest"] = json_digest(evaluation)[1]
+    return evaluation

@@ -463,36 +463,48 @@ class ExecutorRegistry:
     def profiles(self) -> Mapping[str, ExecutorProfile]:
         return self._router.profiles()
 
+    def eligible_executor_ids(
+        self, request: AgentRequest, required_features: Sequence[str] = (),
+    ) -> Tuple[str, ...]:
+        """Inspect capabilities and static policy; execution still requires admission."""
+        return self._router.eligible_executor_ids(
+            self._capability_candidates(request, required_features), request,
+        )
+
+    def _capability_candidates(
+        self, request: AgentRequest, required_features: Sequence[str],
+    ) -> Tuple[str, ...]:
+        features = self._request_features(request, required_features)
+        return tuple(executor_id for executor_id in sorted(self._executors)
+                     if self._executors[executor_id].capabilities.supports(features, request.tools))
+
+    @staticmethod
+    def _request_features(request: AgentRequest, required_features: Sequence[str]) -> Tuple[str, ...]:
+        features = {"structured_output", *required_features}
+        for present, feature in (
+            (request.model is not None, "model_selection"),
+            (bool(request.tools), "tool_policy"),
+            (request.max_cost_usd is not None, "cost_budget"),
+            (request.max_tokens is not None, "token_budget"),
+            (request.reasoning_effort is not None, "reasoning_control"),
+        ):
+            if present:
+                features.add(feature)
+        return tuple(sorted(features))
+
     def execute(
         self,
         request: AgentRequest,
         executor_id: Optional[str] = None,
         required_features: Sequence[str] = (),
     ) -> AgentResult:
-        implied_features = {"structured_output"}
-        if request.model is not None:
-            implied_features.add("model_selection")
-        if request.tools:
-            implied_features.add("tool_policy")
-        if request.max_cost_usd is not None:
-            implied_features.add("cost_budget")
-        if request.max_tokens is not None:
-            implied_features.add("token_budget")
-        if request.reasoning_effort is not None:
-            implied_features.add("reasoning_control")
-        all_features = set(required_features) | implied_features
-        candidates = []
-        for candidate_id in sorted(self._executors):
-            if executor_id is not None and candidate_id != executor_id:
-                continue
-            executor = self._executors[candidate_id]
-            if executor.capabilities.supports(sorted(all_features), request.tools):
-                candidates.append(candidate_id)
+        candidates = [candidate_id for candidate_id in self._capability_candidates(request, required_features)
+                      if executor_id is None or candidate_id == executor_id]
         if not candidates:
             requested = executor_id or "auto"
             raise ContractViolation(
                 f"no agent executor satisfies executor={requested}, "
-                f"features={sorted(all_features)}, tools={sorted(request.tools)}"
+                f"features={list(self._request_features(request, required_features))}, tools={sorted(request.tools)}"
             )
         decision = self._router.select(
             candidates, request, reserve=self._reuse_store is None

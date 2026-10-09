@@ -30,6 +30,26 @@ class NodeEffectJournal:
         digest = hashlib.sha256(f"{run_id}:{node_id}".encode()).hexdigest()[:32]
         return f"node-{digest}"
 
+    def completed_outcome(
+        self, *, run_id: str, node_id: str, effect_type: str,
+        inputs: Any, workspace_identity: Mapping[str, Any],
+    ) -> Optional[Mapping[str, Any]]:
+        """Read a validated completed receipt without invoking or reconciling work."""
+        effect_id = self.effect_id(run_id, node_id)
+        path = self.root / f"{effect_id}.json"
+        with file_lock(self.root / f"{effect_id}.lock"):
+            if not path.exists():
+                return None
+            record = read_json_object(path, label="node effect receipt")
+            normalized_inputs, input_digest = json_digest(inputs, label="effect inputs")
+            normalized_workspace, _ = json_digest(dict(workspace_identity), label="effect workspace identity")
+            self._validate(
+                record, effect_id=effect_id, run_id=run_id, node_id=node_id,
+                effect_type=effect_type, inputs=normalized_inputs, input_digest=input_digest,
+                workspace_identity=normalized_workspace,
+            )
+            return record["outcome"] if record["state"] == "completed" else None
+
     def execute(
         self,
         *,

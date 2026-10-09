@@ -63,7 +63,7 @@ def encode_json(value: Any, *, label: str = "value") -> str:
 
     try:
         return json.dumps(
-            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
         )
     except (TypeError, ValueError) as error:
         raise ContractViolation(f"{label} must be JSON serializable: {error}") from error

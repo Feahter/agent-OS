@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Callable, ContextManager, Dict, Iterator, Mapping, Optional, Tuple, Union
 
 from . import telemetry
+from ._store import json_digest
 from .agents import AgentExecution, ModelUsage
 from .artifacts import ArtifactRecord, ArtifactStore
 from .checkpoint import Checkpoint, CheckpointStore
@@ -294,6 +295,7 @@ class GraphRuntime:
         cost_ledger: CostBudgetLedger,
         artifacts: ArtifactStore,
         usage: ModelUsage,
+        reservations: Optional[Mapping[str, Tuple[TokenReservation, float]]] = None,
     ) -> None:
         if self.checkpoints is None:
             return
@@ -307,6 +309,10 @@ class GraphRuntime:
             cost_ledger.used,
             artifacts.records(),
             usage,
+            {
+                node_id: {"attempt": attempts[node_id], "tokens": tokens.tokens, "cost_usd": cost}
+                for node_id, (tokens, cost) in (reservations or {}).items()
+            },
         )
         with self._owned():
             with self._checkpoint_lock:
@@ -339,7 +345,7 @@ class GraphRuntime:
             restored = NodeStatus(checkpoint.statuses.get(node.id, NodeStatus.PENDING.value))
             statuses[node.id] = restored if restored is NodeStatus.COMPLETED else NodeStatus.PENDING
         attempts = {node.id: checkpoint.attempts.get(node.id, 0) for node in self.graph.nodes}
-        return _RunState(
+        state = _RunState(
             checkpoint.run_id,
             statuses,
             attempts,
@@ -349,6 +355,59 @@ class GraphRuntime:
             True,
             checkpoint.usage,
         )
+        # A write-ahead reservation is unresolved, not a measured zero. Legacy
+        # checkpoints lack reservations; reconstruct them only for RUNNING nodes.
+        unresolved = checkpoint.in_flight
+        if unresolved is None:
+            unresolved = {
+                node.id: {
+                    "attempt": attempts[node.id],
+                    "tokens": self._token_reservation(node).tokens,
+                    "cost_usd": self._cost_reservation(node),
+                }
+                for node in self.graph.nodes
+                if checkpoint.statuses.get(node.id) == NodeStatus.RUNNING.value
+            }
+        for node_id, reservation in unresolved.items():
+            if node_id not in statuses:
+                raise ContractViolation("checkpoint reservation references unknown node")
+            tokens, cost = reservation["tokens"], reservation["cost_usd"]
+            node = self.graph.node_map()[node_id]
+            if node.effect != "read_only" and self.effects is not None:
+                self._validated_effect_lease(state.run_id, node_id)
+                handler = self.registry.resolve(node.kind)
+                workspace_identity = getattr(handler, "workspace_identity", None)
+                if not isinstance(workspace_identity, Mapping):
+                    raise ContractViolation("write effect handler requires workspace_identity")
+                context = NodeContext(state.run_id, node, state.artifacts, state.attempts[node_id])
+                with self._owned():
+                    completed = self.effects.completed_outcome(
+                        run_id=state.run_id, node_id=node_id, effect_type=node.effect,
+                        inputs=[record.to_dict() for record in context.input_records()],
+                        workspace_identity=workspace_identity,
+                    )
+                if completed is not None:
+                    token_reservation = TokenReservation(tokens, "checkpoint", 0, node.max_tokens)
+                    state.ledger.reserved += tokens
+                    state.cost_ledger.reserved += cost
+                    state.reservations[node_id] = (token_reservation, cost)
+                    self._complete_node_execution(
+                        state, node, _NodeExecution(self._restore_outcome(completed), context.input_records()),
+                        token_reservation, cost,
+                    )
+                    continue
+            state.ledger.used += tokens
+            state.cost_ledger.used += cost
+            state.usage = ModelUsage.combine(
+                (state.usage, ModelUsage.unknown().with_accounted_totals(tokens, cost))
+            )
+            self._emit("node_interrupted", state.run_id, node_id, state.attempts[node_id], {
+                "reason": "unresolved_usage", "reserved_tokens": tokens, "reserved_cost_usd": cost,
+            })
+        # Persist recovery accounting before another launch, so repeated resume
+        # cannot charge the same interrupted attempt twice.
+        self._save_state(state)
+        return state
 
     def _token_reservation(self, node: NodeSpec) -> TokenReservation:
         return self.token_reservations.reserve(node)
@@ -600,6 +659,7 @@ class GraphRuntime:
             state.cost_ledger,
             state.artifacts,
             state.usage,
+            state.reservations,
         )
 
     def _reconcile_publications(self, state: _RunState) -> None:
@@ -685,6 +745,7 @@ class GraphRuntime:
         declaration_order: Mapping[str, int],
     ) -> bool:
         changed = False
+        dirty = False
         for node in self._ready_nodes(state, critical_path_ranks, declaration_order):
             if len(state.futures) >= self.graph.max_concurrency:
                 break
@@ -697,6 +758,7 @@ class GraphRuntime:
                     payload={"reason": "gate", "gate": node.gate},
                 )
                 changed = True
+                dirty = True
                 continue
             token_reservation = self._token_reservation(node)
             if not state.ledger.can_reserve(token_reservation.tokens):
@@ -710,6 +772,7 @@ class GraphRuntime:
                     payload={"reason": "token_budget"},
                 )
                 changed = True
+                dirty = True
                 continue
             cost_reservation = self._cost_reservation(node)
             if not state.cost_ledger.can_reserve(cost_reservation):
@@ -723,22 +786,13 @@ class GraphRuntime:
                     payload={"reason": "cost_budget"},
                 )
                 changed = True
+                dirty = True
                 continue
             state.attempts[node.id] += 1
             state.ledger.reserve(token_reservation.tokens)
             state.cost_ledger.reserve(cost_reservation)
             state.reservations[node.id] = (token_reservation, cost_reservation)
             state.statuses[node.id] = NodeStatus.RUNNING
-            with self._owned():
-                future = executor.submit(
-                    self._execute,
-                    handlers[node.id],
-                    state.run_id,
-                    node,
-                    state.artifacts,
-                    state.attempts[node.id],
-                )
-            state.futures[future] = node.id
             self._emit(
                 "node_started",
                 state.run_id,
@@ -750,7 +804,21 @@ class GraphRuntime:
                     "token_reservation_samples": token_reservation.samples,
                 },
             )
+            self._save_state(state)
+            dirty = False
+            with self._owned():
+                future = executor.submit(
+                    self._execute,
+                    handlers[node.id],
+                    state.run_id,
+                    node,
+                    state.artifacts,
+                    state.attempts[node.id],
+                )
+            state.futures[future] = node.id
             changed = True
+        if dirty:
+            self._save_state(state)
         return changed
 
     @staticmethod
@@ -771,11 +839,20 @@ class GraphRuntime:
         state: _RunState,
         reserved_tokens: int,
         reserved_cost: float,
-    ) -> None:
-        state.ledger.settle(reserved_tokens, 0)
+    ) -> ModelUsage:
+        state.ledger.settle(reserved_tokens, reserved_tokens)
         state.cost_ledger.settle(reserved_cost, None)
-        state.usage = ModelUsage.combine(
-            (state.usage, ModelUsage(total_tokens=0, cost_usd=reserved_cost))
+        usage = ModelUsage.unknown().with_accounted_totals(reserved_tokens, reserved_cost)
+        state.usage = ModelUsage.combine((state.usage, usage))
+        return usage
+
+    @staticmethod
+    def _accounted_execution_usage(outcome: NodeOutcome, reserved_cost: float) -> ModelUsage:
+        usage = outcome.usage or ModelUsage.no_call()
+        if outcome.agent_execution is None and usage == ModelUsage.no_call() and reserved_cost == 0:
+            return usage
+        return usage.with_accounted_totals(
+            outcome.tokens_used, reserved_cost if outcome.cost_usd is None else outcome.cost_usd,
         )
 
     def _complete_node_execution(
@@ -789,9 +866,11 @@ class GraphRuntime:
         node_id = node.id
         outcome = execution.outcome
         outcome_usage = outcome.usage or ModelUsage.no_call()
-        accounted_usage = outcome_usage
+        accounted_usage = self._accounted_execution_usage(outcome, reserved_cost)
         within_graph_budget = state.ledger.settle(token_reservation.tokens, outcome.tokens_used)
         within_cost_budget = state.cost_ledger.settle(reserved_cost, outcome.cost_usd)
+        state.usage = ModelUsage.combine((state.usage, accounted_usage))
+        state.reservations.pop(node_id)
         if outcome_usage.total_tokens_complete and outcome_usage.total_tokens is not None:
             warning = self.token_reservations.deviation_warning(
                 node, token_reservation, outcome_usage.total_tokens
@@ -810,12 +889,6 @@ class GraphRuntime:
                         "action": warning.action,
                     },
                 )
-        if not (outcome.agent_execution is None and outcome_usage == ModelUsage.no_call()):
-            accounted_cost = reserved_cost if outcome.cost_usd is None else outcome.cost_usd
-            accounted_usage = outcome_usage.with_accounted_totals(
-                outcome.tokens_used, accounted_cost
-            )
-            state.usage = ModelUsage.combine((state.usage, accounted_usage))
         within_node_budget = node.max_tokens is None or outcome.tokens_used <= node.max_tokens
         within_node_cost = (
             node.agent is None
@@ -832,7 +905,7 @@ class GraphRuntime:
                 state.run_id,
                 node_id,
                 state.attempts[node_id],
-                {"reason": "budget"},
+                {"reason": "budget", "usage": accounted_usage.to_dict()},
             )
             return
         records = state.artifacts.commit_batch(outcome.outputs, node_id)
@@ -847,6 +920,10 @@ class GraphRuntime:
                 "cost_usd": outcome.cost_usd,
                 "usage": accounted_usage.to_dict(),
                 "artifacts": [record.key for record in records],
+                "candidate_digest": (json_digest([record.checksum for record in records])[1]
+                                     if outcome.agent_execution is not None else None),
+                "executor_id": (outcome.agent_execution.result.executor_id
+                                if outcome.agent_execution is not None else None),
                 "metadata": dict(outcome.metadata),
             },
         )
@@ -867,27 +944,41 @@ class GraphRuntime:
     ) -> None:
         node_id = state.futures.pop(future)
         node = nodes[node_id]
-        token_reservation, reserved_cost = state.reservations.pop(node_id)
+        token_reservation, reserved_cost = state.reservations[node_id]
+        execution = None
         try:
+            execution = future.result()
             self._complete_node_execution(
                 state,
                 node,
-                future.result(),
+                execution,
                 token_reservation,
                 reserved_cost,
             )
         except LeaseLostError:
             raise
-        except RetryableNodeError as error:
-            self._record_failed_execution_usage(state, token_reservation.tokens, reserved_cost)
-            if state.attempts[node_id] < node.retry.max_attempts:
+        except Exception as error:
+            unsettled = node_id in state.reservations
+            if unsettled:
+                usage = self._record_failed_execution_usage(state, token_reservation.tokens, reserved_cost)
+                state.reservations.pop(node_id)
+            else:
+                # Settlement precedes artifact commit/publication. A later error
+                # must preserve that usage without charging the reservation twice.
+                assert execution is not None
+                usage = self._accounted_execution_usage(execution.outcome, reserved_cost)
+            payload = {"error": (str(error) if isinstance(error, RetryableNodeError)
+                                 else f"{type(error).__name__}: {error}"),
+                       "usage": usage.to_dict()}
+            if (unsettled and isinstance(error, RetryableNodeError)
+                    and state.attempts[node_id] < node.retry.max_attempts):
                 state.statuses[node_id] = NodeStatus.PENDING
                 self._emit(
                     "node_retry",
                     state.run_id,
                     node_id,
                     state.attempts[node_id],
-                    {"error": str(error)},
+                    payload,
                 )
             else:
                 state.statuses[node_id] = NodeStatus.FAILED
@@ -896,18 +987,8 @@ class GraphRuntime:
                     state.run_id,
                     node_id,
                     state.attempts[node_id],
-                    {"error": str(error)},
+                    payload,
                 )
-        except Exception as error:
-            self._record_failed_execution_usage(state, token_reservation.tokens, reserved_cost)
-            state.statuses[node_id] = NodeStatus.FAILED
-            self._emit(
-                "node_failed",
-                state.run_id,
-                node_id,
-                state.attempts[node_id],
-                {"error": f"{type(error).__name__}: {error}"},
-            )
         finally:
             self._save_state(state)
 
@@ -955,6 +1036,8 @@ class GraphRuntime:
         with ThreadPoolExecutor(max_workers=self.graph.max_concurrency) as executor:
             while True:
                 changed = self._transition_pending_nodes(state, cancellation)
+                if changed:
+                    self._save_state(state)
                 changed = (
                     self._schedule_ready_nodes(
                         state,
@@ -965,8 +1048,6 @@ class GraphRuntime:
                     )
                     or changed
                 )
-                if changed:
-                    self._save_state(state)
                 if not state.futures:
                     if self._all_terminal(state.statuses):
                         break

@@ -323,14 +323,15 @@ class AgentOSDistribution:
 
     def certified_adapter_commands(self) -> Mapping[str, str]:
         commands = {}
-        for probe in _COMMAND_PROBES:
-            if probe.role != "agent":
-                continue
-            check = self._command_check(probe)
+        for check in self.executor_checks():
             path = check.details.get("path")
             if check.status == "pass" and isinstance(path, str):
-                commands[probe.probe_id] = path
+                commands[check.check_id.removeprefix("adapter:")] = path
         return commands
+
+    def executor_checks(self) -> Tuple[DiagnosticCheck, ...]:
+        """Probe current versions, platforms and protocols without model calls."""
+        return tuple(self._command_check(probe) for probe in _COMMAND_PROBES if probe.role == "agent")
 
     def doctor(self, agent_os_root: Path) -> Mapping[str, Any]:
         """Diagnose one portable state root supplied to the low-level interface."""

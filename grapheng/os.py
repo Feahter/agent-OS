@@ -241,6 +241,7 @@ class AgentOS:
                         "publication-receipts",
                         "routing-governance-runtime",
                         "controlled-merge-runtime",
+                        "optimization-rollback-runtime",
                     ],
                 },
             )
@@ -414,6 +415,7 @@ class AgentOS:
             if relative in (
                 PurePosixPath("routing/state.json"),
                 PurePosixPath("routing/state.lock"),
+                PurePosixPath("optimization/rollback.jsonl"),
             ):
                 continue
             if not _allowed_path(relative):

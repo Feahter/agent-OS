@@ -22,6 +22,7 @@ class CheckpointDocumentV1(TypedDict):
     cost_usd: float
     usage: Mapping[str, Any]
     artifacts: List[Mapping[str, Any]]
+    in_flight: Optional[Dict[str, Mapping[str, Any]]]
 
 
 class ControlRunDocumentV1(TypedDict, total=False):

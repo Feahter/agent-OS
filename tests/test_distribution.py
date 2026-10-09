@@ -84,8 +84,12 @@ class DistributionTests(unittest.TestCase):
             item for item in report["checks"] if item["check_id"] == "adapter:codex"
         )
         self.assertEqual("verified", codex["details"]["support_status"])
+        evidence = json.loads(
+            (PROJECT_ROOT / "grapheng" / "compatibility-evidence.json").read_text(encoding="utf-8")
+        )
         self.assertEqual(
-            "2026-09-14T03:39:21Z", codex["details"]["last_verified_at"]
+            max(item["validated_at"] for item in evidence["adapters"]["codex"]),
+            codex["details"]["last_verified_at"],
         )
         opencode = next(
             item

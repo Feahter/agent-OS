@@ -9,6 +9,7 @@ from typing import Any, Mapping, Optional, Sequence
 from . import telemetry
 from .adapters import discover_local_executors
 from .agent_nodes import AgentNodeHandler
+from .agents import AgentRequest
 from .console import ApprovalInbox, OperationsConsole
 from .console_server import OperationsServer
 from .control import LocalControlPlane
@@ -24,6 +25,7 @@ from .economics import (
 from .engineering import EngineeringWorkflow, ProjectPolicy, default_project_policy
 from .errors import ContractViolation, GraphEngineeringError
 from .evaluation import EvaluationCase, EvaluationLab
+from .evidence import EvidenceProjection, EvidenceSource
 from .learning import RSILoop
 from .model import GraphSpec
 from .optimization import (
@@ -72,6 +74,30 @@ def _json_file(path: Path):
         raise ContractViolation(f"cannot read JSON input {path}: {error}") from error
     except json.JSONDecodeError as error:
         raise ContractViolation(f"invalid JSON input {path}: {error}") from error
+
+
+def _evidence_request(path: Path) -> AgentRequest:
+    value = _json_file(path)
+    required = {"task_id", "prompt", "inputs", "output_keys", "workspace"}
+    if (not isinstance(value, dict) or not required.issubset(value)
+            or set(value) - set(AgentRequest.__dataclass_fields__)):
+        raise ContractViolation("invalid evidence AgentRequest fields")
+    for key in ("task_id", "prompt", "workspace"):
+        if not isinstance(value[key], str) or not value[key].strip():
+            raise ContractViolation(f"evidence request {key} must be a non-empty string")
+    if not isinstance(value["inputs"], dict):
+        raise ContractViolation("evidence request inputs must be an object")
+    for key in ("model", "task_type", "model_family", "data_classification", "reuse_scope", "reasoning_effort"):
+        if key in value and value[key] is not None and not isinstance(value[key], str):
+            raise ContractViolation(f"evidence request {key} must be a string")
+    for key in ("output_keys", "tools"):
+        if key in value:
+            if (not isinstance(value[key], list)
+                    or any(not isinstance(item, str) or not item for item in value[key])):
+                raise ContractViolation(f"evidence request {key} must be an array of strings")
+            value[key] = tuple(value[key])
+    value["workspace"] = Path(value["workspace"])
+    return AgentRequest(**value)
 
 
 def _run_optimization_command(args, parser) -> int:
@@ -823,6 +849,27 @@ def _command_parser() -> argparse.ArgumentParser:
     center_parser.add_argument("--home", type=Path)
     center_parser.add_argument("--limit", type=int, default=20)
     center_parser.add_argument("--json", action="store_true", dest="json_output")
+    evidence_parser = subparsers.add_parser("evidence")
+    evidence_parser.add_argument("action", choices=("show", "search", "summary", "export", "link", "correct", "revoke", "forget"))
+    evidence_parser.add_argument("--source", nargs=2, action="append", default=[], metavar=("KIND", "PATH"))
+    evidence_parser.add_argument("--scope", required=True)
+    evidence_parser.add_argument("--task-type", default="general")
+    evidence_parser.add_argument("--policy-digest")
+    evidence_parser.add_argument("--expires-at", type=float)
+    evidence_parser.add_argument("--max-items", type=int, default=10)
+    evidence_parser.add_argument("--max-bytes", type=int, default=8192)
+    evidence_parser.add_argument("--controls", type=Path)
+    evidence_parser.add_argument("--access-log", type=Path)
+    evidence_parser.add_argument("--attempt-id")
+    evidence_parser.add_argument("--parent-attempt-id")
+    evidence_parser.add_argument("--guidance-version")
+    evidence_parser.add_argument("--correction", type=Path)
+    evidence_parser.add_argument("--actor")
+    evidence_parser.add_argument("--replacement-attempt-id")
+    evidence_parser.add_argument("--request", type=Path, help="host AgentRequest for certified retrieval")
+    evidence_parser.add_argument("--required-feature", action="append", default=[])
+    evidence_parser.add_argument("--data-classification", choices=("public", "internal", "confidential", "restricted"))
+    evidence_parser.add_argument("--executor-version", nargs=2, action="append", default=[], metavar=("EXECUTOR", "VERSION"))
     validate_parser = subparsers.add_parser("validate")
     validate_parser.add_argument("spec", type=Path)
     demo_parser = subparsers.add_parser("demo")
@@ -1238,6 +1285,46 @@ def _dispatch_parsed(
         resident.ensure_running()
         value = resident.task_center(args.limit)
         _print_task_center(value, args.json_output)
+        return 0
+
+    if args.command == "evidence":
+        evidence_value: Mapping[str, Any]
+        evidence_request = _evidence_request(args.request) if args.request else None
+        if (args.request or args.required_feature) and args.action != "search":
+            parser.error("evidence request qualification is only valid for search")
+        projection = EvidenceProjection(
+            [EvidenceSource(args.scope, kind, Path(path), args.task_type,
+                            args.policy_digest, args.expires_at, args.data_classification,
+                            tuple(tuple(pair) for pair in args.executor_version)) for kind, path in args.source],
+            control_path=args.controls, access_log=args.access_log,
+            executors=discover_local_executors() if args.request else None,
+            certification=AgentOSDistribution().executor_checks if args.request else None,
+        )
+        if args.action == "show":
+            evidence_value = {"schema_version": 1, "items": projection.snapshot()}
+        elif args.action == "export":
+            evidence_value = projection.portable()
+        elif args.action == "summary":
+            evidence_value = projection.summary()
+        elif args.action == "search":
+            if args.policy_digest is None:
+                parser.error("evidence search requires --policy-digest")
+            evidence_value = projection.search(
+                scope=args.scope, task_type=args.task_type, policy_digest=args.policy_digest,
+                max_items=args.max_items, max_bytes=args.max_bytes,
+                request=evidence_request,
+                required_features=args.required_feature,
+            )
+        else:
+            if not args.attempt_id or not args.actor or not args.controls:
+                parser.error("evidence metadata actions require --attempt-id, --actor, and --controls")
+            evidence_value = projection.control(
+                args.attempt_id, args.action, actor=args.actor,
+                parent_attempt_id=args.parent_attempt_id, guidance_version=args.guidance_version,
+                correction=_json_file(args.correction) if args.correction else None,
+                replacement_attempt_id=args.replacement_attempt_id,
+            )
+        print(json.dumps(evidence_value, ensure_ascii=False, sort_keys=True, indent=2))
         return 0
 
     if args.command == "engineer":

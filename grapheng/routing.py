@@ -322,6 +322,12 @@ class PolicyRouter:
     def profiles(self) -> Mapping[str, ExecutorProfile]:
         return dict(self._profiles)
 
+    def eligible_executor_ids(self, executor_ids: Sequence[str], request: Any) -> Tuple[str, ...]:
+        """Check static policy constraints without selecting or reserving a route."""
+        with self._lock:
+            return tuple(executor_id for executor_id in sorted(executor_ids)
+                         if self._rejection_reason(self._profiles[executor_id], request) is None)
+
     def apply_policy(self, policy: Optional[LearnedRoutingPolicy]) -> None:
         with self._lock:
             self._learned_policy = policy
