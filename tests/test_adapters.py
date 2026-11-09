@@ -83,6 +83,8 @@ class AdapterTests(unittest.TestCase):
         with patch("grapheng.adapters.shutil.which", side_effect=which), patch(
             "grapheng.adapters.subprocess.run",
             side_effect=runner,
+        ), patch("platform.machine", return_value="arm64"), patch(
+            "platform.system", return_value="Darwin"
         ):
             registry = discover_local_executors()
 
@@ -113,7 +115,9 @@ class AdapterTests(unittest.TestCase):
             ), patch(
                 "grapheng.adapters.subprocess.run",
                 side_effect=runner,
-            ) as run:
+            ) as run, patch("platform.machine", return_value="arm64"), patch(
+                "platform.system", return_value="Darwin"
+            ):
                 registry = discover_local_executors()
 
             self.assertEqual(
@@ -143,6 +147,8 @@ class AdapterTests(unittest.TestCase):
 
         with patch("grapheng.adapters.shutil.which", side_effect=which), patch(
             "grapheng.adapters.subprocess.run", side_effect=runner
+        ), patch("platform.machine", return_value="arm64"), patch(
+            "platform.system", return_value="Darwin"
         ):
             registry = discover_local_executors()
 
@@ -206,6 +212,8 @@ class AdapterTests(unittest.TestCase):
             "grapheng.adapters.subprocess.run", side_effect=runner
         ), patch(
             "grapheng.adapters.run_bounded_process", side_effect=execution
+        ), patch("platform.machine", return_value="arm64"), patch(
+            "platform.system", return_value="Darwin"
         ), tempfile.TemporaryDirectory() as directory:
             registry = discover_local_executors()
             result = registry.execute(
